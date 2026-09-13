@@ -7,7 +7,8 @@
 #elif defined(ESP32)
   #include <SPIFFS.h>
   #define FORMAT_SPIFFS_IF_FAILED true
-  #include <SD.h>
+  #include <SD_MMC.h>
+  using fs::File;
 #endif
 
 class FileWrapper : public Stream {

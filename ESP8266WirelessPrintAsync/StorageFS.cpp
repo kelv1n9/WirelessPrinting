@@ -22,7 +22,7 @@ FileWrapper StorageFS::open(const String path, const char *openMode) {
       if (file && file.sdFile.isDirectory())
         file.sdFile.rewindDirectory();
     #elif defined(ESP32)
-      file.sdFile = SD.open(path, openMode);
+      file.sdFile = SD_MMC.open(path, openMode);
     #endif
   }
   else if (hasSPIFFS) {
@@ -43,7 +43,11 @@ FileWrapper StorageFS::open(const String path, const char *openMode) {
 
 void StorageFS::remove(const String filename) {
   if (hasSD)
-    SD.remove(filename.c_str());
+    #if defined(ESP8266)
+      SD.remove(filename.c_str());
+    #else
+      SD_MMC.remove(filename);
+    #endif
   else if (hasSPIFFS)
     SPIFFS.remove(filename);
 }

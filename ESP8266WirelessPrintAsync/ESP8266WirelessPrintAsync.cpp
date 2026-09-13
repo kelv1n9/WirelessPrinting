@@ -19,24 +19,6 @@
 
 #include "CommandQueue.h"
 
-#include <NeoPixelBus.h>
-
-
-const uint16_t PixelCount = 20; // this example assumes 4 pixels, making it smaller will cause a failure
-const uint8_t PixelPin = 2;  // make sure to set this to the correct pin, ignored for ESP8266 (there it is GPIO2 = D4)
-#define colorSaturation 255
-RgbColor red(colorSaturation, 0, 0);
-RgbColor green(0, colorSaturation, 0);
-RgbColor blue(0, 0, colorSaturation);
-RgbColor white(colorSaturation);
-RgbColor black(0);
-
-#if defined(ESP8266)
-  NeoPixelBus<NeoGrbFeature, NeoEsp8266Uart1Ws2813Method> strip(PixelCount); // ESP8266 always uses GPIO2 = D4
-#elif defined(ESP32)
-  NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod> strip(PixelCount, PixelPin);
-#endif
-
 // On ESP8266 use the normal Serial() for now, but name it PrinterSerial for compatibility with ESP32
 // On ESP32, use Serial1 (rather than the normal Serial0 which prints stuff during boot that confuses the printer)
 #ifdef ESP8266
@@ -90,6 +72,9 @@ float printCompletion;
 
 // Serial communication
 String lastCommandSent, lastReceivedResponse;
+uint32_t lineNumber;
+String lastSentLine;
+bool swallowNextOk;
 uint32_t lastPrintedLine;
 
 uint8_t serialBaudIndex;
@@ -446,9 +431,10 @@ bool detectPrinter() {
       PrinterSerial.begin(serialBauds[serialBaudIndex]); // See note above; we have actually renamed Serial to Serial1
       #endif
       #ifdef ESP32
-      PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, 32, 33); // gpio32 = rx, gpio33 = tx
+      PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, 13, 12); // gpio13 = rx, gpio12 = tx (gpio14 taken by SD_MMC clock)
       #endif
       telnetSend("Connecting at " + String(serialBauds[serialBaudIndex]));
+      commandQueue.push("M110 N0"); // M110 - Reset line numbering before using checksums
       commandQueue.push("M115"); // M115 - Firmware Info
       printerDetectionState = 20;
       break;
@@ -894,12 +880,23 @@ void SendCommands() {
     if (noResponsePending || printerUsedBuffer < PRINTER_RX_BUFFER_SIZE * 3 / 4) {  // Let's use no more than 75% of printer RX buffer
       if (noResponsePending)
         restartSerialTimeout();   // Receive timeout has to be reset only when sending a command and no pending response is expected
-      PrinterSerial.println(command);          // Send to 3D Printer
-      printerUsedBuffer += command.length();
+      if (command.startsWith("M110"))
+        lineNumber = 0;
+      else
+        ++lineNumber;
+      String line = "N" + String(lineNumber) + " " + command;
+      uint8_t checksum = 0;
+      for (unsigned int i = 0; i < line.length(); ++i)
+        checksum ^= (uint8_t)line[i];
+      line += "*" + String(checksum);
+
+      PrinterSerial.println(line);              // Send to 3D Printer
+      lastSentLine = line;
+      printerUsedBuffer += line.length();
       lastCommandSent = command;
       commandQueue.popSend();
 
-      telnetSend(">" + command);
+      telnetSend(">" + line);
     }
   }
 }
@@ -916,7 +913,17 @@ void ReceiveResponses() {
       bool incompleteResponse = false;
       String responseDetail = "";
 
-      if (serialResponse.startsWith("ok", lineStartPos)) {
+      if (serialResponse.startsWith("Resend:", lineStartPos) || serialResponse.startsWith("rs ", lineStartPos)) {
+        PrinterSerial.println(lastSentLine);   // Only one command is ever unacknowledged, so it is the one being asked for
+        telnetSend(">" + lastSentLine);
+        swallowNextOk = true;
+        responseDetail = "resend";
+      }
+      else if (swallowNextOk && serialResponse.startsWith("ok", lineStartPos)) {
+        swallowNextOk = false;                 // This ok belongs to the corrupted line, the re-sent one is still pending
+        responseDetail = "resend ok";
+      }
+      else if (serialResponse.startsWith("ok", lineStartPos)) {
         if (lastCommandSent.startsWith(TEMP_COMMAND))
           parseTemperatures(serialResponse);
         else if (fwAutoreportTempCap && lastCommandSent.startsWith(AUTOTEMP_COMMAND))
@@ -938,8 +945,12 @@ void ReceiveResponses() {
           responseDetail = "cold extrusion";
         }
         else if (serialResponse.startsWith("Error:")) {
-          cancelPrint = true;
-          responseDetail = "ERROR";
+          if (serialResponse.indexOf("Last Line") == -1) {   // Every Marlin transmission error ends with 'Last Line: N' and is followed by a Resend
+            cancelPrint = true;
+            responseDetail = "ERROR";
+          }
+          else
+            responseDetail = "resend error";
         }
         else {
           incompleteResponse = true;
@@ -972,18 +983,6 @@ void ReceiveResponses() {
     serialResponse = "";
     restartSerialTimeout();
   }
-  // this resets all the neopixels to an off state
-  strip.Begin();
-  strip.Show();
-  // strip.SetPixelColor(0, red);
-  // strip.SetPixelColor(1, green);
-  // strip.SetPixelColor(2, blue);
-  // strip.SetPixelColor(3, white);
-  int a;
-  for(a=0; a<PixelCount; a++){
-    strip.SetPixelColor(a, white);
-  }
-  strip.Show(); 
 }
 
 void loop() {
@@ -992,7 +991,6 @@ void loop() {
     //* OTA handling *
     //****************
     if (ESPrestartRequired) {  // check the flag here to determine if a restart is required
-      PrinterSerial.printf("Restarting ESP\n\r");
       ESPrestartRequired = false;
       ESP.restart();
     }
@@ -1041,7 +1039,7 @@ void loop() {
   //* Telnet handling *
   //*******************
   // look for Client connect trial
-  if (telnetServer.hasClient() && (!serverClient || !serverClient.connected())) {
+  if (telnetServer.hasClient()) {   // A new client always takes over, a half-open socket would otherwise block telnet forever
     if (serverClient)
       serverClient.stop();
 
