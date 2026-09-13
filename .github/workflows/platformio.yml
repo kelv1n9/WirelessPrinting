@@ -22,7 +22,7 @@ jobs:
         set -e
         VERSION=$(git rev-parse --short HEAD)
         HERE=$(readlink -f .)
-        sed -i -e 's|#define SKETCH_VERSION ".*"|#define SKETCH_VERSION "'$VERSION'"|' $PWD/ESP8266WirelessPrintAsync/ESP8266WirelessPrintAsync.ino
+        sed -i -e 's|#define SKETCH_VERSION ".*"|#define SKETCH_VERSION "'$VERSION'"|' $PWD/ESP8266WirelessPrintAsync/ESP8266WirelessPrintAsync.cpp
         platformio run
         BOARD=$(echo $BD | cut -d ":" -f 3)
         pushd .pio/build
@@ -41,10 +41,3 @@ jobs:
       with:
         name: ${{ env.artifactName }} # Exported above
         path: ./WirelessPrinting/*
-    - name: Upload to GitHub Releases (only when building from main branch)
-      if: ${{ github.ref == 'refs/heads/main' }}
-      run: |
-           set -ex
-           wget -c https://github.com/probonopd/uploadtool/raw/master/upload.sh
-           bash ./upload.sh ./WirelessPrinting*.zip
-           
