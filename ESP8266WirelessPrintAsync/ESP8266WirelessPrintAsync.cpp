@@ -1717,7 +1717,7 @@ void ReceiveResponses() {
       }
     }
     else {
-      bool incompleteResponse = false;
+      bool incompleteResponse = false, unsolicited = false;
       String responseDetail = "";
 
       if (serialResponse.startsWith("Resend:", lineStartPos) || serialResponse.startsWith("rs ", lineStartPos)) {
@@ -1758,8 +1758,10 @@ void ReceiveResponses() {
         responseDetail = "ok";
       }
       else if (printerConnected) {
-        if (parseTemperatures(serialResponse))
+        if (parseTemperatures(serialResponse)) {
+          unsolicited = true;
           responseDetail = "autotemp";
+        }
         else if (parsePosition(serialResponse))
           responseDetail = "position";
         else if (serialResponse.startsWith("echo:busy"))
@@ -1769,7 +1771,7 @@ void ReceiveResponses() {
           responseDetail = "cold extrusion";
         }
         else if (serialResponse.startsWith("Error:")) {
-          const int lastLine = serialResponse.indexOf("Last Line");
+          const int lastLine = serialResponse.indexOf("Last Line:");
           if (lastLine == -1) {   // Every Marlin transmission error ends with 'Last Line: N' and is followed by a Resend
             cancelPrint = true;
             responseDetail = "ERROR";
@@ -1797,7 +1799,8 @@ void ReceiveResponses() {
         lineStartPos = 0;
         serialResponse = "";
       }
-      restartSerialTimeout();
+      if (!unsolicited)
+        restartSerialTimeout();
     }
   }
 
