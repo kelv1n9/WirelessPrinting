@@ -95,7 +95,7 @@ int32_t lastLineReported = -1;
 bool printEndedEarly;
 uint32_t wifiRetryTimer, wifiDownSince;
 
-bool autoPowerOff, powerOffArmed, updateSucceeded;
+bool autoPowerOff, powerOffArmed, powerOffSawIdle, updateSucceeded;
 uint8_t powerOffAttempts;
 uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheckTimer;
 
@@ -344,6 +344,7 @@ void handlePrint() {
       printPause = false;
       isPrinting = false;
       powerOffArmed = autoPowerOff;
+      powerOffSawIdle = false;
       powerOffReadySince = 0;
       powerOffAttempts = 0;
     }
@@ -898,12 +899,16 @@ void handleAutoPowerOff() {
   }
 
   if (target > 0) {
-    powerOffArmed = false;
-    lcd(IpAddress2String(WiFi.localIP()));
+    if (powerOffSawIdle) {          // The heaters were already off, so somebody turned them back on
+      powerOffArmed = false;
+      lcd(IpAddress2String(WiFi.localIP()));
+    }
+    powerOffReadySince = 0;         // Otherwise the end of the file is still draining out of the queue
     return;
   }
+  powerOffSawIdle = true;
 
-  if (nozzle >= POWEROFF_NOZZLE || bedTemperature.actual.toFloat() >= POWEROFF_BED) {
+  if (!commandQueue.isEmpty() || nozzle >= POWEROFF_NOZZLE || bedTemperature.actual.toFloat() >= POWEROFF_BED) {
     powerOffReadySince = 0;
     return;
   }
@@ -1003,6 +1008,7 @@ void setup() {
     wifiManager.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT);
   wifiManager.autoConnect("AutoConnectAP");
   WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);   // Modem sleep costs beacons and latency, which a weak link cannot spare
   wifiDownSince = millis();
   configTzTime("UTC0", "pool.ntp.org", "time.google.com");
 
@@ -1859,8 +1865,7 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     if ((signed)(wifiRetryTimer - millis()) <= 0) {
       wifiRetryTimer = millis() + WIFI_RETRY_INTERVAL;
-      WiFi.disconnect();
-      WiFi.begin();
+      WiFi.begin();       // No disconnect first, tearing down a flapping link only makes it worse
     }
     if (!isPrinting && (signed)(millis() - wifiDownSince) >= WIFI_REBOOT_AFTER)
       ESP.restart();
