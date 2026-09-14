@@ -40,6 +40,7 @@ DNSServer dns;
 #define WIFI_REBOOT_AFTER 600000        // Reboot after this long offline, so a changed network can be configured again
 #define WDT_TIMEOUT 30                  // Seconds without a loop iteration before the watchdog reboots the device
 #define MAX_LISTED_FILES 64             // Upper bound on the directory listing, so a full card cannot exhaust the heap
+#define CANCEL_PARK "G1 X0 Y180 F6000"  // Where a cancelled print leaves the head, comment out to home only
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
 #define API_VERSION     "0.1"
@@ -1401,6 +1402,7 @@ void loop() {
     }
     else if (cancelPrint && !isPrinting) { // Only when cancelPrint has been processed by 'handlePrint'
       cancelPrint = false;
+      swallowNextOk = !commandQueue.isAckEmpty();
       commandQueue.clear();
       printerUsedBuffer = 0;
       lcd("Print cancelled");
@@ -1411,6 +1413,10 @@ void loop() {
       commandQueue.push("M104 S0");
       commandQueue.push("M140 S0");
       commandQueue.push("M107");
+      commandQueue.push("G28 X Y");
+      #ifdef CANCEL_PARK
+        commandQueue.push(CANCEL_PARK);
+      #endif
       commandQueue.push("M84");
       playSound();
     }
