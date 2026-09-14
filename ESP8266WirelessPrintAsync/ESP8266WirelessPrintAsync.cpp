@@ -42,6 +42,11 @@ DNSServer dns;
 #define WDT_TIMEOUT 30                  // Seconds without a loop iteration before the watchdog reboots the device
 #define MAX_LISTED_FILES 64             // Upper bound on the directory listing, so a full card cannot exhaust the heap
 #define CANCEL_PARK "G1 X0 Y180 F6000"  // Where a cancelled print leaves the head, comment out to home only
+#define POWEROFF_NOZZLE 50              // Nozzle has to be below this before the socket may be switched off
+#define POWEROFF_BED 40                 // And the bed below this
+#define POWEROFF_GRACE 120000           // Everything has to stay that way for this long
+#define POWEROFF_RETRY 60000            // Retry interval when the request did not get through
+#define POWEROFF_ATTEMPTS 10            // Attempts before giving up for this print
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
 #define API_VERSION     "0.1"
@@ -75,6 +80,10 @@ String lastSentLine;
 bool swallowNextOk;
 uint8_t timeoutRetries;
 uint32_t wifiRetryTimer, wifiDownSince;
+
+bool autoPowerOff, powerOffArmed;
+uint8_t powerOffAttempts;
+uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheckTimer;
 
 uint8_t serialBaudIndex;
 uint16_t printerUsedBuffer;
@@ -300,6 +309,9 @@ void handlePrint() {
         lcd("Complete");
       printPause = false;
       isPrinting = false;
+      powerOffArmed = autoPowerOff;
+      powerOffReadySince = 0;
+      powerOffAttempts = 0;
     }
     else if (!printPause && commandQueue.getFreeSlots() > 4) {    // Keep some space for "service" commands
       String line = gcodeFile.readStringUntil('\n'); // The G-Code line being worked on
@@ -752,6 +764,82 @@ inline String getState() {
     return "Operational";
 }
 
+void handleAutoPowerOff() {
+  const uint32_t now = millis();
+  if ((int32_t)(now - powerOffCheckTimer) < 0)
+    return;
+  powerOffCheckTimer = now + 1000;
+
+  if (!powerOffArmed)
+    return;
+
+  if (isPrinting || !printerConnected) {
+    powerOffReadySince = 0;
+    return;
+  }
+
+  float target = bedTemperature.target.toFloat();
+  float nozzle = 0;
+  for (int t = 0; t < fwExtruders; ++t) {
+    target = max(target, toolTemperature[t].target.toFloat());
+    nozzle = max(nozzle, toolTemperature[t].actual.toFloat());
+  }
+
+  if (target > 0) {
+    powerOffArmed = false;
+    lcd("Power off cancelled");
+    return;
+  }
+
+  if (nozzle >= POWEROFF_NOZZLE || bedTemperature.actual.toFloat() >= POWEROFF_BED) {
+    powerOffReadySince = 0;
+    return;
+  }
+
+  if (powerOffReadySince == 0) {
+    powerOffReadySince = now;
+    powerOffNoticeTimer = now;
+    powerOffRetryAt = now;
+    powerOffAttempts = 0;
+  }
+
+  const uint32_t waited = now - powerOffReadySince;
+  if (waited < POWEROFF_GRACE) {
+    if ((int32_t)(now - powerOffNoticeTimer) >= 0) {
+      powerOffNoticeTimer = now + 15000;
+      lcd("Power off in " + String((POWEROFF_GRACE - waited) / 1000) + "s");
+    }
+    return;
+  }
+
+  if (yandexHome.busy() || (int32_t)(now - powerOffRetryAt) < 0)
+    return;
+
+  if (powerOffAttempts >= POWEROFF_ATTEMPTS) {
+    powerOffArmed = false;
+    lcd("Power off failed");
+    return;
+  }
+
+  ++powerOffAttempts;
+  powerOffRetryAt = now + POWEROFF_RETRY;
+  lcd("Powering off");
+  yandexHome.request(YandexHome::PowerOff);
+}
+
+inline String powerOffState() {
+  if (!autoPowerOff)
+    return "disabled";
+  if (!powerOffArmed)
+    return "waiting for a print to finish";
+  if (powerOffReadySince == 0)
+    return "armed, printer still warm";
+  const uint32_t waited = millis() - powerOffReadySince;
+
+  return waited < POWEROFF_GRACE ? "switching off in " + String((POWEROFF_GRACE - waited) / 1000) + "s"
+                                 : "switching off now, attempt " + String(powerOffAttempts);
+}
+
 void setup() {
   commandQueue.begin();
   storageFS.begin();
@@ -776,6 +864,10 @@ void setup() {
   telnetServer.setNoDelay(true);
 
   initSelectedFile();
+
+  preferences.begin("wirelessprint", true);
+  autoPowerOff = preferences.getBool("autooff", false);
+  preferences.end();
 
   server.onNotFound([](AsyncWebServerRequest * request) {
     telnetSend("404 | Page '" + request->url() + "' not found");
@@ -847,6 +939,14 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
                      "<input type=\"submit\" value=\"Store token\"/>"
                      "</form>"
                      "<p>The token is written to NVS and never shown again.</p>"
+                     "<h2>Switch off after a print</h2>"
+                     "<p>State: <b>" + powerOffState() + "</b></p>"
+                     "<p>Waits until the print is over, both targets are zero, the nozzle is below "
+                     + String(POWEROFF_NOZZLE) + " and the bed below " + String(POWEROFF_BED)
+                     + ", then holds that for " + String(POWEROFF_GRACE / 1000) + " seconds.</p>"
+                     "<p><button onclick=\"post('/yandex/auto?on=" + String(autoPowerOff ? "0" : "1") + "')\">"
+                     + String(autoPowerOff ? "Turn automatic switch off OFF" : "Turn automatic switch off ON") + "</button> "
+                     "<button onclick=\"post('/yandex/abort')\">Cancel the pending switch off</button></p>"
                      "<h2>Sockets</h2>"
                      "<p><button onclick=\"post('/yandex/devices')\">Load from Yandex</button> "
                      "<button onclick=\"post('/yandex/test')\">Test: switch on</button></p>"
@@ -865,6 +965,24 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     }
     yandexHome.setToken(request->getParam("token", true)->value());
     request->redirect("/yandex");
+  });
+
+  server.on("/yandex/auto", HTTP_POST, [](AsyncWebServerRequest * request) {
+    autoPowerOff = request->hasParam("on") && request->getParam("on")->value() == "1";
+    if (!autoPowerOff)
+      powerOffArmed = false;
+
+    preferences.begin("wirelessprint", false);
+    preferences.putBool("autooff", autoPowerOff);
+    preferences.end();
+
+    request->send(204, "text/plain", "");
+  });
+
+  server.on("/yandex/abort", HTTP_POST, [](AsyncWebServerRequest * request) {
+    powerOffArmed = false;
+    powerOffReadySince = 0;
+    request->send(204, "text/plain", "");
   });
 
   server.on("/yandex/devices", HTTP_POST, [](AsyncWebServerRequest * request) {
@@ -1464,6 +1582,7 @@ void loop() {
     #endif
 
     handlePrint();
+    handleAutoPowerOff();
 
     if (printerRestarted && !isPrinting) {
       printerRestarted = false;
