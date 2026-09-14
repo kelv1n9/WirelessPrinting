@@ -13,6 +13,7 @@
 #include <ESPAsyncWiFiManager.h>  // https://github.com/alanswx/ESPAsyncWiFiManager/
 
 #include "CommandQueue.h"
+#include "YandexHome.h"
 
 // Use Serial1 rather than the normal Serial0, which prints stuff during boot that confuses the printer
 HardwareSerial PrinterSerial(1);
@@ -754,6 +755,7 @@ inline String getState() {
 void setup() {
   commandQueue.begin();
   storageFS.begin();
+  yandexHome.begin();
 
   for (int t = 0; t < MAX_SUPPORTED_EXTRUDERS; t++)
     toolTemperature[t] = { "0.0", "0.0" };
@@ -798,7 +800,7 @@ void setup() {
                      "<input type=\"submit\" value=\"Upload\"/>\n"
                      "</form>"
                      "<pre>curl -F \"file=@/path/to/some.gcode\" -F \"print=true\" " + IpAddress2String(WiFi.localIP()) + "/api/files/local</pre>\n"
-                     "<p><a href=\"/info\">Info</a></p>"
+                     "<p><a href=\"/info\">Info</a> | <a href=\"/yandex\">Yandex socket</a></p>"
                      "<hr>"
                      "<p>WirelessPrinting <a href=\"https://github.com/kelv1n9/WirelessPrinting/commit/" + SKETCH_VERSION + "\">" + SKETCH_VERSION + "</a></p>\n"
                     #ifdef OTA_UPDATES
@@ -810,6 +812,77 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({command: command})}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); location.reload(); }); }
 </script>)HTML";
     request->send(200, "text/html", message);
+  });
+
+  server.on("/yandex", HTTP_GET, [](AsyncWebServerRequest * request) {
+    String list;
+    const String cached = yandexHome.getDevices();
+    const String selected = yandexHome.getDeviceId();
+    int start = 0;
+    while (start < (int)cached.length()) {
+      int end = cached.indexOf('\n', start);
+      if (end == -1)
+        end = cached.length();
+      const String row = cached.substring(start, end);
+      const int tab = row.indexOf('\t');
+      if (tab != -1) {
+        const String id = row.substring(0, tab);
+        const String name = row.substring(tab + 1);
+        list += "<tr><td>" + String(id == selected ? "&#9654; " : "") + htmlEscape(name) + "</td>"
+                "<td><code>" + htmlEscape(id) + "</code></td>"
+                "<td><button onclick=\"post('/yandex/select?id=" + urlEncode(id) + "&amp;name=" + urlEncode(name) + "')\">Use this one</button></td></tr>";
+      }
+      start = end + 1;
+    }
+    if (list == "")
+      list = "<tr><td colspan=\"3\"><i>No sockets loaded yet</i></td></tr>";
+
+    String message = "<h1>Yandex smart home</h1>"
+                     "<p>Status: <b>" + htmlEscape(yandexHome.getStatus()) + "</b>"
+                     + String(yandexHome.busy() ? " (working...)" : "") + "</p>"
+                     "<p>Token: <b>" + String(yandexHome.hasToken() ? "stored" : "not set") + "</b>. "
+                     "Socket: <b>" + String(yandexHome.getDeviceId() == "" ? "not selected" : htmlEscape(yandexHome.getDeviceName())) + "</b></p>"
+                     "<form method=\"POST\" action=\"/yandex/token\">"
+                     "<input name=\"token\" type=\"password\" size=\"60\" placeholder=\"OAuth token\" required/> "
+                     "<input type=\"submit\" value=\"Store token\"/>"
+                     "</form>"
+                     "<p>The token is written to NVS and never shown again.</p>"
+                     "<h2>Sockets</h2>"
+                     "<p><button onclick=\"post('/yandex/devices')\">Load from Yandex</button> "
+                     "<button onclick=\"post('/yandex/test')\">Test: switch on</button></p>"
+                     "<table>" + list + "</table>"
+                     "<p><a href=\"/\">Back</a></p>";
+    message += R"HTML(<script>
+function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); setTimeout(function(){ location.reload(); }, 2500); }); }
+</script>)HTML";
+    request->send(200, "text/html", message);
+  });
+
+  server.on("/yandex/token", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("token", true)) {
+      request->send(400, "text/plain", "token is required");
+      return;
+    }
+    yandexHome.setToken(request->getParam("token", true)->value());
+    request->redirect("/yandex");
+  });
+
+  server.on("/yandex/devices", HTTP_POST, [](AsyncWebServerRequest * request) {
+    request->send(yandexHome.request(YandexHome::DeviceList) ? 204 : 409, "text/plain", "");
+  });
+
+  server.on("/yandex/select", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("id")) {
+      request->send(400, "text/plain", "id is required");
+      return;
+    }
+    yandexHome.setDevice(request->getParam("id")->value(),
+                         request->hasParam("name") ? request->getParam("name")->value() : "");
+    request->send(204, "text/plain", "");
+  });
+
+  server.on("/yandex/test", HTTP_POST, [](AsyncWebServerRequest * request) {
+    request->send(yandexHome.request(YandexHome::PowerOn) ? 204 : 409, "text/plain", "");
   });
 
   server.on("/select", HTTP_POST, [](AsyncWebServerRequest * request) {
