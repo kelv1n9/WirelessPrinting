@@ -2,13 +2,9 @@
 
 #include <Arduino.h>
 #include <ArduinoOTA.h>
-#if defined(ESP8266)
-  #include <ESP8266mDNS.h>        // https://github.com/esp8266/Arduino/tree/master/libraries/ESP8266mDNS
-#elif defined(ESP32)
-  #include <ESPmDNS.h>
-  #include <Update.h>
-  #include <Hash.h>
-#endif
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <Hash.h>
 #include <ArduinoJson.h>          // https://github.com/bblanchon/ArduinoJson (for implementing a subset of the OctoPrint API)
 #include <DNSServer.h>
 #include "StorageFS.h"
@@ -19,14 +15,8 @@
 
 #include "CommandQueue.h"
 
-// On ESP8266 use the normal Serial() for now, but name it PrinterSerial for compatibility with ESP32
-// On ESP32, use Serial1 (rather than the normal Serial0 which prints stuff during boot that confuses the printer)
-#ifdef ESP8266
-#define PrinterSerial Serial
-#endif
-#ifdef ESP32
+// Use Serial1 rather than the normal Serial0, which prints stuff during boot that confuses the printer
 HardwareSerial PrinterSerial(1);
-#endif
 
 WiFiServer telnetServer(23);
 WiFiClient serverClient;
@@ -36,7 +26,6 @@ DNSServer dns;
 
 // Configurable parameters
 #define SKETCH_VERSION "2.x-localbuild" // Gets inserted at build time by .travis.yml
-#define USE_FAST_SD                     // Use Default fast SD clock, comment if your SD is an old or slow one.
 #define OTA_UPDATES                     // Enable OTA firmware updates, comment if you don't want it (OTA may lead to security issues because someone may load any code on device)
 //#define OTA_PASSWORD ""               // Uncomment to protect OTA updates and assign a password (inside "")
 #define MAX_SUPPORTED_EXTRUDERS 6       // Number of supported extruder
@@ -75,7 +64,6 @@ String lastCommandSent, lastReceivedResponse;
 uint32_t lineNumber;
 String lastSentLine;
 bool swallowNextOk;
-uint32_t lastPrintedLine;
 
 uint8_t serialBaudIndex;
 uint16_t printerUsedBuffer;
@@ -106,12 +94,6 @@ inline String IpAddress2String(const IPAddress& ipAddress) {
          String(ipAddress[1]) + "." +
          String(ipAddress[2]) + "." +
          String(ipAddress[3]);
-}
-
-inline void setLed(const bool status) {
-  #if defined(LED_BUILTIN)
-    digitalWrite(LED_BUILTIN, status ? LOW : HIGH);   // Note: LOW turn the LED on
-  #endif
 }
 
 inline void telnetSend(const String line) {
@@ -233,7 +215,6 @@ void handlePrint() {
       isPrinting = false;
     }
     else if (!printPause && commandQueue.getFreeSlots() > 4) {    // Keep some space for "service" commands
-      ++lastPrintedLine;
       String line = gcodeFile.readStringUntil('\n'); // The G-Code line being worked on
       filePos += line.length();
       int pos = line.indexOf(';');
@@ -260,7 +241,6 @@ void handlePrint() {
     startPrint = restartPrint = false;
 
     filePos = 0;
-    lastPrintedLine = 0;
     prevM73Completion = prevM532Completion = 0.0;
 
     gcodeFile = storageFS.open(uploadedFullname);
@@ -367,26 +347,14 @@ bool M115ExtractBool(const String response, const String field, const bool onErr
   return result == "" ? onErrorValue : (result == "1" ? true : false);
 }
 
-inline String getDeviceName() {
-  #if defined(ESP8266)
-    return fwMachineType + " (" + String(ESP.getChipId(), HEX) + ")";
-  #elif defined(ESP32)
-    uint64_t chipid = ESP.getEfuseMac();
-    return fwMachineType + " (" + String((uint16_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX) + ")";
-  #else
-    #error Unimplemented chip!
-  #endif
+inline String getDeviceId() {
+  uint64_t chipid = ESP.getEfuseMac();
+
+  return String((uint16_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX);
 }
 
-inline String getDeviceId() {
-  #if defined(ESP8266)
-    return String(ESP.getChipId(), HEX);
-  #elif defined(ESP32)
-    uint64_t chipid = ESP.getEfuseMac();
-    return String((uint16_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX);
-  #else
-    #error Unimplemented chip!
-  #endif
+inline String getDeviceName() {
+  return fwMachineType + " (" + getDeviceId() + ")";
 }
 
 void mDNSInit() {
@@ -426,13 +394,8 @@ bool detectPrinter() {
       break;
 
     case 10:
-      // Initialize baud and send a request to printezr
-      #ifdef ESP8266
-      PrinterSerial.begin(serialBauds[serialBaudIndex]); // See note above; we have actually renamed Serial to Serial1
-      #endif
-      #ifdef ESP32
+      // Initialize baud and send a request to printer
       PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, 13, 12); // gpio13 = rx, gpio12 = tx (gpio14 taken by SD_MMC clock)
-      #endif
       telnetSend("Connecting at " + String(serialBauds[serialBaudIndex]));
       commandQueue.push("M110 N0"); // M110 - Reset line numbering before using checksums
       commandQueue.push("M115"); // M115 - Firmware Info
@@ -519,22 +482,13 @@ inline String stringify(bool value) {
 }
 
 void setup() {
-  #if defined(LED_BUILTIN)
-    pinMode(LED_BUILTIN, OUTPUT);     // Initialize the LED_BUILTIN pin as an output
-  #endif
-
-  #ifdef USE_FAST_SD
-    storageFS.begin(true);
-  #else
-    storageFS.begin(false);
-  #endif
+  storageFS.begin();
 
   for (int t = 0; t < MAX_SUPPORTED_EXTRUDERS; t++)
     toolTemperature[t] = { "0.0", "0.0" };
   bedTemperature = { "0.0", "0.0" };
 
   // Wait for connection
-  setLed(true);
   #ifdef OTA_UPDATES
     AsyncElegantOTA.begin(&server);
   #endif
@@ -542,20 +496,12 @@ void setup() {
   // wifiManager.resetSettings();   // Uncomment this to reset the settings on the device, then you will need to reflash with USB and this commented out!
   wifiManager.setDebugOutput(false);  // So that it does not send stuff to the printer that the printer does not understand
   wifiManager.autoConnect("AutoConnectAP");
-  setLed(false);
 
   telnetServer.begin();
   telnetServer.setNoDelay(true);
 
-  if (storageFS.activeSPIFFS()) {
-    #if defined(ESP8266)
-      server.addHandler(new SPIFFSEditor());
-    #elif defined(ESP32)
-      server.addHandler(new SPIFFSEditor(SPIFFS));
-    #else
-      #error Unsupported SOC
-    #endif
-  }
+  if (storageFS.activeSPIFFS())
+    server.addHandler(new SPIFFSEditor(SPIFFS));
 
   initUploadedFilename();
 

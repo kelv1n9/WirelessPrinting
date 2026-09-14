@@ -2,14 +2,10 @@
 
 #define FS_NO_GLOBALS // allow spiffs to coexist with SD card, define BEFORE including FS.h
 #include <FS.h>
-#if defined(ESP8266)
-  #include <SdFat.h>
-#elif defined(ESP32)
-  #include <SPIFFS.h>
-  #define FORMAT_SPIFFS_IF_FAILED true
-  #include <SD_MMC.h>
-  using fs::File;
-#endif
+#include <SPIFFS.h>
+#define FORMAT_SPIFFS_IF_FAILED true
+#include <SD_MMC.h>
+using fs::File;
 
 class FileWrapper : public Stream {
   friend class StorageFS;
@@ -17,13 +13,6 @@ class FileWrapper : public Stream {
   private:
     File sdFile;
     fs::File fsFile;
-    #if defined(ESP8266)
-      enum FSDirType { Null, DirSource, DirEntry };
-
-      String cachedName;
-      fs::Dir fsDir;
-      FSDirType fsDirType;
-    #endif
 
   public:
     // Print methods
@@ -37,11 +26,7 @@ class FileWrapper : public Stream {
     virtual int read();
 
     inline operator bool() {
-      return sdFile || fsFile
-      #if defined(ESP8266)
-        || fsDirType != Null;
-      #endif
-      ;
+      return sdFile || fsFile;
     }
 
     String name();
@@ -53,11 +38,8 @@ class FileWrapper : public Stream {
     inline bool isDirectory() {
       if (sdFile)
         return sdFile.isDirectory();
-      #if defined(ESP8266)
-        return fsDirType == DirSource;
-      #else
-        return fsFile ? fsFile.isDirectory() : false;
-      #endif
+
+      return fsFile ? fsFile.isDirectory() : false;
     }
 
     FileWrapper openNextFile();
