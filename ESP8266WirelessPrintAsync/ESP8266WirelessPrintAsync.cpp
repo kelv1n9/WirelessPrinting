@@ -4,13 +4,11 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <Update.h>
-#include <Hash.h>
 #include <ArduinoJson.h>          // https://github.com/bblanchon/ArduinoJson (for implementing a subset of the OctoPrint API)
 #include <DNSServer.h>
 #include "StorageFS.h"
 #include <ESPAsyncWebServer.h>    // https://github.com/me-no-dev/ESPAsyncWebServer
 #include <ESPAsyncWiFiManager.h>  // https://github.com/alanswx/ESPAsyncWiFiManager/
-#include <AsyncElegantOTA.h>      // https://github.com/ayushsharma82/AsyncElegantOTA
 
 #include "CommandQueue.h"
 
@@ -488,9 +486,6 @@ void setup() {
   bedTemperature = { "0.0", "0.0" };
 
   // Wait for connection
-  #ifdef OTA_UPDATES
-    AsyncElegantOTA.begin(&server);
-  #endif
   AsyncWiFiManager wifiManager(&server, &dns);
   // wifiManager.resetSettings();   // Uncomment this to reset the settings on the device, then you will need to reflash with USB and this commented out!
   wifiManager.setDebugOutput(false);  // So that it does not send stuff to the printer that the printer does not understand
@@ -559,6 +554,43 @@ void setup() {
     message += "</pre>";
     request->send(200, "text/html", message);
   });
+
+  #ifdef OTA_UPDATES
+    server.on("/update", HTTP_GET, [](AsyncWebServerRequest * request) {
+      request->send(200, "text/html", "<h1>" + getDeviceName() + "</h1>"
+                                      "<form method=\"POST\" action=\"/update\" enctype=\"multipart/form-data\">\n"
+                                      "Firmware image: <input name=\"firmware\" type=\"file\" accept=\".bin\" required/><br/>\n"
+                                      "<input type=\"submit\" value=\"Update\"/>\n"
+                                      "</form>"
+                                      "<p>The device reboots on success. Do not power it off during the upload.</p>");
+    });
+
+    server.on("/update", HTTP_POST, [](AsyncWebServerRequest * request) {
+      const bool failed = Update.hasError() || Update.progress() == 0;
+      AsyncWebServerResponse *response = request->beginResponse(failed ? 500 : 200, "text/plain",
+                                                                failed ? String(Update.errorString()) : String("OK, rebooting"));
+      response->addHeader("Connection", "close");
+      request->send(response);
+      ESPrestartRequired = !failed;
+    },
+    [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+      if (!index) {
+        if (Update.isRunning())
+          Update.abort();
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+          return;
+        lcd("Updating...");
+      }
+
+      if (!Update.isRunning())
+        return;
+
+      if (Update.write(data, len) != len)
+        Update.abort();
+      else if (final)
+        Update.end(true);
+    });
+  #endif
 
   // Download page
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest * request) {
@@ -934,6 +966,7 @@ void loop() {
     //****************
     if (ESPrestartRequired) {  // check the flag here to determine if a restart is required
       ESPrestartRequired = false;
+      delay(500);
       ESP.restart();
     }
 
@@ -1004,7 +1037,4 @@ void loop() {
     }
   }
     
-  #ifdef OTA_UPDATES
-    AsyncElegantOTA.loop();
-  #endif
 }
