@@ -23,6 +23,18 @@ class StorageFS {
       return 255;
     }
 
+    inline static bool exists(const String path) {
+      return hasSD && SD_MMC.exists(path);
+    }
+
+    inline static uint64_t totalBytes() {
+      return hasSD ? SD_MMC.totalBytes() : 0;
+    }
+
+    inline static uint64_t freeBytes() {
+      return hasSD ? SD_MMC.totalBytes() - SD_MMC.usedBytes() : 0;
+    }
+
     static FileWrapper open(const String path, const char *openMode = "r");
     static void remove(const String filename);
 };

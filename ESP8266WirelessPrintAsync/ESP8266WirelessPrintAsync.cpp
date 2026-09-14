@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <esp_task_wdt.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>          // https://github.com/bblanchon/ArduinoJson (for implementing a subset of the OctoPrint API)
 #include <DNSServer.h>
 #include "StorageFS.h"
@@ -38,6 +39,7 @@ DNSServer dns;
 #define WIFI_RETRY_INTERVAL 30000       // Reconnection attempt interval while the network is down
 #define WIFI_REBOOT_AFTER 600000        // Reboot after this long offline, so a changed network can be configured again
 #define WDT_TIMEOUT 30                  // Seconds without a loop iteration before the watchdog reboots the device
+#define MAX_LISTED_FILES 64             // Upper bound on the directory listing, so a full card cannot exhaust the heap
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
 #define API_VERSION     "0.1"
@@ -76,10 +78,17 @@ uint8_t serialBaudIndex;
 uint16_t printerUsedBuffer;
 uint32_t serialReceiveTimeoutTimer;
 
-// Uploaded file information
-String uploadedFullname;
-size_t uploadedFileSize, filePos;
-uint32_t uploadedFileDate = 1378847754;
+// Stored files
+Preferences preferences;
+
+String selectedFile;
+size_t selectedFileSize, filePos;
+uint32_t selectedFileDate;
+
+String printingFile;
+size_t printingFileSize;
+
+String lastUploadFields, uploadFailure;
 
 // Temperature for printer status reporting
 #define TEMP_COMMAND      "M105"
@@ -202,8 +211,77 @@ inline void playSound() {
   commandQueue.push("M300 S500 P50");
 }
 
-inline String getUploadedFilename() {
-  return uploadedFullname == "" ? "Unknown" : uploadedFullname.substring(1);
+inline String stringify(bool value) {
+  return value ? "true" : "false";
+}
+
+inline String baseName(const String path) {
+  return path.startsWith("/") ? path.substring(1) : path;
+}
+
+inline String jobFilename() {
+  const String path = isPrinting ? printingFile : selectedFile;
+
+  return path == "" ? "Unknown" : baseName(path);
+}
+
+inline size_t jobFileSize() {
+  return isPrinting ? printingFileSize : selectedFileSize;
+}
+
+inline bool isGcodeFilename(const String name) {
+  if (name.startsWith("."))
+    return false;
+
+  String lowercase = name;
+  lowercase.toLowerCase();
+
+  return lowercase.endsWith(".gcode") || lowercase.endsWith(".gco") || lowercase.endsWith(".g");
+}
+
+String sanitizeFilename(const String filename) {
+  String name = filename;
+  int pos = name.lastIndexOf('/');
+  if (pos != -1)
+    name = name.substring(pos + 1);
+  pos = name.lastIndexOf('\\');
+  if (pos != -1)
+    name = name.substring(pos + 1);
+
+  String clean;
+  for (unsigned int i = 0; i < name.length(); ++i) {
+    const char ch = name[i];
+    const bool safe = ch >= 32 && ch < 127 && ch != '"' && ch != '*' && ch != ':' &&
+                      ch != '<' && ch != '>' && ch != '?' && ch != '|';
+    clean += safe ? ch : '_';
+  }
+  while (clean.startsWith("."))
+    clean = clean.substring(1);
+
+  const unsigned int limit = storageFS.getMaxPathLength() - 1;
+  if (clean.length() > limit)
+    clean = clean.substring(clean.length() - limit);
+
+  return clean;
+}
+
+void selectFile(const String path) {
+  selectedFile = path;
+  selectedFileSize = 0;
+  selectedFileDate = 0;
+
+  if (path != "") {
+    FileWrapper file = storageFS.open(path);
+    if (file) {
+      selectedFileSize = file.size();
+      selectedFileDate = file.lastWrite();
+      file.close();
+    }
+  }
+
+  preferences.begin("wirelessprint", false);
+  preferences.putString("selected", path);
+  preferences.end();
 }
 
 void handlePrint() {
@@ -232,7 +310,7 @@ void handlePrint() {
       }
 
       // Send to printer completion (if supported)
-      printCompletion = uploadedFileSize > 0 ? (float)filePos / uploadedFileSize * 100 : 0;
+      printCompletion = printingFileSize > 0 ? (float)filePos / printingFileSize * 100 : 0;
       if (fwBuildPercentCap && printCompletion - prevM73Completion >= 1) {
         commandQueue.push("M73 P" + String((int)printCompletion));
         prevM73Completion = printCompletion;
@@ -250,17 +328,19 @@ void handlePrint() {
     filePos = 0;
     prevM73Completion = prevM532Completion = 0.0;
 
-    gcodeFile = storageFS.open(uploadedFullname);
+    gcodeFile = storageFS.open(selectedFile);
     if (!gcodeFile)
       lcd("Can't open file");
     else {
+      printingFile = selectedFile;
+      printingFileSize = selectedFileSize;
       lcd("Printing...");
       playSound();
       printStartTime = millis();
       isPrinting = true;
       if (fwProgressCap) {
         commandQueue.push("M530 S1 L0");
-        commandQueue.push("M531 " + getUploadedFilename());
+        commandQueue.push("M531 " + baseName(printingFile));
       }
     }
   }
@@ -268,27 +348,65 @@ void handlePrint() {
 
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
   static FileWrapper file;
+  static String path;
 
   if (!index) {
-    lcd("Receiving...");
+    if (file) {
+      file.close();
+      if (path != "")
+        storageFS.remove(path);
+    }
+    path = "";
+    uploadFailure = "";
 
-    if (uploadedFullname != "")
-      storageFS.remove(uploadedFullname);     // Remove previous file
-    int pos = filename.lastIndexOf("/");
-    uploadedFullname = pos == -1 ? "/" + filename : filename.substring(pos);
-    if (uploadedFullname.length() > storageFS.getMaxPathLength())
-      uploadedFullname = "/cached.gco";   // TODO maybe a different solution
-    file = storageFS.open(uploadedFullname, "w"); // create or truncate file
+    const String name = sanitizeFilename(filename);
+    if (!storageFS.isActive())
+      uploadFailure = "no storage";
+    else if (!isGcodeFilename(name))
+      uploadFailure = "not a gcode file";
+    else if (isPrinting && "/" + name == printingFile)
+      uploadFailure = "that file is being printed";
+    else if (request->contentLength() >= storageFS.freeBytes())
+      uploadFailure = "not enough free space";
+    else {
+      file = storageFS.open("/" + name, "w");
+      if (!file)
+        uploadFailure = "cannot create file";
+      else {
+        path = "/" + name;
+        lcd("Receiving...");
+      }
+    }
   }
 
-  file.write(data, len);
+  if (uploadFailure == "" && file && file.write(data, len) != len)
+    uploadFailure = "write error, card full";
 
-  if (final) { // upload finished
-    file.close();
-    uploadedFileSize = index + len;
+  if (final) {
+    if (file)
+      file.close();
+    if (uploadFailure != "") {
+      if (path != "")
+        storageFS.remove(path);
+    }
+    else if (path != "")
+      selectFile(path);
+    path = "";
   }
-  else
-    uploadedFileSize = 0;
+}
+
+bool paramIsTrue(AsyncWebServerRequest *request, const char *name) {
+  AsyncWebParameter *param = NULL;
+  if (request->hasParam(name, true))
+    param = request->getParam(name, true);
+  else if (request->hasParam(name))
+    param = request->getParam(name);
+  if (param == NULL)
+    return false;
+
+  const String value = param->value();
+
+  return value != "false" && value != "0";
 }
 
 int apiJobHandler(JsonObject root) {
@@ -300,7 +418,7 @@ int apiJobHandler(JsonObject root) {
       cancelPrint = true;
     }
     else if (strcmp(command, "start") == 0) {
-      if (isPrinting || !printerConnected || uploadedFullname == "")
+      if (isPrinting || !printerConnected || selectedFile == "")
         return 409;
       startPrint = true;
     }
@@ -455,24 +573,76 @@ bool detectPrinter() {
   return false;
 }
 
-inline bool isGcodeFilename(const String name) {
-  if (name.startsWith("."))
-    return false;
+String uint64ToString(const uint64_t value) {
+  char buffer[21];
+  snprintf(buffer, sizeof(buffer), "%llu", value);
 
-  String lowercase = name;
-  lowercase.toLowerCase();
-
-  return lowercase.endsWith(".gcode") || lowercase.endsWith(".gco") || lowercase.endsWith(".g");
+  return String(buffer);
 }
 
-void initUploadedFilename() {
+String jsonEscape(const String text) {
+  String escaped;
+  for (unsigned int i = 0; i < text.length(); ++i) {
+    const char ch = text[i];
+    if (ch == '"' || ch == '\\')
+      escaped += '\\';
+    if (ch >= 32)
+      escaped += ch;
+  }
+
+  return escaped;
+}
+
+String htmlEscape(const String text) {
+  String escaped;
+  for (unsigned int i = 0; i < text.length(); ++i) {
+    const char ch = text[i];
+    if (ch == '&')
+      escaped += "&amp;";
+    else if (ch == '<')
+      escaped += "&lt;";
+    else if (ch == '>')
+      escaped += "&gt;";
+    else if (ch == '"')
+      escaped += "&quot;";
+    else if (ch == '\'')
+      escaped += "&#39;";
+    else
+      escaped += ch;
+  }
+
+  return escaped;
+}
+
+String urlEncode(const String text) {
+  static const char hex[] = "0123456789ABCDEF";
+  String encoded;
+
+  for (unsigned int i = 0; i < text.length(); ++i) {
+    const char ch = text[i];
+    const bool unreserved = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                            (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-' || ch == '~';
+    if (unreserved)
+      encoded += ch;
+    else {
+      encoded += '%';
+      encoded += hex[((uint8_t)ch >> 4) & 0x0F];
+      encoded += hex[(uint8_t)ch & 0x0F];
+    }
+  }
+
+  return encoded;
+}
+
+String firstStoredFile() {
+  String found;
+
   FileWrapper dir = storageFS.open("/");
   if (dir) {
     FileWrapper file = dir.openNextFile();
     while (file) {
       if (!file.isDirectory() && isGcodeFilename(file.name())) {
-        uploadedFullname = "/" + file.name();
-        uploadedFileSize = file.size();
+        found = "/" + file.name();
         file.close();
         break;
       }
@@ -481,6 +651,84 @@ void initUploadedFilename() {
     }
     dir.close();
   }
+
+  return found;
+}
+
+void forEachStoredFile(std::function<void(const String, const uint32_t, const uint32_t)> visit) {
+  FileWrapper dir = storageFS.open("/");
+  if (!dir)
+    return;
+
+  unsigned int listed = 0;
+  FileWrapper file = dir.openNextFile();
+  while (file && listed < MAX_LISTED_FILES) {
+    if (!file.isDirectory() && isGcodeFilename(file.name())) {
+      visit(file.name(), file.size(), file.lastWrite());
+      ++listed;
+    }
+    file.close();
+    file = dir.openNextFile();
+  }
+  if (file)
+    file.close();
+  dir.close();
+}
+
+String fileListJson() {
+  String json = "{\r\n  \"files\": [";
+  bool first = true;
+
+  forEachStoredFile([&json, &first](const String name, const uint32_t size, const uint32_t date) {
+    const String escaped = jsonEscape(name);
+    if (!first)
+      json += ",";
+    first = false;
+    json += "\r\n    {"
+            "\"name\": \"" + escaped + "\", "
+            "\"path\": \"" + escaped + "\", "
+            "\"display\": \"" + escaped + "\", "
+            "\"origin\": \"local\", "
+            "\"size\": " + String(size) + ", "
+            "\"date\": " + String(date) + ", "
+            "\"type\": \"machinecode\", "
+            "\"typePath\": [\"machinecode\", \"gcode\"], "
+            "\"selected\": " + stringify("/" + name == selectedFile) + ", "
+            "\"refs\": {\"download\": \"/download?name=" + urlEncode(name) + "\"}"
+            "}";
+  });
+
+  json += "\r\n  ],\r\n"
+          "  \"free\": " + uint64ToString(storageFS.freeBytes()) + ",\r\n"
+          "  \"total\": " + uint64ToString(storageFS.totalBytes()) + "\r\n"
+          "}";
+
+  return json;
+}
+
+String fileListHtml() {
+  String html;
+
+  forEachStoredFile([&html](const String name, const uint32_t size, const uint32_t date) {
+    const String shown = htmlEscape(name);
+    const String encoded = urlEncode(name);
+    const bool current = "/" + name == selectedFile;
+    html += "<tr><td>" + String(current ? "&#9654; " : "") + shown + "</td>"
+            "<td align=\"right\">" + String(size / 1024) + " KiB</td>"
+            "<td><button onclick=\"post('/select?name=" + encoded + "')\">Select</button> "
+            "<button onclick=\"post('/delete?name=" + encoded + "')\">Delete</button> "
+            "<a href=\"/download?name=" + encoded + "\">Download</a></td></tr>";
+  });
+
+  return html == "" ? "<tr><td colspan=\"3\"><i>No files</i></td></tr>" : html;
+}
+
+void initSelectedFile() {
+  preferences.begin("wirelessprint", true);
+  const String stored = preferences.getString("selected", "");
+  preferences.end();
+
+  selectFile(storageFS.exists(stored) ? stored : firstStoredFile());
 }
 
 inline String getState() {
@@ -494,10 +742,6 @@ inline String getState() {
     return "Printing";
   else
     return "Operational";
-}
-
-inline String stringify(bool value) {
-  return value ? "true" : "false";
 }
 
 void setup() {
@@ -522,7 +766,7 @@ void setup() {
   telnetServer.begin();
   telnetServer.setNoDelay(true);
 
-  initUploadedFilename();
+  initSelectedFile();
 
   server.onNotFound([](AsyncWebServerRequest * request) {
     telnetSend("404 | Page '" + request->url() + "' not found");
@@ -531,19 +775,22 @@ void setup() {
 
   // Main page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest * request) {
-      String uploadedName = uploadedFullname;
-  uploadedName.replace("/", "");
     String message = "<h1>" + getDeviceName() + "</h1>"
+                     "<p>" + getState() + ". Selected: <b>" + htmlEscape(jobFilename()) + "</b></p>"
+                     "<p><button onclick=\"job('start')\">Print selected</button> "
+                     "<button onclick=\"job('cancel')\">Cancel print</button></p>"
+                     "<h2>Files on " + storageFS.getActiveFS() + "</h2>"
+                     "<table>" + fileListHtml() + "</table>"
+                     "<p>" + uint64ToString(storageFS.freeBytes() / 1048576) + " MiB free of " +
+                             uint64ToString(storageFS.totalBytes() / 1048576) + " MiB</p>"
+                     "<h2>Upload</h2>"
                      "<form enctype=\"multipart/form-data\" action=\"/api/files/local\" method=\"POST\">\n"
-                     "<p>You can also print from the command line using curl:</p>\n"
-                     "<pre>curl -F \"file=@/path/to/some.gcode\" -F \"print=true\" " + IpAddress2String(WiFi.localIP()) + "/api/files/local</pre>\n"
-                     "Choose a file to upload: <input name=\"file\" type=\"file\" accept=\".gcode,.GCODE,.gco,.GCO\"/><br/>\n"
-                     "<input type=\"checkbox\" name=\"print\" id = \"printImmediately\" value=\"true\" checked>\n"
-                     "<label for = \"printImmediately\">Print Immediately</label><br/>\n"
-                     "<input type=\"submit\" value=\"Upload\" />\n"
+                     "<input name=\"file\" type=\"file\" accept=\".gcode,.GCODE,.gco,.GCO\" required/><br/>\n"
+                     "<input type=\"checkbox\" name=\"print\" id=\"printImmediately\" value=\"true\">\n"
+                     "<label for=\"printImmediately\">Print immediately</label><br/>\n"
+                     "<input type=\"submit\" value=\"Upload\"/>\n"
                      "</form>"
-                     "<p><script>\nfunction startFunction(command) {\n  var xmlhttp = new XMLHttpRequest();\n  xmlhttp.open(\"POST\", \"/api/job\");\n  xmlhttp.setRequestHeader(\"Content-Type\", \"application/json\");\n  xmlhttp.send(JSON.stringify({command:command}));\n}\n</script>\n<button onclick=\"startFunction(\'cancel\')\">Cancel active print</button>\n<button onclick=\"startFunction(\'start\')\">Print " + uploadedName + "</button></p>\n"
-                     "<p><a href=\"/download\">Download " + uploadedName + "</a></p>"
+                     "<pre>curl -F \"file=@/path/to/some.gcode\" -F \"print=true\" " + IpAddress2String(WiFi.localIP()) + "/api/files/local</pre>\n"
                      "<p><a href=\"/info\">Info</a></p>"
                      "<hr>"
                      "<p>WirelessPrinting <a href=\"https://github.com/kelv1n9/WirelessPrinting/commit/" + SKETCH_VERSION + "\">" + SKETCH_VERSION + "</a></p>\n"
@@ -551,7 +798,45 @@ void setup() {
                       "<p>OTA Update Device: <a href=\"/update\">Click Here</a></p>"
                     #endif
                      ;
+    message += R"HTML(<script>
+function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); location.reload(); }); }
+function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({command: command})}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); location.reload(); }); }
+</script>)HTML";
     request->send(200, "text/html", message);
+  });
+
+  server.on("/select", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("name")) {
+      request->send(400, "text/plain", "name is required");
+      return;
+    }
+    const String path = "/" + sanitizeFilename(request->getParam("name")->value());
+    if (!storageFS.exists(path)) {
+      request->send(404, "text/plain", "no such file");
+      return;
+    }
+    selectFile(path);
+    request->send(204, "text/plain", "");
+  });
+
+  server.on("/delete", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("name")) {
+      request->send(400, "text/plain", "name is required");
+      return;
+    }
+    const String path = "/" + sanitizeFilename(request->getParam("name")->value());
+    if (!storageFS.exists(path)) {
+      request->send(404, "text/plain", "no such file");
+      return;
+    }
+    if (isPrinting && path == printingFile) {
+      request->send(409, "text/plain", "that file is being printed");
+      return;
+    }
+    storageFS.remove(path);
+    if (path == selectedFile)
+      selectFile(firstStoredFile());
+    request->send(204, "text/plain", "");
   });
 
   // Info page
@@ -560,12 +845,15 @@ void setup() {
                      "Free heap: " + String(ESP.getFreeHeap()) + "\n\n"
                      "File system: " + storageFS.getActiveFS() + "\n";
     if (storageFS.isActive()) {
-      message += "Filename length limit: " + String(storageFS.getMaxPathLength()) + "\n";
-      if (uploadedFullname != "") {
-        message += "Uploaded file: " + getUploadedFilename() + "\n"
-                   "Uploaded file size: " + String(uploadedFileSize) + "\n";
-      }
+      message += "Card free: " + uint64ToString(storageFS.freeBytes()) + " of " + uint64ToString(storageFS.totalBytes()) + "\n"
+                 "Selected file: " + htmlEscape(baseName(selectedFile)) + "\n"
+                 "Selected file size: " + String(selectedFileSize) + "\n";
+      if (isPrinting)
+        message += "Printing file: " + htmlEscape(baseName(printingFile)) + "\n";
     }
+    message += "Last upload fields:" + htmlEscape(lastUploadFields) + "\n";
+    if (uploadFailure != "")
+      message += "Last upload failure: " + htmlEscape(uploadFailure) + "\n";
     message += "\n"
                "Last command sent: " + lastCommandSent + "\n"
                "Last received response: " + lastReceivedResponse + "\n";
@@ -622,13 +910,25 @@ void setup() {
 
   // Download page
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest * request) {
-    AsyncWebServerResponse *response = request->beginResponse("application/x-gcode", uploadedFileSize, [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+    String path = selectedFile;
+    if (request->hasParam("name"))
+      path = "/" + sanitizeFilename(request->getParam("name")->value());
+
+    FileWrapper probe = storageFS.open(path);
+    if (!probe) {
+      request->send(404, "text/plain", "no such file");
+      return;
+    }
+    const size_t fileSize = probe.size();
+    probe.close();
+
+    AsyncWebServerResponse *response = request->beginResponse("application/x-gcode", fileSize, [path, fileSize](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
       static size_t downloadBytesLeft;
       static FileWrapper downloadFile;
 
       if (!index) {
-        downloadFile = storageFS.open(uploadedFullname);
-        downloadBytesLeft = uploadedFileSize;
+        downloadFile = storageFS.open(path);
+        downloadBytesLeft = fileSize;
       }
       size_t bytes = min(downloadBytesLeft, maxLen);
       bytes = min(bytes, (size_t)2048);
@@ -639,8 +939,8 @@ void setup() {
 
       return bytes;
     });
-    response->addHeader("Content-Disposition", "attachment; filename=\"" + getUploadedFilename()+ "\"");
-    request->send(response);    
+    response->addHeader("Content-Disposition", "attachment; filename=\"" + baseName(path) + "\"");
+    request->send(response);
   });
 
   server.on("/api/login", HTTP_POST, [](AsyncWebServerRequest * request) {
@@ -679,31 +979,42 @@ void setup() {
   // Todo: http://docs.octoprint.org/en/master/api/connection.html#post--api-connection
 
   // File Operations
-  // Pending: http://docs.octoprint.org/en/master/api/files.html#retrieve-all-files
+  // http://docs.octoprint.org/en/master/api/files.html#retrieve-all-files
   server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest * request) {
-    request->send(200, "application/json", "{\r\n"
-                                           "  \"files\": {\r\n"
-                                           "  }\r\n"
-                                           "}");
+    request->send(200, "application/json", fileListJson());
   });
 
   // For Slic3r OctoPrint compatibility
   server.on("/api/files/local", HTTP_POST, [](AsyncWebServerRequest * request) {
     // https://docs.octoprint.org/en/master/api/files.html?highlight=api%2Ffiles%2Flocal#upload-file-or-create-folder
+    lastUploadFields = "";
+    for (int i = 0; i < request->params(); ++i) {
+      AsyncWebParameter *param = request->getParam(i);
+      lastUploadFields += " " + param->name() + "=" + param->value();
+    }
+
+    if (uploadFailure != "") {
+      lcd("Upload failed");
+      request->send(500, "application/json", "{\"error\": \"" + jsonEscape(uploadFailure) + "\"}");
+      return;
+    }
+
     lcd("Received");
     playSound();
 
-    // We are not using
-    // if (request->hasParam("print", true))
-    // due to https://github.com/fieldOfView/Cura-OctoPrintPlugin/issues/156
-    
-    startPrint = printerConnected && !isPrinting && uploadedFullname != "";
+    if (paramIsTrue(request, "print")) {
+      if (!printerConnected || isPrinting) {
+        request->send(409, "application/json", "{\"error\": \"printer is busy\"}");
+        return;
+      }
+      startPrint = true;
+    }
 
     // OctoPrint sends 201 here; https://github.com/fieldOfView/Cura-OctoPrintPlugin/issues/155#issuecomment-596110996
     request->send(201, "application/json", "{\r\n"
                                            "  \"files\": {\r\n"
                                            "    \"local\": {\r\n"
-                                           "      \"name\": \"" + getUploadedFilename() + "\",\r\n"
+                                           "      \"name\": \"" + jsonEscape(baseName(selectedFile)) + "\",\r\n"
                                            "      \"origin\": \"local\"\r\n"
                                            "    }\r\n"
                                            "  },\r\n"
@@ -721,10 +1032,10 @@ void setup() {
     request->send(200, "application/json", "{\r\n"
                                            "  \"job\": {\r\n"
                                            "    \"file\": {\r\n"
-                                           "      \"name\": \"" + getUploadedFilename() + "\",\r\n"
+                                           "      \"name\": \"" + jsonEscape(jobFilename()) + "\",\r\n"
                                            "      \"origin\": \"local\",\r\n"
-                                           "      \"size\": " + String(uploadedFileSize) + ",\r\n"
-                                           "      \"date\": " + String(uploadedFileDate) + "\r\n"
+                                           "      \"size\": " + String(jobFileSize()) + ",\r\n"
+                                           "      \"date\": " + String(selectedFileDate) + "\r\n"
                                            "    },\r\n"
                                            //"    \"estimatedPrintTime\": \"" + estimatedPrintTime + "\",\r\n"
                                            "    \"filament\": {\r\n"

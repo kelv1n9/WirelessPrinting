@@ -8,6 +8,8 @@ Send gcode to a Marlin printer over WiFi from any slicer that speaks the OctoPri
 
 - **ESP32 only.** The ESP8266 environments are gone.
 - **microSD through SD_MMC in 1-bit mode**, which works with the onboard slot of ESP32-CAM boards and keeps most GPIOs free. A card is required, the SPIFFS fallback is gone.
+- **The card is a library, not a single slot.** Upstream deletes the previous file on every upload and answers the OctoPrint file listing with an empty stub. Files now accumulate, `/api/files` returns them all with sizes and free space, and one of them is selected for printing. The selection survives a reboot.
+- **Upload and print are separate.** Upstream ignores the `print` field and always starts a print, so both of a slicer's buttons behave the same. The field is now honoured.
 - **Line numbers and checksums.** Every command is sent as `N<n> <command>*<checksum>` and lost bytes are recovered through Marlin's resend mechanism. Upstream sends plain text, so a single dropped byte silently turns into a wrong move. On a hand-wired serial link at 250000 baud this happens often enough to ruin prints.
 - **Transmission errors no longer stop the print.** Upstream treats every `Error:` from Marlin as fatal and fires `M112`, which halts the printer. Only genuine faults do that now.
 - **A new telnet client takes over** instead of being locked out by a half-open socket.
@@ -42,6 +44,15 @@ On first boot the module opens an access point named `AutoConnectAP`. Connect to
 - Web interface: `http://<ip>/`
 - Raw gcode console: `nc <ip> 23`
 - Slicer: host type **OctoPrint**, the module's IP, any API key
+
+Beyond the OctoPrint subset, the web interface uses two endpoints of its own:
+
+```
+POST /select?name=<file>
+POST /delete?name=<file>
+```
+
+A file that is currently being printed cannot be deleted or overwritten.
 
 There is no authentication. Keep it on your local network.
 

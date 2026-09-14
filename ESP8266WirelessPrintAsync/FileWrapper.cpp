@@ -36,6 +36,10 @@ uint32_t FileWrapper::size() {
   return sdFile ? sdFile.size() : 0;
 }
 
+uint32_t FileWrapper::lastWrite() {
+  return sdFile ? (uint32_t)sdFile.getLastWrite() : 0;
+}
+
 size_t FileWrapper::read(uint8_t *buf, size_t size) {
   return sdFile ? sdFile.read(buf, size) : 0;
 }
