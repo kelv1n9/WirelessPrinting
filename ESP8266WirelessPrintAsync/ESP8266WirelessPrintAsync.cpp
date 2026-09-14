@@ -301,7 +301,7 @@ void handlePrint() {
     }
     else if (!printPause && commandQueue.getFreeSlots() > 4) {    // Keep some space for "service" commands
       String line = gcodeFile.readStringUntil('\n'); // The G-Code line being worked on
-      filePos += line.length();
+      filePos += line.length() + 1;
       int pos = line.indexOf(';');
       if (line.length() > 0 && pos != 0 && line[0] != '(' && line[0] != '\r') {
         if (pos != -1)
@@ -310,7 +310,7 @@ void handlePrint() {
       }
 
       // Send to printer completion (if supported)
-      printCompletion = printingFileSize > 0 ? (float)filePos / printingFileSize * 100 : 0;
+      printCompletion = printingFileSize > 0 ? min((float)filePos / printingFileSize * 100, 100.0f) : 0;
       if (fwBuildPercentCap && printCompletion - prevM73Completion >= 1) {
         commandQueue.push("M73 P" + String((int)printCompletion));
         prevM73Completion = printCompletion;
