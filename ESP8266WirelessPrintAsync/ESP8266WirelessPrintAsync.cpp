@@ -90,6 +90,8 @@ uint32_t lineNumber;
 String lastSentLine;
 bool swallowNextOk;
 uint8_t timeoutRetries;
+int32_t lastLineReported = -1;
+bool printEndedEarly;
 uint32_t wifiRetryTimer, wifiDownSince;
 
 bool autoPowerOff, powerOffArmed, updateSucceeded;
@@ -328,10 +330,15 @@ void handlePrint() {
   if (isPrinting) {
     const bool abortPrint = (restartPrint || cancelPrint || printerRestarted);
     if (abortPrint || !gcodeFile.available()) {
+      printEndedEarly = !abortPrint && filePos + 64 < printingFileSize;
       gcodeFile.close();
       if (fwProgressCap)
         commandQueue.push("M530 S0");
-      if (!abortPrint)
+      if (printEndedEarly) {
+        cancelPrint = true;
+        lcd("Ended early");
+      }
+      else if (!abortPrint)
         lcd("Complete");
       printPause = false;
       isPrinting = false;
@@ -1715,14 +1722,21 @@ void ReceiveResponses() {
 
       if (serialResponse.startsWith("Resend:", lineStartPos) || serialResponse.startsWith("rs ", lineStartPos)) {
         const int32_t requested = parseResendNumber(serialResponse, lineStartPos);
-        if (requested >= 0 && (uint32_t)requested < lineNumber)
-          printerRestarted = true;
-        if (!printerRestarted && !commandQueue.isAckEmpty() && lastCommandSent != "") {  // Only one command is ever unacknowledged, so it is the one being asked for
-          ++linesResent;
-          transmitCommand(lastCommandSent, requested < 0 ? lineNumber : (uint32_t)requested);
+        const bool trusted = requested >= 0 && (lastLineReported < 0 || requested == lastLineReported + 1);
+
+        if (!trusted)
+          responseDetail = "resend ignored, does not match Last Line " + String(lastLineReported);
+        else {
+          if ((uint32_t)requested < lineNumber)
+            printerRestarted = true;
+          if (!printerRestarted && !commandQueue.isAckEmpty() && lastCommandSent != "") {  // Only one command is ever unacknowledged, so it is the one being asked for
+            ++linesResent;
+            transmitCommand(lastCommandSent, (uint32_t)requested);
+          }
+          responseDetail = "resend";
         }
+        lastLineReported = -1;
         swallowNextOk = true;
-        responseDetail = "resend";
       }
       else if (serialResponse.startsWith("start", lineStartPos)) {
         printerRestarted = true;
@@ -1755,12 +1769,15 @@ void ReceiveResponses() {
           responseDetail = "cold extrusion";
         }
         else if (serialResponse.startsWith("Error:")) {
-          if (serialResponse.indexOf("Last Line") == -1) {   // Every Marlin transmission error ends with 'Last Line: N' and is followed by a Resend
+          const int lastLine = serialResponse.indexOf("Last Line");
+          if (lastLine == -1) {   // Every Marlin transmission error ends with 'Last Line: N' and is followed by a Resend
             cancelPrint = true;
             responseDetail = "ERROR";
           }
-          else
+          else {
+            lastLineReported = parseResendNumber(serialResponse, lastLine);
             responseDetail = "resend error";
+          }
         }
         else {
           incompleteResponse = true;
@@ -1855,7 +1872,11 @@ void loop() {
       timeoutRetries = 0;
       swallowNextOk = false;
       lastCommandSent = "";
+      lastLineReported = -1;
       commandQueue.push("M110 N0");
+      commandQueue.push("M104 S0");
+      commandQueue.push("M140 S0");
+      commandQueue.push("M107");
       lcd("Printer restarted");
     }
     else if (cancelPrint && !isPrinting) { // Only when cancelPrint has been processed by 'handlePrint'
