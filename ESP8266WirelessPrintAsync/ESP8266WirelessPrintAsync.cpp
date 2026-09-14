@@ -34,7 +34,7 @@ DNSServer dns;
 #define TEMPERATURE_REPORT_INTERVAL 2   // Ask the printer for its temperatures status every 2 seconds
 #define KEEPALIVE_INTERVAL 2500         // Marlin defaults to 2 seconds, get a little of margin
 #define MAX_TIMEOUT_RETRIES 5           // Silent periods of KEEPALIVE_INTERVAL before a print is given up on
-#define MAX_RESPONSE_LENGTH 512         // An unrecognized response longer than this is discarded instead of growing the heap
+#define MAX_RESPONSE_LENGTH 4096        // An unrecognized response longer than this is discarded instead of growing the heap. M115 alone is over 1 KB
 #define WIFI_PORTAL_TIMEOUT 180         // Seconds the configuration portal stays up before retrying the stored network
 #define WIFI_RETRY_INTERVAL 30000       // Reconnection attempt interval while the network is down
 #define WIFI_REBOOT_AFTER 600000        // Reboot after this long offline, so a changed network can be configured again
@@ -641,8 +641,9 @@ String firstStoredFile() {
   if (dir) {
     FileWrapper file = dir.openNextFile();
     while (file) {
-      if (!file.isDirectory() && isGcodeFilename(file.name())) {
-        found = "/" + file.name();
+      const String name = baseName(file.name());
+      if (!file.isDirectory() && isGcodeFilename(name)) {
+        found = "/" + name;
         file.close();
         break;
       }
@@ -663,8 +664,9 @@ void forEachStoredFile(std::function<void(const String, const uint32_t, const ui
   unsigned int listed = 0;
   FileWrapper file = dir.openNextFile();
   while (file && listed < MAX_LISTED_FILES) {
-    if (!file.isDirectory() && isGcodeFilename(file.name())) {
-      visit(file.name(), file.size(), file.lastWrite());
+    const String name = baseName(file.name());
+    if (!file.isDirectory() && isGcodeFilename(name)) {
+      visit(name, file.size(), file.lastWrite());
       ++listed;
     }
     file.close();
@@ -810,8 +812,9 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
       request->send(400, "text/plain", "name is required");
       return;
     }
-    const String path = "/" + sanitizeFilename(request->getParam("name")->value());
-    if (!storageFS.exists(path)) {
+    const String name = sanitizeFilename(request->getParam("name")->value());
+    const String path = "/" + name;
+    if (!isGcodeFilename(name) || !storageFS.exists(path)) {
       request->send(404, "text/plain", "no such file");
       return;
     }

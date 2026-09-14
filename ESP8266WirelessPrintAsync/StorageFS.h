@@ -24,7 +24,7 @@ class StorageFS {
     }
 
     inline static bool exists(const String path) {
-      return hasSD && SD_MMC.exists(path);
+      return hasSD && path.length() > 1 && path.startsWith("/") && SD_MMC.exists(path);
     }
 
     inline static uint64_t totalBytes() {
