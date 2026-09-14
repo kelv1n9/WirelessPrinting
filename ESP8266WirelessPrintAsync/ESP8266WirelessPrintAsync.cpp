@@ -23,7 +23,7 @@ AsyncWebServer server(80);
 DNSServer dns;
 
 // Configurable parameters
-#define SKETCH_VERSION "2.x-localbuild" // Gets inserted at build time by .travis.yml
+#define SKETCH_VERSION "2.x-localbuild" // Gets inserted at build time by the PlatformIO workflow
 #define OTA_UPDATES                     // Enable OTA firmware updates, comment if you don't want it (OTA may lead to security issues because someone may load any code on device)
 //#define OTA_PASSWORD ""               // Uncomment to protect OTA updates and assign a password (inside "")
 #define MAX_SUPPORTED_EXTRUDERS 6       // Number of supported extruder
@@ -546,7 +546,7 @@ void setup() {
                      "<p><a href=\"/download\">Download " + uploadedName + "</a></p>"
                      "<p><a href=\"/info\">Info</a></p>"
                      "<hr>"
-                     "<p>WirelessPrinting <a href=\"https://github.com/probonopd/WirelessPrinting/commit/" + SKETCH_VERSION + "\">" + SKETCH_VERSION + "</a></p>\n"
+                     "<p>WirelessPrinting <a href=\"https://github.com/kelv1n9/WirelessPrinting/commit/" + SKETCH_VERSION + "\">" + SKETCH_VERSION + "</a></p>\n"
                     #ifdef OTA_UPDATES
                       "<p>OTA Update Device: <a href=\"/update\">Click Here</a></p>"
                     #endif

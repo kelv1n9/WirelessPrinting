@@ -5,39 +5,27 @@ on:
   pull_request:
 
 jobs:
-  PlatformIO:
+  build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
-    - name: Set up Python
-      uses: actions/setup-python@v1
-    - name: Install dependencies
-      run: |
-        sudo apt-get install rename
-        python -m pip install --upgrade pip
-        pip install -U platformio==5.2.5
-    - name: Run PlatformIO
-      run: |
-        set -x
-        set -e
-        VERSION=$(git rev-parse --short HEAD)
-        HERE=$(readlink -f .)
-        sed -i -e 's|#define SKETCH_VERSION ".*"|#define SKETCH_VERSION "'$VERSION'"|' $PWD/ESP8266WirelessPrintAsync/ESP8266WirelessPrintAsync.cpp
-        platformio run
-        BOARD=$(echo $BD | cut -d ":" -f 3)
-        pushd .pio/build
-        for board_dir in */; do
-          pushd "$board_dir"
-          board=$(echo "$board_dir" | tr -d '/')
-          rename "s|firmware|WirelessPrinting_${board}_${VERSION}|" firmware.*
-          popd
-        done
-        popd
-        mkdir WirelessPrinting
-        find . -type f -name 'WirelessPrinting_*.bin' -exec cp {} ./WirelessPrinting/ \;
-        ( cd ./WirelessPrinting ; zip -r ../WirelessPrinting_$GITHUB_RUN_NUMBER_$(date +%Y-%m-%d)-$(git rev-parse --short HEAD).zip * )
-        echo "artifactName=WirelessPrinting_$GITHUB_RUN_NUMBER_$(date +%Y-%m-%d)-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-    - uses: actions/upload-artifact@v3
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
       with:
-        name: ${{ env.artifactName }} # Exported above
-        path: ./WirelessPrinting/*
+        python-version: '3.11'
+
+    - name: Install PlatformIO
+      run: pip install -U platformio
+
+    - name: Stamp the sketch with the commit it was built from
+      run: |
+        sed -i -e 's|#define SKETCH_VERSION ".*"|#define SKETCH_VERSION "'$(git rev-parse --short HEAD)'"|' \
+          ESP8266WirelessPrintAsync/ESP8266WirelessPrintAsync.cpp
+
+    - name: Build
+      run: pio run
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: WirelessPrinting-${{ github.sha }}
+        path: .pio/build/esp32dev/firmware.bin
