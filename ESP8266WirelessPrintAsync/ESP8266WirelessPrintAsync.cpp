@@ -779,7 +779,7 @@ void setup() {
 
   server.onNotFound([](AsyncWebServerRequest * request) {
     telnetSend("404 | Page '" + request->url() + "' not found");
-    request->send(404, "text/html", "<h1>Page not found!</h1>");
+    request->send(404, "text/html; charset=utf-8", "<h1>Page not found!</h1>");
   });
 
   // Main page
@@ -811,7 +811,7 @@ void setup() {
 function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); location.reload(); }); }
 function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({command: command})}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); location.reload(); }); }
 </script>)HTML";
-    request->send(200, "text/html", message);
+    request->send(200, "text/html; charset=utf-8", message);
   });
 
   server.on("/yandex", HTTP_GET, [](AsyncWebServerRequest * request) {
@@ -855,7 +855,7 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
     message += R"HTML(<script>
 function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); setTimeout(function(){ location.reload(); }, 2500); }); }
 </script>)HTML";
-    request->send(200, "text/html", message);
+    request->send(200, "text/html; charset=utf-8", message);
   });
 
   server.on("/yandex/token", HTTP_POST, [](AsyncWebServerRequest * request) {
@@ -949,12 +949,12 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
                  "BUILD_PERCENT: " + stringify(fwBuildPercentCap) + "\n";
     }
     message += "</pre>";
-    request->send(200, "text/html", message);
+    request->send(200, "text/html; charset=utf-8", message);
   });
 
   #ifdef OTA_UPDATES
     server.on("/update", HTTP_GET, [](AsyncWebServerRequest * request) {
-      request->send(200, "text/html", "<h1>" + getDeviceName() + "</h1>"
+      request->send(200, "text/html; charset=utf-8", "<h1>" + getDeviceName() + "</h1>"
                                       "<form method=\"POST\" action=\"/update\" enctype=\"multipart/form-data\">\n"
                                       "Firmware image: <input name=\"firmware\" type=\"file\" accept=\".bin\" required/><br/>\n"
                                       "<input type=\"submit\" value=\"Update\"/>\n"
