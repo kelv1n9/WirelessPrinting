@@ -18,6 +18,9 @@ h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.3px}
 .badge.live{color:var(--ok);border-color:#1e4433}
 .badge.busy{color:var(--acc);border-color:#22406e}
 .badge.bad{color:var(--bad);border-color:#5a2724}
+.badge.warn{color:var(--warn);border-color:#5a4520}
+tr.pick{cursor:pointer}
+tr.pick:hover td{background:#1a1f28}
 .spacer{flex:1}
 .meta{font-size:12px;color:var(--dim);display:flex;gap:14px;flex-wrap:wrap}
 main{padding:22px;display:grid;gap:18px;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);max-width:1400px;margin:0 auto}
@@ -73,11 +76,16 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <h1 id="machine">printer</h1>
   <span class="badge" id="state">connecting</span>
   <span class="spacer"></span>
+  <span class="badge warn hide" id="soon"></span>
   <div class="meta">
     <span id="clock"></span>
     <span id="rssi"></span>
     <span id="up"></span>
     <span><a href="/info">info</a> · <a href="/yandex">socket</a> · <a href="/update">firmware</a></span>
+  </div>
+  <div class="row">
+    <button id="brestart">Restart module</button>
+    <button class="d" id="bpower">Turn printer off</button>
   </div>
 </header>
 
@@ -136,21 +144,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     </div>
   </section>
 
-  <section class="wide">
-    <h2>Diagnostics</h2>
-    <div class="diag">
-      <div><b>Socket</b><span id="dsock">—</span></div>
-      <div><b>Link</b><span id="dlink">—</span></div>
-      <div><b>Resends</b><span id="dres">—</span></div>
-      <div><b>Free heap</b><span id="dheap">—</span></div>
-      <div><b>Signal</b><span id="drssi">—</span></div>
-      <div><b>Firmware</b><span id="dver">—</span></div>
-    </div>
-    <div class="row" style="margin-top:14px">
-      <button id="brestart">Restart module</button>
-      <button class="d" id="bpower">Turn printer off</button>
-    </div>
-  </section>
 </main>
 
 <div id="toast"></div>
@@ -220,13 +213,9 @@ function render(d){
   const mark = d.storage.selected + '|' + d.printing;
   if (seen !== null && seen !== mark) loadFiles().catch(()=>{});
   seen = mark;
-  $('dsock').textContent = d.socket.token ? (d.socket.device || 'no socket') + ' · ' + d.socket.state : 'no token';
-  $('dlink').textContent = d.link.baud + ' baud · ' + d.link.sent + ' sent';
-  const rate = d.link.sent ? (d.link.resent * 100 / d.link.sent) : 0;
-  $('dres').textContent = d.link.resent + ' (' + rate.toFixed(1) + '%)';
-  $('dheap').textContent = kib(d.system.heap);
-  $('drssi').textContent = d.system.rssi + ' dBm';
-  $('dver').textContent = d.system.version;
+  const soon = $('soon'), off = d.socket.state.indexOf('switching off') === 0;
+  soon.classList.toggle('hide', !off);
+  if (off) soon.textContent = d.socket.state;
   $('brestart').disabled = d.printing;
   $('bpower').disabled = d.printing || !d.socket.token || !d.socket.device;
 }
@@ -237,7 +226,8 @@ function renderFiles(sel){
   if (!files.length) { tb.insertRow().insertCell().innerHTML = '<span class="dim">card is empty</span>'; return; }
   for (const f of files) {
     const tr = tb.insertRow();
-    if (f.name === sel) tr.className = 'sel';
+    tr.className = 'pick' + (f.name === sel ? ' sel' : '');
+    tr.onclick = () => act('/select?name=' + encodeURIComponent(f.name));
     const img = document.createElement('img');
     img.className = 'tmini'; img.loading = 'lazy'; img.alt = '';
     img.onerror = () => img.classList.add('noimg');
@@ -248,8 +238,8 @@ function renderFiles(sel){
     const d = tr.insertCell(); d.className = 'num dim';
     d.textContent = f.date > 1e9 ? new Date(f.date*1000).toLocaleDateString() : '—';
     const a = tr.insertCell(); a.className = 'row';
+    a.onclick = e => e.stopPropagation();
     a.append(btn('Print', 'p', () => act('/select?name=' + encodeURIComponent(f.name)).then(() => job('start'))),
-             btn('Select', '', () => act('/select?name=' + encodeURIComponent(f.name))),
              btn('Delete', 'd', () => confirm('Delete ' + f.name + '?') && act('/delete?name=' + encodeURIComponent(f.name))));
   }
 }
