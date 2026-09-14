@@ -1,0 +1,301 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KP3S</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%235b9cff'/%3E%3Cpath d='M8 21l8-11 8 11z' fill='%230d0f12'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#0d0f12;--panel:#15181d;--sunk:#1b1f26;--line:#262b33;
+  --tx:#e8ebf0;--dim:#8a93a2;--acc:#5b9cff;--ok:#3ddc84;--warn:#ffb020;--bad:#ff5f56;
+  --hot:#ff7a45;--bed:#ffc14d;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+a{color:var(--acc);text-decoration:none}
+header{display:flex;align-items:center;gap:14px;padding:14px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.3px}
+.badge{font-size:12px;padding:3px 10px;border-radius:99px;background:var(--sunk);border:1px solid var(--line);color:var(--dim)}
+.badge.live{color:var(--ok);border-color:#1e4433}
+.badge.busy{color:var(--acc);border-color:#22406e}
+.badge.bad{color:var(--bad);border-color:#5a2724}
+.spacer{flex:1}
+.meta{font-size:12px;color:var(--dim);display:flex;gap:14px;flex-wrap:wrap}
+main{padding:22px;display:grid;gap:18px;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);max-width:1400px;margin:0 auto}
+@media(max-width:900px){main{grid-template-columns:1fr;padding:14px}}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
+section h2{margin:0 0 14px;font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);font-weight:600}
+.wide{grid-column:1/-1}
+.job{display:flex;gap:18px;align-items:flex-start}
+.thumb{width:118px;height:118px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);object-fit:contain;flex:none}
+.noimg{visibility:hidden}
+.jobmain{flex:1;min-width:0}
+.fname{font-size:15px;font-weight:600;word-break:break-all;margin-bottom:12px}
+.pct{font-size:40px;font-weight:650;line-height:1;letter-spacing:-1px}
+.pct small{font-size:16px;color:var(--dim);font-weight:500;margin-left:4px}
+.bar{height:7px;border-radius:99px;background:var(--sunk);overflow:hidden;margin:12px 0 16px}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),#8ab6ff);width:0;transition:width .4s}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:14px 18px}
+.kv .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
+.kv .v{font-size:17px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+.kv .v.sm{font-size:14px;font-weight:500}
+.temp{display:flex;align-items:baseline;gap:8px;margin-bottom:4px}
+.temp .now{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums}
+.temp .tgt{font-size:13px;color:var(--dim);font-variant-numeric:tabular-nums}
+.tlabel{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);margin-bottom:6px}
+.spark{display:block;width:100%;height:34px;margin-top:6px}
+.tbox+.tbox{margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}
+button{font:inherit;color:var(--tx);background:var(--sunk);border:1px solid var(--line);border-radius:8px;padding:7px 13px;cursor:pointer}
+button:hover:not(:disabled){border-color:#3a424e;background:#20252d}
+button:disabled{opacity:.4;cursor:default}
+button.p{background:var(--acc);border-color:var(--acc);color:#06101f;font-weight:600}
+button.p:hover:not(:disabled){background:#7aaeff;border-color:#7aaeff}
+button.d{color:var(--bad)}
+.row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+table{width:100%;border-collapse:collapse}
+td,th{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);font-weight:600}
+tr:last-child td{border-bottom:0}
+tr.sel td{background:#161d2a}
+.tmini{width:40px;height:40px;border-radius:6px;background:var(--sunk);object-fit:contain;display:block}
+.nm{font-weight:500;word-break:break-all}
+.dim{color:var(--dim)}
+.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+.foot{display:flex;justify-content:space-between;gap:12px;margin-top:14px;flex-wrap:wrap;align-items:center}
+progress{width:190px;height:7px;accent-color:var(--acc)}
+.diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px 18px;font-size:13px}
+.diag b{display:block;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+.hide{display:none!important}
+#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#20252d;border:1px solid var(--line);padding:10px 18px;border-radius:9px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:9}
+#toast.on{opacity:1}
+</style>
+
+<header>
+  <h1 id="machine">printer</h1>
+  <span class="badge" id="state">connecting</span>
+  <span class="spacer"></span>
+  <div class="meta">
+    <span id="clock"></span>
+    <span id="rssi"></span>
+    <span id="up"></span>
+    <span><a href="/info">info</a> · <a href="/yandex">socket</a> · <a href="/update">firmware</a></span>
+  </div>
+</header>
+
+<main>
+  <section class="wide" id="jobsec">
+    <h2 id="jobtitle">Job</h2>
+    <div class="job">
+      <img class="thumb" id="jthumb" alt="" onerror="this.classList.add('noimg')">
+      <div class="jobmain">
+        <div class="fname" id="jname">—</div>
+        <div class="pct"><span id="jpct">0</span><small>%</small></div>
+        <div class="bar"><i id="jbar"></i></div>
+        <div class="grid">
+          <div class="kv"><div class="k">Layer</div><div class="v" id="jlayer">—</div></div>
+          <div class="kv"><div class="k">Height</div><div class="v" id="jz">—</div></div>
+          <div class="kv"><div class="k">Elapsed</div><div class="v" id="jel">—</div></div>
+          <div class="kv"><div class="k">Remaining</div><div class="v" id="jrem">—</div></div>
+          <div class="kv"><div class="k">Finishes</div><div class="v" id="jend">—</div></div>
+          <div class="kv"><div class="k">Fan</div><div class="v" id="jfan">—</div></div>
+        </div>
+        <div class="row" style="margin-top:16px">
+          <button class="p" id="bprint">Print selected</button>
+          <button class="d" id="bcancel">Cancel print</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="filesec">
+    <h2>Files</h2>
+    <table><tbody id="ftab"></tbody></table>
+    <div class="foot">
+      <div class="row">
+        <button id="bpick">Upload</button>
+        <label class="dim"><input type="checkbox" id="cprint"> print after upload</label>
+        <input type="file" id="file" accept=".gcode,.gco,.g" hidden>
+      </div>
+      <div class="row">
+        <progress id="uprog" class="hide" max="100" value="0"></progress>
+        <span class="dim num" id="space"></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="tempsec">
+    <h2>Temperatures</h2>
+    <div class="tbox">
+      <div class="tlabel">Nozzle</div>
+      <div class="temp"><span class="now" id="tn">—</span><span class="tgt" id="tnt"></span></div>
+      <svg class="spark" id="sn" viewBox="0 0 200 34" preserveAspectRatio="none"><polyline fill="none" stroke="var(--hot)" stroke-width="1.6" points=""/></svg>
+    </div>
+    <div class="tbox">
+      <div class="tlabel">Bed</div>
+      <div class="temp"><span class="now" id="tb">—</span><span class="tgt" id="tbt"></span></div>
+      <svg class="spark" id="sb" viewBox="0 0 200 34" preserveAspectRatio="none"><polyline fill="none" stroke="var(--bed)" stroke-width="1.6" points=""/></svg>
+    </div>
+  </section>
+
+  <section class="wide">
+    <h2>Diagnostics</h2>
+    <div class="diag">
+      <div><b>Socket</b><span id="dsock">—</span></div>
+      <div><b>Link</b><span id="dlink">—</span></div>
+      <div><b>Resends</b><span id="dres">—</span></div>
+      <div><b>Free heap</b><span id="dheap">—</span></div>
+      <div><b>Signal</b><span id="drssi">—</span></div>
+      <div><b>Firmware</b><span id="dver">—</span></div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button id="brestart">Restart module</button>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const hist = {n:[], b:[]};
+let files = [], seen = null;
+
+const hhmm = s => { s = Math.max(0, Math.round(s));
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+  return (h ? h+'h ' : '') + (h||m ? m+'m ' : '') + (h ? '' : (s%60)+'s'); };
+const kib = b => b >= 1073741824 ? (b/1073741824).toFixed(1)+' GB'
+              : b >= 1048576 ? (b/1048576).toFixed(1)+' MB'
+              : Math.round(b/1024)+' KB';
+
+function toast(t){ const e = $('toast'); e.textContent = t; e.classList.add('on'); setTimeout(()=>e.classList.remove('on'), 2600); }
+
+async function call(url, opt){
+  const r = await fetch(url, opt);
+  if (!r.ok) { toast(await r.text() || ('HTTP ' + r.status)); throw 0; }
+  return r;
+}
+
+function spark(svg, arr){
+  if (arr.length < 2) return;
+  const lo = Math.min(...arr), hi = Math.max(...arr), span = hi - lo || 1;
+  svg.firstElementChild.setAttribute('points', arr.map((v,i) =>
+    (i * 200 / (arr.length - 1)).toFixed(1) + ',' + (32 - (v - lo) / span * 30).toFixed(1)).join(' '));
+}
+
+function render(d){
+  $('machine').textContent = d.system.machine;
+  const b = $('state');
+  b.textContent = d.state;
+  b.className = 'badge ' + (d.printing ? 'busy' : d.connected ? 'live' : 'bad');
+  $('rssi').textContent = d.system.rssi + ' dBm';
+  $('up').textContent = 'up ' + hhmm(d.system.uptime);
+  $('clock').textContent = d.system.epoch > 1e9 ? new Date(d.system.epoch*1000).toLocaleTimeString() : '';
+
+  const j = d.job;
+  $('jobtitle').textContent = d.printing ? 'Printing' : 'Selected';
+  $('jname').textContent = j.file;
+  $('jpct').textContent = j.completion.toFixed(1);
+  $('jbar').style.width = j.completion + '%';
+  $('jlayer').textContent = j.layers ? j.layer + ' / ' + j.layers : (j.layer || '—');
+  $('jz').textContent = j.z ? j.z.toFixed(2) + ' mm' : '—';
+  $('jel').textContent = d.printing ? hhmm(j.elapsed) : '—';
+  $('jrem').textContent = j.remaining >= 0 ? hhmm(j.remaining) : '—';
+  $('jend').textContent = j.remaining >= 0 ? new Date(Date.now() + j.remaining*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '—';
+  $('jfan').textContent = j.fan < 0 ? '—' : Math.round(j.fan/2.55) + '%';
+  const th = $('jthumb'), want = j.file && j.file !== 'Unknown' ? '/thumbnail?name=' + encodeURIComponent(j.file) : '';
+  if (th.dataset.src !== want) { th.dataset.src = want; th.className = 'thumb'; th.src = want; }
+  $('bprint').disabled = d.printing || !d.connected;
+  $('bcancel').disabled = !d.printing;
+
+  const t = d.temperature;
+  $('tn').textContent = t.tool.actual.toFixed(1) + '°';
+  $('tnt').textContent = t.tool.target > 0 ? '→ ' + t.tool.target.toFixed(0) + '°' : 'off';
+  $('tb').textContent = t.bed.actual.toFixed(1) + '°';
+  $('tbt').textContent = t.bed.target > 0 ? '→ ' + t.bed.target.toFixed(0) + '°' : 'off';
+  hist.n.push(t.tool.actual); hist.b.push(t.bed.actual);
+  if (hist.n.length > 120) { hist.n.shift(); hist.b.shift(); }
+  spark($('sn'), hist.n); spark($('sb'), hist.b);
+
+  $('space').textContent = kib(+d.storage.free) + ' free';
+  const mark = d.storage.selected + '|' + d.printing;
+  if (seen !== null && seen !== mark) loadFiles().catch(()=>{});
+  seen = mark;
+  $('dsock').textContent = d.socket.token ? (d.socket.device || 'no socket') + ' · ' + d.socket.state : 'no token';
+  $('dlink').textContent = d.link.baud + ' baud · ' + d.link.sent + ' sent';
+  const rate = d.link.sent ? (d.link.resent * 100 / d.link.sent) : 0;
+  $('dres').textContent = d.link.resent + ' (' + rate.toFixed(1) + '%)';
+  $('dheap').textContent = kib(d.system.heap);
+  $('drssi').textContent = d.system.rssi + ' dBm';
+  $('dver').textContent = d.system.version;
+}
+
+function renderFiles(sel){
+  const tb = $('ftab');
+  tb.textContent = '';
+  if (!files.length) { tb.insertRow().insertCell().innerHTML = '<span class="dim">card is empty</span>'; return; }
+  for (const f of files) {
+    const tr = tb.insertRow();
+    if (f.name === sel) tr.className = 'sel';
+    const img = document.createElement('img');
+    img.className = 'tmini'; img.loading = 'lazy'; img.alt = '';
+    img.onerror = () => img.classList.add('noimg');
+    img.src = '/thumbnail?name=' + encodeURIComponent(f.name);
+    tr.insertCell().append(img);
+    const n = tr.insertCell(); n.className = 'nm'; n.textContent = f.name;
+    const s = tr.insertCell(); s.className = 'num dim'; s.textContent = kib(f.size);
+    const d = tr.insertCell(); d.className = 'num dim';
+    d.textContent = f.date > 1e9 ? new Date(f.date*1000).toLocaleDateString() : '—';
+    const a = tr.insertCell(); a.className = 'row';
+    a.append(btn('Print', 'p', () => act('/select?name=' + encodeURIComponent(f.name)).then(() => job('start'))),
+             btn('Select', '', () => act('/select?name=' + encodeURIComponent(f.name))),
+             btn('Delete', 'd', () => confirm('Delete ' + f.name + '?') && act('/delete?name=' + encodeURIComponent(f.name))));
+  }
+}
+
+function btn(text, cls, fn){ const b = document.createElement('button'); b.textContent = text; if (cls) b.className = cls; b.onclick = fn; return b; }
+
+async function act(url){ await call(url, {method:'POST'}); await loadFiles(); }
+async function job(cmd){
+  await call('/api/job', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({command: cmd})});
+  toast(cmd === 'start' ? 'print started' : 'cancelling');
+}
+
+async function loadFiles(){
+  const d = await (await fetch('/api/files')).json();
+  files = d.files;
+  const s = await (await fetch('/api/status')).json();
+  seen = s.storage.selected + '|' + s.printing;
+  renderFiles(s.storage.selected);
+  $('space').textContent = kib(+d.free) + ' free';
+}
+
+$('bprint').onclick = () => job('start');
+$('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel');
+$('brestart').onclick = () => confirm('Restart the module?') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
+$('bpick').onclick = () => $('file').click();
+$('file').onchange = e => { if (e.target.files[0]) upload(e.target.files[0]); e.target.value = ''; };
+
+function upload(f){
+  const form = new FormData();
+  form.append('file', f);
+  if ($('cprint').checked) form.append('print', 'true');
+  const x = new XMLHttpRequest(), p = $('uprog');
+  p.classList.remove('hide'); p.value = 0;
+  x.upload.onprogress = e => { if (e.lengthComputable) p.value = e.loaded * 100 / e.total; };
+  x.onloadend = () => {
+    p.classList.add('hide');
+    toast(x.status === 201 ? 'uploaded' : ('upload failed: ' + (x.responseText || x.status)));
+    loadFiles();
+  };
+  x.open('POST', '/api/files/local');
+  x.send(form);
+}
+
+(async function loop(){
+  for (;;) {
+    try { render(await (await fetch('/api/status')).json()); }
+    catch (e) { $('state').textContent = 'offline'; $('state').className = 'badge bad'; }
+    await new Promise(r => setTimeout(r, 1200));
+  }
+})();
+loadFiles().catch(()=>{});
+</script>
