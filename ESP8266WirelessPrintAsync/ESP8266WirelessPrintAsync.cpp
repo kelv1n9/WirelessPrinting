@@ -4,6 +4,7 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <Update.h>
+#include <esp_task_wdt.h>
 #include <ArduinoJson.h>          // https://github.com/bblanchon/ArduinoJson (for implementing a subset of the OctoPrint API)
 #include <DNSServer.h>
 #include "StorageFS.h"
@@ -31,6 +32,12 @@ DNSServer dns;
 #define PRINTER_RX_BUFFER_SIZE 0        // This is printer firmware 'RX_BUFFER_SIZE'. If such parameter is unknown please use 0
 #define TEMPERATURE_REPORT_INTERVAL 2   // Ask the printer for its temperatures status every 2 seconds
 #define KEEPALIVE_INTERVAL 2500         // Marlin defaults to 2 seconds, get a little of margin
+#define MAX_TIMEOUT_RETRIES 5           // Silent periods of KEEPALIVE_INTERVAL before a print is given up on
+#define MAX_RESPONSE_LENGTH 512         // An unrecognized response longer than this is discarded instead of growing the heap
+#define WIFI_PORTAL_TIMEOUT 180         // Seconds the configuration portal stays up before retrying the stored network
+#define WIFI_RETRY_INTERVAL 30000       // Reconnection attempt interval while the network is down
+#define WIFI_REBOOT_AFTER 600000        // Reboot after this long offline, so a changed network can be configured again
+#define WDT_TIMEOUT 30                  // Seconds without a loop iteration before the watchdog reboots the device
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
 #define API_VERSION     "0.1"
@@ -51,6 +58,7 @@ bool printerConnected,
      printPause,
      restartPrint,
      cancelPrint,
+     printerRestarted,
      autoreportTempEnabled;
 
 uint32_t printStartTime;
@@ -61,6 +69,8 @@ String lastCommandSent, lastReceivedResponse;
 uint32_t lineNumber;
 String lastSentLine;
 bool swallowNextOk;
+uint8_t timeoutRetries;
+uint32_t wifiRetryTimer, wifiDownSince;
 
 uint8_t serialBaudIndex;
 uint16_t printerUsedBuffer;
@@ -201,7 +211,7 @@ void handlePrint() {
   static float prevM73Completion, prevM532Completion;
 
   if (isPrinting) {
-    const bool abortPrint = (restartPrint || cancelPrint);
+    const bool abortPrint = (restartPrint || cancelPrint || printerRestarted);
     if (abortPrint || !gcodeFile.available()) {
       gcodeFile.close();
       if (fwProgressCap)
@@ -222,7 +232,7 @@ void handlePrint() {
       }
 
       // Send to printer completion (if supported)
-      printCompletion = (float)filePos / uploadedFileSize * 100;
+      printCompletion = uploadedFileSize > 0 ? (float)filePos / uploadedFileSize * 100 : 0;
       if (fwBuildPercentCap && printCompletion - prevM73Completion >= 1) {
         commandQueue.push("M73 P" + String((int)printCompletion));
         prevM73Completion = printCompletion;
@@ -418,6 +428,7 @@ bool detectPrinter() {
         else {
           telnetSend("Connected");
 
+          printerRestarted = false;
           fwMachineType = value;
           value = M115ExtractString(lastReceivedResponse, "EXTRUDER_COUNT");
           fwExtruders = value == "" ? 1 : min(value.toInt(), (long)MAX_SUPPORTED_EXTRUDERS);
@@ -444,18 +455,29 @@ bool detectPrinter() {
   return false;
 }
 
+inline bool isGcodeFilename(const String name) {
+  if (name.startsWith("."))
+    return false;
+
+  String lowercase = name;
+  lowercase.toLowerCase();
+
+  return lowercase.endsWith(".gcode") || lowercase.endsWith(".gco") || lowercase.endsWith(".g");
+}
+
 void initUploadedFilename() {
   FileWrapper dir = storageFS.open("/");
   if (dir) {
     FileWrapper file = dir.openNextFile();
-    while (file && file.isDirectory()) {
+    while (file) {
+      if (!file.isDirectory() && isGcodeFilename(file.name())) {
+        uploadedFullname = "/" + file.name();
+        uploadedFileSize = file.size();
+        file.close();
+        break;
+      }
       file.close();
       file = dir.openNextFile();
-    }
-    if (file) {
-      uploadedFullname = "/" + file.name();
-      uploadedFileSize = file.size();
-      file.close();
     }
     dir.close();
   }
@@ -479,6 +501,7 @@ inline String stringify(bool value) {
 }
 
 void setup() {
+  commandQueue.begin();
   storageFS.begin();
 
   for (int t = 0; t < MAX_SUPPORTED_EXTRUDERS; t++)
@@ -486,10 +509,15 @@ void setup() {
   bedTemperature = { "0.0", "0.0" };
 
   // Wait for connection
+  WiFi.mode(WIFI_STA);
   AsyncWiFiManager wifiManager(&server, &dns);
   // wifiManager.resetSettings();   // Uncomment this to reset the settings on the device, then you will need to reflash with USB and this commented out!
   wifiManager.setDebugOutput(false);  // So that it does not send stuff to the printer that the printer does not understand
+  if (WiFi.SSID() != "")
+    wifiManager.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT);
   wifiManager.autoConnect("AutoConnectAP");
+  WiFi.setAutoReconnect(true);
+  wifiDownSince = millis();
 
   telnetServer.begin();
   telnetServer.setNoDelay(true);
@@ -839,12 +867,46 @@ void setup() {
     #ifdef OTA_PASSWORD
       ArduinoOTA.setPassword(OTA_PASSWORD);
     #endif
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      esp_task_wdt_reset();
+    });
     ArduinoOTA.begin();
   #endif
+
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
 }
 
 inline void restartSerialTimeout() {
   serialReceiveTimeoutTimer = millis() + KEEPALIVE_INTERVAL;
+}
+
+void transmitCommand(const String command, const uint32_t number) {
+  String line = "N" + String(number) + " " + command;
+  uint8_t checksum = 0;
+  for (unsigned int i = 0; i < line.length(); ++i)
+    checksum ^= (uint8_t)line[i];
+  line += "*" + String(checksum);
+
+  PrinterSerial.println(line);              // Send to 3D Printer
+  lastSentLine = line;
+  lineNumber = command.startsWith("M110") ? 0 : number;
+
+  telnetSend(">" + line);
+}
+
+int32_t parseResendNumber(const String response, const int from) {
+  unsigned int i = from;
+  while (i < response.length() && !isDigit(response[i]))
+    ++i;
+  if (i >= response.length())
+    return -1;
+
+  int32_t value = 0;
+  while (i < response.length() && isDigit(response[i]))
+    value = value * 10 + (response[i++] - '0');
+
+  return value;
 }
 
 void SendCommands() {
@@ -854,23 +916,11 @@ void SendCommands() {
     if (noResponsePending || printerUsedBuffer < PRINTER_RX_BUFFER_SIZE * 3 / 4) {  // Let's use no more than 75% of printer RX buffer
       if (noResponsePending)
         restartSerialTimeout();   // Receive timeout has to be reset only when sending a command and no pending response is expected
-      if (command.startsWith("M110"))
-        lineNumber = 0;
-      else
-        ++lineNumber;
-      String line = "N" + String(lineNumber) + " " + command;
-      uint8_t checksum = 0;
-      for (unsigned int i = 0; i < line.length(); ++i)
-        checksum ^= (uint8_t)line[i];
-      line += "*" + String(checksum);
 
-      PrinterSerial.println(line);              // Send to 3D Printer
-      lastSentLine = line;
-      printerUsedBuffer += line.length();
+      transmitCommand(command, command.startsWith("M110") ? 0 : lineNumber + 1);
+      printerUsedBuffer += lastSentLine.length();
       lastCommandSent = command;
       commandQueue.popSend();
-
-      telnetSend(">" + line);
     }
   }
 }
@@ -881,17 +931,30 @@ void ReceiveResponses() {
 
   while (PrinterSerial.available()) {
     char ch = (char)PrinterSerial.read();
-    if (ch != '\n')
+    if (ch != '\n') {
       serialResponse += ch;
+      if (serialResponse.length() > MAX_RESPONSE_LENGTH) {
+        serialResponse = "";
+        lineStartPos = 0;
+        telnetSend("#OVERFLOW#");
+      }
+    }
     else {
       bool incompleteResponse = false;
       String responseDetail = "";
 
       if (serialResponse.startsWith("Resend:", lineStartPos) || serialResponse.startsWith("rs ", lineStartPos)) {
-        PrinterSerial.println(lastSentLine);   // Only one command is ever unacknowledged, so it is the one being asked for
-        telnetSend(">" + lastSentLine);
+        const int32_t requested = parseResendNumber(serialResponse, lineStartPos);
+        if (requested >= 0 && (uint32_t)requested < lineNumber)
+          printerRestarted = true;
+        if (!printerRestarted && !commandQueue.isAckEmpty() && lastCommandSent != "")   // Only one command is ever unacknowledged, so it is the one being asked for
+          transmitCommand(lastCommandSent, requested < 0 ? lineNumber : (uint32_t)requested);
         swallowNextOk = true;
         responseDetail = "resend";
+      }
+      else if (serialResponse.startsWith("start", lineStartPos)) {
+        printerRestarted = true;
+        responseDetail = "printer restarted";
       }
       else if (swallowNextOk && serialResponse.startsWith("ok", lineStartPos)) {
         swallowNextOk = false;                 // This ok belongs to the corrupted line, the re-sent one is still pending
@@ -905,6 +968,7 @@ void ReceiveResponses() {
 
         unsigned int cmdLen = commandQueue.popAcknowledge().length();     // Go on with next command
         printerUsedBuffer = max(printerUsedBuffer - cmdLen, 0u);
+        timeoutRetries = 0;
         responseDetail = "ok";
       }
       else if (printerConnected) {
@@ -949,10 +1013,22 @@ void ReceiveResponses() {
   }
 
   if (!commandQueue.isAckEmpty() && (signed)(serialReceiveTimeoutTimer - millis()) <= 0) {  // Command has been lost by printer, buffer has been freed
-    if (printerConnected)
-      telnetSend("#TIMEOUT#");
-    else
+    if (!printerConnected)
       commandQueue.clear();
+    else {
+      telnetSend("#TIMEOUT#");
+      if (lastCommandSent != "" && ++timeoutRetries <= MAX_TIMEOUT_RETRIES)
+        transmitCommand(lastCommandSent, lineNumber);
+      else {
+        timeoutRetries = 0;
+        commandQueue.clear();
+        printerUsedBuffer = 0;
+        if (isPrinting) {
+          cancelPrint = true;
+          lcd("Printer not responding");
+        }
+      }
+    }
     lineStartPos = 0;
     serialResponse = "";
     restartSerialTimeout();
@@ -973,6 +1049,18 @@ void loop() {
     ArduinoOTA.handle();
   #endif
 
+  if (WiFi.status() != WL_CONNECTED) {
+    if ((signed)(wifiRetryTimer - millis()) <= 0) {
+      wifiRetryTimer = millis() + WIFI_RETRY_INTERVAL;
+      WiFi.disconnect();
+      WiFi.begin();
+    }
+    if (!isPrinting && (signed)(millis() - wifiDownSince) >= WIFI_REBOOT_AFTER)
+      ESP.restart();
+  }
+  else
+    wifiDownSince = millis();
+
   //********************
   //* Printer handling *
   //********************
@@ -985,17 +1073,32 @@ void loop() {
 
     handlePrint();
 
-    if (cancelPrint && !isPrinting) { // Only when cancelPrint has been processed by 'handlePrint'
+    if (printerRestarted && !isPrinting) {
+      printerRestarted = false;
       cancelPrint = false;
       commandQueue.clear();
       printerUsedBuffer = 0;
-      // Apparently we need to decide how to handle this
-      // For now using M112 - Emergency Stop
-      // http://marlinfw.org/docs/gcode/M112.html
-      telnetSend("Should cancel print! This is not working yet");
-      commandQueue.push("M112"); // Send to 3D Printer immediately w/o waiting for anything
-      //playSound();
-      //lcd("Print cancelled");
+      lineNumber = 0;
+      timeoutRetries = 0;
+      swallowNextOk = false;
+      lastCommandSent = "";
+      commandQueue.push("M110 N0");
+      lcd("Printer restarted");
+    }
+    else if (cancelPrint && !isPrinting) { // Only when cancelPrint has been processed by 'handlePrint'
+      cancelPrint = false;
+      commandQueue.clear();
+      printerUsedBuffer = 0;
+      lcd("Print cancelled");
+      commandQueue.push("G91");
+      commandQueue.push("G1 E-3 F300");
+      commandQueue.push("G1 Z10 F600");
+      commandQueue.push("G90");
+      commandQueue.push("M104 S0");
+      commandQueue.push("M140 S0");
+      commandQueue.push("M107");
+      commandQueue.push("M84");
+      playSound();
     }
 
     if (!autoreportTempEnabled) {
@@ -1036,5 +1139,6 @@ void loop() {
       telnetCommand += ch;
     }
   }
-    
+
+  esp_task_wdt_reset();
 }
