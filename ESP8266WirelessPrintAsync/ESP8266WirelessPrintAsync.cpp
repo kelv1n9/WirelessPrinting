@@ -80,7 +80,8 @@ float printCompletion;
 // Telemetry gathered while streaming the file
 uint16_t currentLayer, totalLayers;
 float currentZ;
-int32_t slicerMinutesLeft = -1;
+int32_t slicerMinutesLeft = -1, slicerPercent = -1;
+uint32_t linesMangled;
 int16_t fanSpeed;
 uint32_t linesSent, linesResent;
 
@@ -364,6 +365,9 @@ void handlePrint() {
           const int r = line.indexOf('R');
           if (r != -1)
             slicerMinutesLeft = line.substring(r + 1).toInt();
+          const int pp = line.indexOf('P');
+          if (pp != -1)
+            slicerPercent = line.substring(pp + 1).toInt();
         }
         else if (line.startsWith("M107"))
           fanSpeed = 0;
@@ -391,9 +395,9 @@ void handlePrint() {
     prevM532Completion = 0.0;
     currentLayer = 0;
     currentZ = 0;
-    slicerMinutesLeft = -1;
+    slicerMinutesLeft = slicerPercent = -1;
     fanSpeed = -1;
-    linesSent = linesResent = 0;
+    linesSent = linesResent = linesMangled = 0;
 
     gcodeFile = storageFS.open(selectedFile);
     if (!gcodeFile)
@@ -895,7 +899,7 @@ void handleAutoPowerOff() {
 
   if (target > 0) {
     powerOffArmed = false;
-    lcd("Power off cancelled");
+    lcd(IpAddress2String(WiFi.localIP()));
     return;
   }
 
@@ -1059,8 +1063,10 @@ void setup() {
                      "<p>Waits until the print is over, both targets are zero, the nozzle is below "
                      + String(POWEROFF_NOZZLE) + " and the bed below " + String(POWEROFF_BED)
                      + ", then holds that for " + String(POWEROFF_GRACE / 1000) + " seconds.</p>"
-                     "<p><button onclick=\"post('/yandex/auto?on=" + String(autoPowerOff ? "0" : "1") + "')\">"
-                     + String(autoPowerOff ? "Turn automatic switch off OFF" : "Turn automatic switch off ON") + "</button> "
+                     "<p>Automatic switch off is <b>" + String(autoPowerOff ? "ON" : "OFF") + "</b> "
+                     "<button onclick=\"post('/yandex/auto?on=" + String(autoPowerOff ? "0" : "1") + "')\">"
+                     + String(autoPowerOff ? "Disable" : "Enable") + "</button></p>"
+                     "<p>"
                      "<button onclick=\"post('/yandex/abort')\">Cancel the pending switch off</button></p>"
                      "<h2>Sockets</h2>"
                      "<p><button onclick=\"post('/yandex/devices')\">Load from Yandex</button> "
@@ -1475,6 +1481,8 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
   
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest * request) {
     const uint32_t elapsed = isPrinting ? (millis() - printStartTime) / 1000 : 0;
+    const bool fromSlicer = isPrinting && slicerPercent >= 0;
+    const float completion = fromSlicer ? (float)slicerPercent : printCompletion;
     int32_t remaining = -1;
     String remainingFrom = "unknown";
     if (isPrinting) {
@@ -1502,7 +1510,8 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
         "\"file\":\"" + jsonEscape(jobFilename()) + "\","
         "\"size\":" + String(jobFileSize()) + ","
         "\"position\":" + String(filePos) + ","
-        "\"completion\":" + String(printCompletion, 2) + ","
+        "\"completion\":" + String(completion, 2) + ","
+        "\"completionFrom\":\"" + String(fromSlicer ? "slicer" : "position") + "\","
         "\"elapsed\":" + String(elapsed) + ","
         "\"remaining\":" + String(remaining) + ","
         "\"remainingFrom\":\"" + remainingFrom + "\","
@@ -1513,7 +1522,8 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       "\"link\":{"
         "\"baud\":" + String(serialBauds[serialBaudIndex]) + ","
         "\"sent\":" + String(linesSent) + ","
-        "\"resent\":" + String(linesResent) + "},"
+        "\"resent\":" + String(linesResent) + ","
+        "\"mangled\":" + String(linesMangled) + "},"
       "\"storage\":{"
         "\"selected\":\"" + jsonEscape(baseName(selectedFile)) + "\","
         "\"free\":" + uint64ToString(storageFS.freeBytes()) + ","
@@ -1766,6 +1776,11 @@ void ReceiveResponses() {
           responseDetail = "position";
         else if (serialResponse.startsWith("echo:busy"))
           responseDetail = "busy";
+        else if (serialResponse.indexOf("Unknown command") != -1) {
+          if (isPrinting)
+            ++linesMangled;          // The checksum cannot catch a dropped pair of identical bytes
+          responseDetail = "mangled line reached the printer";
+        }
         else if (serialResponse.startsWith("echo: cold extrusion prevented")) {
           // To do: Pause sending gcode, or do something similar
           responseDetail = "cold extrusion";

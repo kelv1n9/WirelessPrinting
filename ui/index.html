@@ -77,8 +77,8 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <span class="badge" id="state">connecting</span>
   <span class="spacer"></span>
   <span class="badge warn hide" id="soon"></span>
+  <span class="badge bad hide" id="mangled"></span>
   <div class="meta">
-    <span id="clock"></span>
     <span id="rssi"></span>
     <span id="up"></span>
     <span><a href="/info">info</a> · <a href="/yandex">socket</a> · <a href="/update">firmware</a></span>
@@ -109,6 +109,10 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
         <div class="row" style="margin-top:16px">
           <button class="p" id="bprint">Print selected</button>
           <button class="d" id="bcancel">Cancel print</button>
+          <span class="spacer"></span>
+          <label class="dim" style="font-size:13px">switch the printer off when done
+            <input type="checkbox" id="cauto" style="margin-left:6px;vertical-align:middle">
+          </label>
         </div>
       </div>
     </div>
@@ -120,7 +124,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     <div class="foot">
       <div class="row">
         <button id="bpick">Upload</button>
-        <label class="dim"><input type="checkbox" id="cprint"> print after upload</label>
         <input type="file" id="file" accept=".gcode,.gco,.g" hidden>
       </div>
       <div class="row">
@@ -182,7 +185,6 @@ function render(d){
   b.className = 'badge ' + (d.printing ? 'busy' : d.connected ? 'live' : 'bad');
   $('rssi').textContent = d.system.rssi + ' dBm';
   $('up').textContent = 'up ' + hhmm(d.system.uptime);
-  $('clock').textContent = d.system.epoch > 1e9 ? new Date(d.system.epoch*1000).toLocaleTimeString() : '';
 
   const j = d.job;
   $('jobtitle').textContent = d.printing ? 'Printing' : 'Selected';
@@ -197,6 +199,9 @@ function render(d){
   $('jfan').textContent = j.fan < 0 ? '—' : Math.round(j.fan/2.55) + '%';
   const th = $('jthumb'), want = j.file && j.file !== 'Unknown' ? '/thumbnail?name=' + encodeURIComponent(j.file) : '';
   if (th.dataset.src !== want) { th.dataset.src = want; th.className = 'thumb'; th.src = want; }
+  const auto_ = $('cauto');
+  if (document.activeElement !== auto_) auto_.checked = d.socket.auto;
+  auto_.disabled = !d.socket.token || !d.socket.device;
   $('bprint').disabled = d.printing || !d.connected;
   $('bcancel').disabled = !d.printing;
 
@@ -213,6 +218,9 @@ function render(d){
   const mark = d.storage.selected + '|' + d.printing;
   if (seen !== null && seen !== mark) loadFiles().catch(()=>{});
   seen = mark;
+  const bad = $('mangled');
+  bad.classList.toggle('hide', !d.link.mangled);
+  if (d.link.mangled) bad.textContent = d.link.mangled + ' mangled line' + (d.link.mangled > 1 ? 's' : '');
   const soon = $('soon'), off = d.socket.state.indexOf('switching off') === 0;
   soon.classList.toggle('hide', !off);
   if (off) soon.textContent = d.socket.state;
@@ -261,6 +269,8 @@ async function loadFiles(){
   $('space').textContent = kib(+d.free) + ' free';
 }
 
+$('cauto').onchange = e => call('/yandex/auto?on=' + (e.target.checked ? 1 : 0), {method:'POST'})
+  .then(() => toast(e.target.checked ? 'will switch off after a print' : 'will stay on'));
 $('bprint').onclick = () => job('start');
 $('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel');
 $('brestart').onclick = () => confirm('Restart the module? The printer keeps running.') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
@@ -271,7 +281,6 @@ $('file').onchange = e => { if (e.target.files[0]) upload(e.target.files[0]); e.
 function upload(f){
   const form = new FormData();
   form.append('file', f);
-  if ($('cprint').checked) form.append('print', 'true');
   const x = new XMLHttpRequest(), p = $('uprog');
   p.classList.remove('hide'); p.value = 0;
   x.upload.onprogress = e => { if (e.lengthComputable) p.value = e.loaded * 100 / e.total; };
