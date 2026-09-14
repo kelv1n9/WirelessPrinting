@@ -1099,6 +1099,10 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
   });
 
   server.on("/yandex/off", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (isPrinting) {
+      request->send(409, "text/plain", "a print is running, cancel it first");
+      return;
+    }
     request->send(yandexHome.request(YandexHome::PowerOff) ? 204 : 409, "text/plain", "");
   });
 

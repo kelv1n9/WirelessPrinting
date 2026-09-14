@@ -148,6 +148,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     </div>
     <div class="row" style="margin-top:14px">
       <button id="brestart">Restart module</button>
+      <button class="d" id="bpower">Turn printer off</button>
     </div>
   </section>
 </main>
@@ -226,6 +227,8 @@ function render(d){
   $('dheap').textContent = kib(d.system.heap);
   $('drssi').textContent = d.system.rssi + ' dBm';
   $('dver').textContent = d.system.version;
+  $('brestart').disabled = d.printing;
+  $('bpower').disabled = d.printing || !d.socket.token || !d.socket.device;
 }
 
 function renderFiles(sel){
@@ -270,7 +273,8 @@ async function loadFiles(){
 
 $('bprint').onclick = () => job('start');
 $('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel');
-$('brestart').onclick = () => confirm('Restart the module?') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
+$('brestart').onclick = () => confirm('Restart the module? The printer keeps running.') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
+$('bpower').onclick = () => confirm('Cut mains to the printer? This module loses power too and cannot switch it back on.') && call('/yandex/off', {method:'POST'}).then(() => toast('switching off'));
 $('bpick').onclick = () => $('file').click();
 $('file').onchange = e => { if (e.target.files[0]) upload(e.target.files[0]); e.target.value = ''; };
 
