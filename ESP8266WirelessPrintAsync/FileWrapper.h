@@ -1,9 +1,7 @@
 #pragma once
 
-#define FS_NO_GLOBALS // allow spiffs to coexist with SD card, define BEFORE including FS.h
+#define FS_NO_GLOBALS
 #include <FS.h>
-#include <SPIFFS.h>
-#define FORMAT_SPIFFS_IF_FAILED true
 #include <SD_MMC.h>
 using fs::File;
 
@@ -12,7 +10,6 @@ class FileWrapper : public Stream {
 
   private:
     File sdFile;
-    fs::File fsFile;
 
   public:
     // Print methods
@@ -26,7 +23,7 @@ class FileWrapper : public Stream {
     virtual int read();
 
     inline operator bool() {
-      return sdFile || fsFile;
+      return sdFile;
     }
 
     String name();
@@ -36,10 +33,7 @@ class FileWrapper : public Stream {
     void close();
 
     inline bool isDirectory() {
-      if (sdFile)
-        return sdFile.isDirectory();
-
-      return fsFile ? fsFile.isDirectory() : false;
+      return sdFile ? sdFile.isDirectory() : false;
     }
 
     FileWrapper openNextFile();
