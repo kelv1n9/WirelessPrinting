@@ -468,9 +468,13 @@ String M115ExtractString(const String response, const String field) {
 }
 
 bool M115ExtractBool(const String response, const String field, const bool onErrorValue = false) {
-  String result = M115ExtractString(response, field);
+  const int pos = response.indexOf(field + ":");
+  if (pos == -1)
+    return onErrorValue;
 
-  return result == "" ? onErrorValue : (result == "1" ? true : false);
+  const unsigned int valuePos = (unsigned int)pos + field.length() + 1;
+
+  return valuePos < response.length() ? response[valuePos] == '1' : onErrorValue;
 }
 
 inline String getDeviceId() {
