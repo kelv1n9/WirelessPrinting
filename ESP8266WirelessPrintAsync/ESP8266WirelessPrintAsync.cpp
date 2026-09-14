@@ -6,6 +6,8 @@
 #include <Update.h>
 #include <esp_task_wdt.h>
 #include <Preferences.h>
+#include <time.h>
+#include <mbedtls/base64.h>
 #include <ArduinoJson.h>          // https://github.com/bblanchon/ArduinoJson (for implementing a subset of the OctoPrint API)
 #include <DNSServer.h>
 #include "StorageFS.h"
@@ -41,6 +43,8 @@ DNSServer dns;
 #define WIFI_REBOOT_AFTER 600000        // Reboot after this long offline, so a changed network can be configured again
 #define WDT_TIMEOUT 30                  // Seconds without a loop iteration before the watchdog reboots the device
 #define MAX_LISTED_FILES 64             // Upper bound on the directory listing, so a full card cannot exhaust the heap
+#define THUMBNAIL_SCAN_BYTES 262144     // How far into a file to look for an embedded preview
+#define THUMBNAIL_MAX_BYTES 131072      // Refuse to decode a preview larger than this
 #define CANCEL_PARK "G1 X0 Y180 F6000"  // Where a cancelled print leaves the head, comment out to home only
 #define POWEROFF_NOZZLE 100             // Nozzle has to be below this before the socket may be switched off
 #define POWEROFF_BED 50                 // And the bed below this
@@ -73,6 +77,13 @@ bool printerConnected,
 uint32_t printStartTime;
 float printCompletion;
 
+// Telemetry gathered while streaming the file
+uint16_t currentLayer, totalLayers;
+float currentZ;
+int32_t slicerMinutesLeft = -1;
+int16_t fanSpeed;
+uint32_t linesSent, linesResent;
+
 // Serial communication
 String lastCommandSent, lastReceivedResponse;
 uint32_t lineNumber;
@@ -81,7 +92,7 @@ bool swallowNextOk;
 uint8_t timeoutRetries;
 uint32_t wifiRetryTimer, wifiDownSince;
 
-bool autoPowerOff, powerOffArmed;
+bool autoPowerOff, powerOffArmed, updateSucceeded;
 uint8_t powerOffAttempts;
 uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheckTimer;
 
@@ -295,6 +306,21 @@ void selectFile(const String path) {
   preferences.end();
 }
 
+uint16_t readTotalLayers(const String path) {
+  FileWrapper file = storageFS.open(path);
+  if (!file)
+    return 0;
+
+  char buffer[1025];
+  const size_t got = file.read((uint8_t *)buffer, sizeof(buffer) - 1);
+  buffer[got] = 0;
+  file.close();
+
+  const char *found = strstr(buffer, "total layer number:");
+
+  return found == NULL ? 0 : atoi(found + 19);
+}
+
 void handlePrint() {
   static FileWrapper gcodeFile;
   static float prevM532Completion;
@@ -316,10 +342,29 @@ void handlePrint() {
     else if (!printPause && commandQueue.getFreeSlots() > 4) {    // Keep some space for "service" commands
       String line = gcodeFile.readStringUntil('\n'); // The G-Code line being worked on
       filePos += line.length() + 1;
+
+      if (line.startsWith(";LAYER_CHANGE"))
+        ++currentLayer;
+      else if (line.startsWith(";Z:"))
+        currentZ = line.substring(3).toFloat();
+
       int pos = line.indexOf(';');
       if (line.length() > 0 && pos != 0 && line[0] != '(' && line[0] != '\r') {
         if (pos != -1)
           line = line.substring(0, pos);
+
+        if (line.startsWith("M73")) {
+          const int r = line.indexOf('R');
+          if (r != -1)
+            slicerMinutesLeft = line.substring(r + 1).toInt();
+        }
+        else if (line.startsWith("M107"))
+          fanSpeed = 0;
+        else if (line.startsWith("M106")) {
+          const int sPos = line.indexOf('S');
+          fanSpeed = sPos == -1 ? 255 : line.substring(sPos + 1).toInt();
+        }
+
         commandQueue.push(line);
       }
 
@@ -337,6 +382,11 @@ void handlePrint() {
 
     filePos = 0;
     prevM532Completion = 0.0;
+    currentLayer = 0;
+    currentZ = 0;
+    slicerMinutesLeft = -1;
+    fanSpeed = -1;
+    linesSent = linesResent = 0;
 
     gcodeFile = storageFS.open(selectedFile);
     if (!gcodeFile)
@@ -344,6 +394,7 @@ void handlePrint() {
     else {
       printingFile = selectedFile;
       printingFileSize = selectedFileSize;
+      totalLayers = readTotalLayers(printingFile);
       lcd("Printing...");
       playSound();
       printStartTime = millis();
@@ -401,6 +452,60 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
     }
     else if (path != "")
       selectFile(path);
+    path = "";
+  }
+}
+
+bool isInterfaceFilename(const String name) {
+  if (name.startsWith("."))
+    return false;
+
+  String lowercase = name;
+  lowercase.toLowerCase();
+
+  return lowercase.endsWith(".html") || lowercase.endsWith(".css") || lowercase.endsWith(".js") ||
+         lowercase.endsWith(".json") || lowercase.endsWith(".svg") || lowercase.endsWith(".png") ||
+         lowercase.endsWith(".ico") || lowercase.endsWith(".woff2") || lowercase.endsWith(".txt");
+}
+
+void handleInterfaceUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+  static FileWrapper file;
+  static String path;
+
+  if (!index) {
+    if (file) {
+      file.close();
+      if (path != "")
+        storageFS.remove(path);
+    }
+    path = "";
+    uploadFailure = "";
+
+    const String name = sanitizeFilename(filename);
+    if (!storageFS.isActive())
+      uploadFailure = "no storage";
+    else if (!isInterfaceFilename(name))
+      uploadFailure = "not an interface file";
+    else if (request->contentLength() >= storageFS.freeBytes())
+      uploadFailure = "not enough free space";
+    else {
+      storageFS.mkdir("/ui");
+      file = storageFS.open("/ui/" + name, "w");
+      if (!file)
+        uploadFailure = "cannot create file";
+      else
+        path = "/ui/" + name;
+    }
+  }
+
+  if (uploadFailure == "" && file && file.write(data, len) != len)
+    uploadFailure = "write error, card full";
+
+  if (final) {
+    if (file)
+      file.close();
+    if (uploadFailure != "" && path != "")
+      storageFS.remove(path);
     path = "";
   }
 }
@@ -836,42 +941,7 @@ inline String powerOffState() {
                                  : "switching off now, attempt " + String(powerOffAttempts);
 }
 
-void setup() {
-  commandQueue.begin();
-  storageFS.begin();
-  yandexHome.begin();
-
-  for (int t = 0; t < MAX_SUPPORTED_EXTRUDERS; t++)
-    toolTemperature[t] = { "0.0", "0.0" };
-  bedTemperature = { "0.0", "0.0" };
-
-  // Wait for connection
-  WiFi.mode(WIFI_STA);
-  AsyncWiFiManager wifiManager(&server, &dns);
-  // wifiManager.resetSettings();   // Uncomment this to reset the settings on the device, then you will need to reflash with USB and this commented out!
-  wifiManager.setDebugOutput(false);  // So that it does not send stuff to the printer that the printer does not understand
-  if (WiFi.SSID() != "")
-    wifiManager.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT);
-  wifiManager.autoConnect("AutoConnectAP");
-  WiFi.setAutoReconnect(true);
-  wifiDownSince = millis();
-
-  telnetServer.begin();
-  telnetServer.setNoDelay(true);
-
-  initSelectedFile();
-
-  preferences.begin("wirelessprint", true);
-  autoPowerOff = preferences.getBool("autooff", false);
-  preferences.end();
-
-  server.onNotFound([](AsyncWebServerRequest * request) {
-    telnetSend("404 | Page '" + request->url() + "' not found");
-    request->send(404, "text/html; charset=utf-8", "<h1>Page not found!</h1>");
-  });
-
-  // Main page
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest * request) {
+String fallbackPage() {
     String message = "<h1>" + getDeviceName() + "</h1>"
                      "<p>" + getState() + ". Selected: <b>" + htmlEscape(jobFilename()) + "</b></p>"
                      "<p><button onclick=\"job('start')\">Print selected</button> "
@@ -899,8 +969,50 @@ void setup() {
 function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); location.reload(); }); }
 function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({command: command})}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); location.reload(); }); }
 </script>)HTML";
-    request->send(200, "text/html; charset=utf-8", message);
+
+    return message;
+}
+
+void setup() {
+  commandQueue.begin();
+  storageFS.begin();
+  yandexHome.begin();
+  storageFS.mkdir("/ui");
+
+  for (int t = 0; t < MAX_SUPPORTED_EXTRUDERS; t++)
+    toolTemperature[t] = { "0.0", "0.0" };
+  bedTemperature = { "0.0", "0.0" };
+
+  // Wait for connection
+  WiFi.mode(WIFI_STA);
+  AsyncWiFiManager wifiManager(&server, &dns);
+  // wifiManager.resetSettings();   // Uncomment this to reset the settings on the device, then you will need to reflash with USB and this commented out!
+  wifiManager.setDebugOutput(false);  // So that it does not send stuff to the printer that the printer does not understand
+  if (WiFi.SSID() != "")
+    wifiManager.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT);
+  wifiManager.autoConnect("AutoConnectAP");
+  WiFi.setAutoReconnect(true);
+  wifiDownSince = millis();
+  configTzTime("UTC0", "pool.ntp.org", "time.google.com");
+
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+
+  initSelectedFile();
+
+  preferences.begin("wirelessprint", true);
+  autoPowerOff = preferences.getBool("autooff", false);
+  preferences.end();
+
+  server.onNotFound([](AsyncWebServerRequest * request) {
+    if (request->url() == "/" || request->url() == "/index.html") {
+      request->send(200, "text/html; charset=utf-8", fallbackPage());
+      return;
+    }
+    telnetSend("404 | Page '" + request->url() + "' not found");
+    request->send(404, "text/html; charset=utf-8", "<h1>Page not found!</h1>");
   });
+
 
   server.on("/yandex", HTTP_GET, [](AsyncWebServerRequest * request) {
     String list;
@@ -945,7 +1057,9 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
                      "<button onclick=\"post('/yandex/abort')\">Cancel the pending switch off</button></p>"
                      "<h2>Sockets</h2>"
                      "<p><button onclick=\"post('/yandex/devices')\">Load from Yandex</button> "
-                     "<button onclick=\"post('/yandex/test')\">Test: switch on</button></p>"
+                     "<button onclick=\"post('/yandex/test')\">Test: switch on</button> "
+                     "<button onclick=\"if (confirm('This cuts power to the printer and to this module. Continue?')) post('/yandex/off')\">Switch off now</button></p>"
+                     "<p><button onclick=\"post('/restart')\">Restart the module</button></p>"
                      "<table>" + list + "</table>"
                      "<p><a href=\"/\">Back</a></p>";
     message += R"HTML(<script>
@@ -973,6 +1087,19 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     preferences.end();
 
     request->send(204, "text/plain", "");
+  });
+
+  server.on("/restart", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (isPrinting) {
+      request->send(409, "text/plain", "a print is running");
+      return;
+    }
+    request->send(200, "text/plain", "restarting");
+    ESPrestartRequired = true;
+  });
+
+  server.on("/yandex/off", HTTP_POST, [](AsyncWebServerRequest * request) {
+    request->send(yandexHome.request(YandexHome::PowerOff) ? 204 : 409, "text/plain", "");
   });
 
   server.on("/yandex/abort", HTTP_POST, [](AsyncWebServerRequest * request) {
@@ -1077,7 +1204,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     });
 
     server.on("/update", HTTP_POST, [](AsyncWebServerRequest * request) {
-      const bool failed = Update.hasError() || Update.progress() == 0;
+      const bool failed = !updateSucceeded;
       AsyncWebServerResponse *response = request->beginResponse(failed ? 500 : 200, "text/plain",
                                                                 failed ? String(Update.errorString()) : String("OK, rebooting"));
       response->addHeader("Connection", "close");
@@ -1086,6 +1213,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     },
     [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
       if (!index) {
+        updateSucceeded = false;
         if (Update.isRunning())
           Update.abort();
         if (!Update.begin(UPDATE_SIZE_UNKNOWN))
@@ -1099,11 +1227,70 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       if (Update.write(data, len) != len)
         Update.abort();
       else if (final)
-        Update.end(true);
+        updateSucceeded = Update.end(true);
     });
   #endif
 
   // Download page
+  server.on("/thumbnail", HTTP_GET, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("name")) {
+      request->send(400, "text/plain", "name is required");
+      return;
+    }
+
+    FileWrapper file = storageFS.open("/" + sanitizeFilename(request->getParam("name")->value()));
+    if (!file) {
+      request->send(404, "text/plain", "no such file");
+      return;
+    }
+
+    String encoded;
+    bool inside = false;
+    unsigned int scanned = 0;
+    while (file.available() && scanned < THUMBNAIL_SCAN_BYTES && encoded.length() < THUMBNAIL_MAX_BYTES) {
+      String line = file.readStringUntil('\n');
+      scanned += line.length() + 1;
+      line.trim();
+      if (!line.startsWith(";"))
+        continue;
+
+      if (!inside) {
+        inside = line.indexOf("thumbnail begin") != -1;
+        continue;
+      }
+      if (line.indexOf("thumbnail end") != -1)
+        break;
+
+      line = line.substring(1);
+      line.trim();
+      encoded += line;
+    }
+    file.close();
+
+    size_t length = 0;
+    if (encoded == "" || mbedtls_base64_decode(NULL, 0, &length, (const unsigned char *)encoded.c_str(), encoded.length()) != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL || length == 0) {
+      request->send(404, "text/plain", "no preview in this file");
+      return;
+    }
+
+    uint8_t *decoded = (uint8_t *)malloc(length);
+    if (decoded == NULL) {
+      request->send(507, "text/plain", "out of memory");
+      return;
+    }
+    if (mbedtls_base64_decode(decoded, length, &length, (const unsigned char *)encoded.c_str(), encoded.length()) != 0) {
+      free(decoded);
+      request->send(404, "text/plain", "broken preview");
+      return;
+    }
+
+    AsyncResponseStream *response = request->beginResponseStream("image/png", length + 64);
+    response->write(decoded, length);
+    free(decoded);
+    response->addHeader("Cache-Control", "max-age=86400");
+    request->send(response);
+  });
+
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest * request) {
     String path = selectedFile;
     if (request->hasParam("name"))
@@ -1275,6 +1462,68 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       }
   });
   
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest * request) {
+    const uint32_t elapsed = isPrinting ? (millis() - printStartTime) / 1000 : 0;
+    int32_t remaining = -1;
+    String remainingFrom = "unknown";
+    if (isPrinting) {
+      if (slicerMinutesLeft >= 0) {
+        remaining = slicerMinutesLeft * 60;
+        remainingFrom = "slicer";
+      }
+      else if (printCompletion > 0.5) {
+        remaining = (int32_t)(elapsed / printCompletion * (100 - printCompletion));
+        remainingFrom = "extrapolated";
+      }
+    }
+
+    const time_t now = time(NULL);
+
+    String message = "{"
+      "\"state\":\"" + getState() + "\","
+      "\"connected\":" + stringify(printerConnected) + ","
+      "\"printing\":" + stringify(isPrinting) + ","
+      "\"paused\":" + stringify(printPause) + ","
+      "\"temperature\":{"
+        "\"tool\":{\"actual\":" + toolTemperature[0].actual + ",\"target\":" + toolTemperature[0].target + "},"
+        "\"bed\":{\"actual\":" + bedTemperature.actual + ",\"target\":" + bedTemperature.target + "}},"
+      "\"job\":{"
+        "\"file\":\"" + jsonEscape(jobFilename()) + "\","
+        "\"size\":" + String(jobFileSize()) + ","
+        "\"position\":" + String(filePos) + ","
+        "\"completion\":" + String(printCompletion, 2) + ","
+        "\"elapsed\":" + String(elapsed) + ","
+        "\"remaining\":" + String(remaining) + ","
+        "\"remainingFrom\":\"" + remainingFrom + "\","
+        "\"layer\":" + String(currentLayer) + ","
+        "\"layers\":" + String(totalLayers) + ","
+        "\"z\":" + String(currentZ, 2) + ","
+        "\"fan\":" + String(fanSpeed) + "},"
+      "\"link\":{"
+        "\"baud\":" + String(serialBauds[serialBaudIndex]) + ","
+        "\"sent\":" + String(linesSent) + ","
+        "\"resent\":" + String(linesResent) + "},"
+      "\"storage\":{"
+        "\"selected\":\"" + jsonEscape(baseName(selectedFile)) + "\","
+        "\"free\":" + uint64ToString(storageFS.freeBytes()) + ","
+        "\"total\":" + uint64ToString(storageFS.totalBytes()) + "},"
+      "\"socket\":{"
+        "\"token\":" + stringify(yandexHome.hasToken()) + ","
+        "\"device\":\"" + jsonEscape(yandexHome.getDeviceName()) + "\","
+        "\"auto\":" + stringify(autoPowerOff) + ","
+        "\"state\":\"" + jsonEscape(powerOffState()) + "\","
+        "\"status\":\"" + jsonEscape(yandexHome.getStatus()) + "\"},"
+      "\"system\":{"
+        "\"heap\":" + String(ESP.getFreeHeap()) + ","
+        "\"uptime\":" + String(millis() / 1000) + ","
+        "\"epoch\":" + String((uint32_t)now) + ","
+        "\"rssi\":" + String(WiFi.RSSI()) + ","
+        "\"machine\":\"" + jsonEscape(fwMachineType) + "\","
+        "\"version\":\"" SKETCH_VERSION "\"}"
+      "}";
+    request->send(200, "application/json", message);
+  });
+
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest * request) {
     // https://github.com/probonopd/WirelessPrinting/issues/30
     // https://github.com/probonopd/WirelessPrinting/issues/18#issuecomment-321927016
@@ -1365,6 +1614,16 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     request->send(200, "text/plain", "Received");
   }, handleUpload);
 
+  server.on("/ui/upload", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (uploadFailure != "") {
+      request->send(500, "application/json", "{\"error\": \"" + jsonEscape(uploadFailure) + "\"}");
+      return;
+    }
+    request->send(201, "application/json", "{\"done\": true}");
+  }, handleInterfaceUpload);
+
+  server.serveStatic("/", SD_MMC, "/ui/").setDefaultFile("index.html").setCacheControl("no-cache");
+
   server.begin();
 
   #ifdef OTA_UPDATES
@@ -1395,6 +1654,7 @@ void transmitCommand(const String command, const uint32_t number) {
   line += "*" + String(checksum);
 
   PrinterSerial.println(line);              // Send to 3D Printer
+  ++linesSent;
   lastSentLine = line;
   lineNumber = command.startsWith("M110") ? 0 : number;
 
@@ -1453,8 +1713,10 @@ void ReceiveResponses() {
         const int32_t requested = parseResendNumber(serialResponse, lineStartPos);
         if (requested >= 0 && (uint32_t)requested < lineNumber)
           printerRestarted = true;
-        if (!printerRestarted && !commandQueue.isAckEmpty() && lastCommandSent != "")   // Only one command is ever unacknowledged, so it is the one being asked for
+        if (!printerRestarted && !commandQueue.isAckEmpty() && lastCommandSent != "") {  // Only one command is ever unacknowledged, so it is the one being asked for
+          ++linesResent;
           transmitCommand(lastCommandSent, requested < 0 ? lineNumber : (uint32_t)requested);
+        }
         swallowNextOk = true;
         responseDetail = "resend";
       }

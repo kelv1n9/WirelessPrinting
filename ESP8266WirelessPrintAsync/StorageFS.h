@@ -23,6 +23,10 @@ class StorageFS {
       return 255;
     }
 
+    inline static bool mkdir(const String path) {
+      return hasSD && (SD_MMC.exists(path) || SD_MMC.mkdir(path));
+    }
+
     inline static bool exists(const String path) {
       return hasSD && path.length() > 1 && path.startsWith("/") && SD_MMC.exists(path);
     }
