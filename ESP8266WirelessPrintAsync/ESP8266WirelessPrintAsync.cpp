@@ -36,7 +36,7 @@ DNSServer dns;
 #define PRINTER_RX_BUFFER_SIZE 0        // This is printer firmware 'RX_BUFFER_SIZE'. If such parameter is unknown please use 0
 #define TEMPERATURE_REPORT_INTERVAL 2   // Ask the printer for its temperatures status every 2 seconds
 #define KEEPALIVE_INTERVAL 2500         // Marlin defaults to 2 seconds, get a little of margin
-#define MAX_TIMEOUT_RETRIES 5           // Silent periods of KEEPALIVE_INTERVAL before a print is given up on
+#define MAX_TIMEOUT_RETRIES 12          // Silent periods of KEEPALIVE_INTERVAL before a print is given up on
 #define MAX_RESPONSE_LENGTH 4096        // An unrecognized response longer than this is discarded instead of growing the heap. M115 alone is over 1 KB
 #define WIFI_PORTAL_TIMEOUT 180         // Seconds the configuration portal stays up before retrying the stored network
 #define WIFI_RETRY_INTERVAL 30000       // Reconnection attempt interval while the network is down
@@ -1736,6 +1736,10 @@ void ReceiveResponses() {
       bool incompleteResponse = false, unsolicited = false;
       String responseDetail = "";
 
+      while (lineStartPos < (int)serialResponse.length() &&   // A dropped or added byte must not hide an otherwise valid reply
+             (serialResponse[lineStartPos] < 32 || serialResponse[lineStartPos] > 126))
+        ++lineStartPos;
+
       if (serialResponse.startsWith("Resend:", lineStartPos) || serialResponse.startsWith("rs ", lineStartPos)) {
         const int32_t requested = parseResendNumber(serialResponse, lineStartPos);
         const bool trusted = requested >= 0 && (lastLineReported < 0 || requested == lastLineReported + 1);
@@ -1793,14 +1797,18 @@ void ReceiveResponses() {
         }
         else if (serialResponse.startsWith("Error:")) {
           const int lastLine = serialResponse.indexOf("Last Line:");
-          if (lastLine == -1) {   // Every Marlin transmission error ends with 'Last Line: N' and is followed by a Resend
-            cancelPrint = true;
-            responseDetail = "ERROR";
-          }
-          else {
+          if (lastLine != -1) {   // Every Marlin transmission error ends with 'Last Line: N' and is followed by a Resend
             lastLineReported = parseResendNumber(serialResponse, lastLine);
             responseDetail = "resend error";
           }
+          else if (serialResponse.indexOf("halted") != -1 || serialResponse.indexOf("kill") != -1 ||
+                   serialResponse.indexOf("Thermal") != -1 || serialResponse.indexOf("MINTEMP") != -1 ||
+                   serialResponse.indexOf("MAXTEMP") != -1 || serialResponse.indexOf("Heating failed") != -1) {
+            cancelPrint = true;
+            responseDetail = "ERROR";
+          }
+          else
+            responseDetail = "error, not fatal";
         }
         else {
           incompleteResponse = true;
