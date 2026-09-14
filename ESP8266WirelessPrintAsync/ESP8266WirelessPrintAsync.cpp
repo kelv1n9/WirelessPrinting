@@ -11,7 +11,6 @@
 #include <ESPAsyncWebServer.h>    // https://github.com/me-no-dev/ESPAsyncWebServer
 #include <ESPAsyncWiFiManager.h>  // https://github.com/alanswx/ESPAsyncWiFiManager/
 #include <AsyncElegantOTA.h>      // https://github.com/ayushsharma82/AsyncElegantOTA
-#include <SPIFFSEditor.h>
 
 #include "CommandQueue.h"
 
@@ -499,9 +498,6 @@ void setup() {
 
   telnetServer.begin();
   telnetServer.setNoDelay(true);
-
-  if (storageFS.activeSPIFFS())
-    server.addHandler(new SPIFFSEditor(SPIFFS));
 
   initUploadedFilename();
 
