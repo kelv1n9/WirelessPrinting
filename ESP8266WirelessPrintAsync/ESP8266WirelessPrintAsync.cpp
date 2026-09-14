@@ -47,7 +47,6 @@ DNSServer dns;
 #define POWEROFF_GRACE 30000            // Everything has to stay that way for this long
 #define POWEROFF_RETRY 60000            // Retry interval when the request did not get through
 #define POWEROFF_ATTEMPTS 10            // Attempts before giving up for this print
-#define PROGRESS_SCAN_BYTES 65536       // How far into a file to look for its own M73 before reporting progress ourselves
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
 #define API_VERSION     "0.1"
@@ -296,38 +295,9 @@ void selectFile(const String path) {
   preferences.end();
 }
 
-bool fileReportsOwnProgress(const String path) {
-  FileWrapper file = storageFS.open(path);
-  if (!file)
-    return false;
-
-  const unsigned int chunk = 512, overlap = 3;
-  char buffer[chunk + overlap + 1];
-  unsigned int head = 0, scanned = 0;
-  bool found = false;
-
-  while (!found && scanned < PROGRESS_SCAN_BYTES && file.available()) {
-    const size_t got = file.read((uint8_t *)buffer + head, chunk);
-    if (got == 0)
-      break;
-
-    const unsigned int total = head + got;
-    buffer[total] = 0;
-    found = strstr(buffer, "\nM73") != NULL || (scanned == 0 && strncmp(buffer, "M73", 3) == 0);
-
-    head = total < overlap ? total : overlap;
-    memmove(buffer, buffer + total - head, head);
-    scanned += got;
-  }
-  file.close();
-
-  return found;
-}
-
 void handlePrint() {
   static FileWrapper gcodeFile;
-  static float prevM73Completion, prevM532Completion;
-  static bool fileReportsProgress;
+  static float prevM532Completion;
 
   if (isPrinting) {
     const bool abortPrint = (restartPrint || cancelPrint || printerRestarted);
@@ -350,17 +320,11 @@ void handlePrint() {
       if (line.length() > 0 && pos != 0 && line[0] != '(' && line[0] != '\r') {
         if (pos != -1)
           line = line.substring(0, pos);
-        if (line.startsWith("M73"))
-          fileReportsProgress = true;
         commandQueue.push(line);
       }
 
       // Send to printer completion (if supported)
       printCompletion = printingFileSize > 0 ? min((float)filePos / printingFileSize * 100, 100.0f) : 0;
-      if (fwBuildPercentCap && !fileReportsProgress && printCompletion - prevM73Completion >= 1) {
-        commandQueue.push("M73 P" + String((int)printCompletion));
-        prevM73Completion = printCompletion;
-      }
       if (fwProgressCap && printCompletion - prevM532Completion >= 0.1) {
         commandQueue.push("M532 X" + String((int)(printCompletion * 10) / 10.0));
         prevM532Completion = printCompletion;
@@ -372,8 +336,7 @@ void handlePrint() {
     startPrint = restartPrint = false;
 
     filePos = 0;
-    prevM73Completion = prevM532Completion = 0.0;
-    fileReportsProgress = false;
+    prevM532Completion = 0.0;
 
     gcodeFile = storageFS.open(selectedFile);
     if (!gcodeFile)
@@ -381,7 +344,6 @@ void handlePrint() {
     else {
       printingFile = selectedFile;
       printingFileSize = selectedFileSize;
-      fileReportsProgress = fileReportsOwnProgress(printingFile);
       lcd("Printing...");
       playSound();
       printStartTime = millis();
