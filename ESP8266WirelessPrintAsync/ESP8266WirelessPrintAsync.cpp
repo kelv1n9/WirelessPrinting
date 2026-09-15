@@ -60,6 +60,7 @@ DNSServer dns;
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
 #define LINE_PROBE_MS 3000              // Long enough to catch a printer that only speaks now and then
 #define BOOT_PROBE_MS 6000              // The printer greets whoever is listening, but only once, at power on
+#define UPDATE_ABANDONED_AFTER 30000    // An upload that stops halfway must not leave the printer muted
 #define POWEROFF_ATTEMPTS 10            // Attempts before giving up for this print
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
@@ -111,7 +112,8 @@ uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheck
 float energyWh, energyLastWatt = -1, energyTariff = ENERGY_TARIFF;
 float filamentGrams = -1, filamentPrice = FILAMENT_PRICE, filamentDefaultPrice = FILAMENT_PRICE;
 uint32_t energyLastAt, energyPollAt;
-volatile bool lineProbeRequested;
+volatile bool lineProbeRequested, updateRunning;
+uint32_t updateTouchedAt;
 String lineProbeResult = "{\"verdict\":\"not measured yet, ask once more\"}";
 String bootProbeResult = "{\"verdict\":\"not run\"}";
 
@@ -1391,6 +1393,10 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 
     server.on("/update", HTTP_POST, [](AsyncWebServerRequest * request) {
       const bool failed = !updateSucceeded;
+      if (failed && updateRunning) {
+        updateRunning = false;
+        PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
+      }
       AsyncWebServerResponse *response = request->beginResponse(failed ? 500 : 200, "text/plain",
                                                                 failed ? String(Update.errorString()) : String("OK, rebooting"));
       response->addHeader("Connection", "close");
@@ -1405,7 +1411,11 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
         if (!Update.begin(UPDATE_SIZE_UNKNOWN))
           return;
         lcd("Updating...");
+        updateRunning = true;      // Writing the flash stalls everything that reads from it
+        PrinterSerial.end();
       }
+
+      updateTouchedAt = millis();
 
       if (!Update.isRunning())
         return;
@@ -2048,6 +2058,16 @@ void ReceiveResponses() {
 }
 
 void loop() {
+  if (updateRunning) {             // Let the upload have the chip to itself
+    if ((int32_t)(millis() - updateTouchedAt) > UPDATE_ABANDONED_AFTER) {
+      updateRunning = false;
+      Update.abort();
+      PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
+    }
+    esp_task_wdt_reset();
+    return;
+  }
+
   #ifdef OTA_UPDATES
     //****************
     //* OTA handling *
