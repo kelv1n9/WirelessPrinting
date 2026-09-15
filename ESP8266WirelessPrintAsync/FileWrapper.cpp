@@ -36,6 +36,10 @@ uint32_t FileWrapper::size() {
   return sdFile ? sdFile.size() : 0;
 }
 
+bool FileWrapper::seek(uint32_t position) {
+  return sdFile ? sdFile.seek(position) : false;
+}
+
 uint32_t FileWrapper::lastWrite() {
   return sdFile ? (uint32_t)sdFile.getLastWrite() : 0;
 }

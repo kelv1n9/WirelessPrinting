@@ -28,6 +28,7 @@ class FileWrapper : public Stream {
 
     String name();
     uint32_t size();
+    bool seek(uint32_t position);
     uint32_t lastWrite();
     size_t read(uint8_t *buf, size_t size);
     String readStringUntil(char eol);

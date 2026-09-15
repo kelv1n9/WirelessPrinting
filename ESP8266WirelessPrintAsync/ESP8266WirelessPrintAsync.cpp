@@ -54,6 +54,8 @@ DNSServer dns;
 #define POWEROFF_RETRY 60000            // Retry interval when the request did not get through
 #define ENERGY_POLL 60000               // How often the socket is asked what the printer is drawing
 #define ENERGY_TARIFF 0.077             // AZN per kWh, the first band for households, overridable
+#define FILAMENT_PRICE 40               // AZN per kg, only used when the file does not say
+#define FILAMENT_SCAN_BYTES 65536       // The slicer appends its summary after the last move
 #define POWEROFF_ATTEMPTS 10            // Attempts before giving up for this print
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
@@ -103,6 +105,7 @@ bool autoPowerOff, powerOffArmed, powerOffSawIdle, updateSucceeded;
 uint8_t powerOffAttempts;
 uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheckTimer;
 float energyWh, energyLastWatt = -1, energyTariff = ENERGY_TARIFF;
+float filamentGrams = -1, filamentPrice = FILAMENT_PRICE, filamentDefaultPrice = FILAMENT_PRICE;
 uint32_t energyLastAt, energyPollAt;
 
 uint8_t serialBaudIndex;
@@ -319,6 +322,38 @@ void selectFile(const String path) {
   preferences.end();
 }
 
+// Orca appends its summary after the last move, including what the job weighs and what
+// the spool cost, so the price of a print comes out of the file itself.
+// ponytail: the first extruder only, this printer has one
+void readFilamentUse(const String path, float &grams, float &price) {
+  grams = -1;
+  price = filamentDefaultPrice;
+
+  FileWrapper file = storageFS.open(path);
+  if (!file)
+    return;
+
+  const uint32_t size = file.size();
+  if (size > FILAMENT_SCAN_BYTES)
+    file.seek(size - FILAMENT_SCAN_BYTES);
+
+  while (file.available()) {
+    const String line = file.readStringUntil('\n');
+    if (!line.startsWith("; "))
+      continue;
+
+    const int equals = line.indexOf('=');
+    if (equals == -1)
+      continue;
+
+    if (line.startsWith("; total filament used [g]") || (grams < 0 && line.startsWith("; filament used [g]")))
+      grams = line.substring(equals + 1).toFloat();
+    else if (line.startsWith("; filament_cost"))
+      price = line.substring(equals + 1).toFloat();
+  }
+  file.close();
+}
+
 uint16_t readTotalLayers(const String path) {
   FileWrapper file = storageFS.open(path);
   if (!file)
@@ -424,6 +459,7 @@ void handlePrint() {
       energyWh = 0;
       energyLastWatt = -1;
       energyLastAt = yandexHome.getPowerAt();
+      readFilamentUse(printingFile, filamentGrams, filamentPrice);
       energyPollAt = millis();
       if (fwProgressCap) {
         commandQueue.push("M530 S1 L0");
@@ -1059,6 +1095,8 @@ void setup() {
   preferences.begin("wirelessprint", true);
   autoPowerOff = preferences.getBool("autooff", false);
   energyTariff = preferences.getFloat("tariff", ENERGY_TARIFF);
+  filamentDefaultPrice = preferences.getFloat("kilo", FILAMENT_PRICE);
+  filamentPrice = filamentDefaultPrice;
   preferences.end();
 
   server.onNotFound([](AsyncWebServerRequest * request) {
@@ -1120,8 +1158,11 @@ void setup() {
                      "<button onclick=\"if (confirm('This cuts power to the printer and to this module. Continue?')) post('/yandex/off')\">Switch off now</button></p>"
                      "<form method=\"POST\" action=\"/yandex/tariff\">"
                      "<p>Electricity costs <input type=\"number\" step=\"0.001\" min=\"0\" name=\"tariff\" "
-                     "value=\"" + String(energyTariff, 3) + "\" size=\"8\"> AZN per kWh "
-                     "<button type=\"submit\">Save</button></p></form>"
+                     "value=\"" + String(energyTariff, 3) + "\" size=\"8\"> AZN per kWh, "
+                     "filament costs <input type=\"number\" step=\"0.01\" min=\"0\" name=\"kilo\" "
+                     "value=\"" + String(filamentDefaultPrice, 2) + "\" size=\"8\"> AZN per kg "
+                     "<button type=\"submit\">Save</button></p>"
+                     "<p>A file that carries its own filament price uses that instead.</p></form>"
                      "<p><button onclick=\"post('/restart')\">Restart the module</button></p>"
                      "<table>" + list + "</table>"
                      "<p><a href=\"/\">Back</a></p>";
@@ -1146,12 +1187,18 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       return;
     }
     const float value = request->getParam("tariff", true)->value().toFloat();
+    const float kilo = request->hasParam("kilo", true) ? request->getParam("kilo", true)->value().toFloat()
+                                                       : filamentDefaultPrice;
+    preferences.begin("wirelessprint", false);
     if (value >= 0) {
       energyTariff = value;
-      preferences.begin("wirelessprint", false);
       preferences.putFloat("tariff", value);
-      preferences.end();
     }
+    if (kilo >= 0) {
+      filamentDefaultPrice = kilo;
+      preferences.putFloat("kilo", kilo);
+    }
+    preferences.end();
     request->redirect("/yandex");
   });
 
@@ -1561,6 +1608,8 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       }
     }
 
+    const float usedGrams = filamentGrams < 0 ? 0 : filamentGrams * (isPrinting ? completion / 100 : 1);
+
     const time_t now = time(NULL);
 
     String message = "{"
@@ -1592,8 +1641,12 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       "\"energy\":{"
         "\"wh\":" + String(energyWh, 1) + ","
         "\"watt\":" + String(yandexHome.getPower(), 1) + ","
-        "\"cost\":" + String(energyWh / 1000 * energyTariff, 3) + ","
-        "\"tariff\":" + String(energyTariff, 3) + "},"
+        "\"power\":" + String(energyWh / 1000 * energyTariff, 3) + ","
+        "\"grams\":" + String(usedGrams, 2) + ","
+        "\"filament\":" + String(usedGrams / 1000 * filamentPrice, 3) + ","
+        "\"cost\":" + String(energyWh / 1000 * energyTariff + usedGrams / 1000 * filamentPrice, 3) + ","
+        "\"tariff\":" + String(energyTariff, 3) + ","
+        "\"kilo\":" + String(filamentPrice, 2) + "},"
       "\"storage\":{"
         "\"selected\":\"" + jsonEscape(baseName(selectedFile)) + "\","
         "\"free\":" + uint64ToString(storageFS.freeBytes()) + ","
