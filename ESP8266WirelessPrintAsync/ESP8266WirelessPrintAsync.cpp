@@ -56,6 +56,8 @@ DNSServer dns;
 #define ENERGY_TARIFF 0.077             // AZN per kWh, the first band for households, overridable
 #define FILAMENT_PRICE 40               // AZN per kg, only used when the file does not say
 #define FILAMENT_SCAN_BYTES 65536       // The slicer appends its summary after the last move
+#define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
+#define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
 #define POWEROFF_ATTEMPTS 10            // Attempts before giving up for this print
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
@@ -107,6 +109,8 @@ uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheck
 float energyWh, energyLastWatt = -1, energyTariff = ENERGY_TARIFF;
 float filamentGrams = -1, filamentPrice = FILAMENT_PRICE, filamentDefaultPrice = FILAMENT_PRICE;
 uint32_t energyLastAt, energyPollAt;
+volatile bool lineProbeRequested;
+String lineProbeResult = "{\"verdict\":\"not measured yet, ask once more\"}";
 
 uint8_t serialBaudIndex;
 uint16_t printerUsedBuffer;
@@ -701,7 +705,7 @@ bool detectPrinter() {
 
     case 10:
       // Initialize baud and send a request to printer
-      PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, 13, 12); // gpio13 = rx, gpio12 = tx (gpio14 taken by SD_MMC clock)
+      PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
       telnetSend("Connecting at " + String(serialBauds[serialBaudIndex]));
       commandQueue.push("M110 N0"); // M110 - Reset line numbering before using checksums
       commandQueue.push("M115"); // M115 - Firmware Info
@@ -931,6 +935,62 @@ inline String getState() {
 // accumulated here. A reading is a point measurement of a load that steps between a
 // few watts and most of a kilowatt, so the trapezoid between two of them is an
 // estimate and nothing more.
+// Whether anything is on the other end of the receive wire, told apart from a wire
+// that dangles: a line a live UART holds idle stays high against a pull down, a
+// broken one follows whichever pull is applied.
+void handleLineProbe() {
+  if (!lineProbeRequested)
+    return;
+  lineProbeRequested = false;
+
+  PrinterSerial.end();
+
+  const auto sample = [](const uint8_t mode, const int count) {
+    pinMode(PRINTER_RX_PIN, mode);
+    delay(5);
+    int high = 0;
+    for (int i = 0; i < count; ++i) {
+      high += digitalRead(PRINTER_RX_PIN);
+      delayMicroseconds(50);
+    }
+    return high;
+  };
+
+  const int againstPullDown = sample(INPUT_PULLDOWN, 200);
+  const int againstPullUp = sample(INPUT_PULLUP, 200);
+
+  pinMode(PRINTER_RX_PIN, INPUT);
+  delay(5);
+  int floating = 0, edges = 0, last = digitalRead(PRINTER_RX_PIN);
+  for (int i = 0; i < 2000; ++i) {
+    const int now = digitalRead(PRINTER_RX_PIN);
+    floating += now;
+    if (now != last)
+      ++edges;
+    last = now;
+    delayMicroseconds(50);
+  }
+
+  String verdict;
+  if (againstPullDown > 180 && againstPullUp > 180)
+    verdict = "driven high, something live is on the other end";
+  else if (againstPullDown < 20 && againstPullUp > 180)
+    verdict = "floating, nothing is driving this wire";
+  else if (againstPullDown < 20 && againstPullUp < 20)
+    verdict = "held low, shorted to ground or the far end is stuck";
+  else
+    verdict = "changing while measured, there is traffic on this wire";
+
+  lineProbeResult = "{\"pin\":" + String(PRINTER_RX_PIN) +
+                    ",\"againstPullDown\":" + String(againstPullDown) +
+                    ",\"againstPullUp\":" + String(againstPullUp) +
+                    ",\"floatingHigh\":" + String(floating) +
+                    ",\"edges\":" + String(edges) +
+                    ",\"verdict\":\"" + verdict + "\"}";
+
+  PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
+}
+
 void handleEnergy() {
   const uint32_t at = yandexHome.getPowerAt();
   if (at != energyLastAt) {
@@ -1668,6 +1728,11 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     request->send(200, "application/json", message);
   });
 
+  server.on("/api/line", HTTP_GET, [](AsyncWebServerRequest * request) {
+    lineProbeRequested = true;
+    request->send(200, "application/json", lineProbeResult);
+  });
+
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest * request) {
     // https://github.com/probonopd/WirelessPrinting/issues/30
     // https://github.com/probonopd/WirelessPrinting/issues/18#issuecomment-321927016
@@ -2013,6 +2078,8 @@ void loop() {
   //********************
   //* Printer handling *
   //********************
+  handleLineProbe();
+
   if (!printerConnected)
     printerConnected = detectPrinter();
   else {
