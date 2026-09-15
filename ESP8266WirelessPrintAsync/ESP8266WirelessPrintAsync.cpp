@@ -58,6 +58,8 @@ DNSServer dns;
 #define FILAMENT_SCAN_BYTES 65536       // The slicer appends its summary after the last move
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
+#define LINE_PROBE_MS 3000              // Long enough to catch a printer that only speaks now and then
+#define BOOT_PROBE_MS 6000              // The printer greets whoever is listening, but only once, at power on
 #define POWEROFF_ATTEMPTS 10            // Attempts before giving up for this print
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
@@ -111,6 +113,7 @@ float filamentGrams = -1, filamentPrice = FILAMENT_PRICE, filamentDefaultPrice =
 uint32_t energyLastAt, energyPollAt;
 volatile bool lineProbeRequested;
 String lineProbeResult = "{\"verdict\":\"not measured yet, ask once more\"}";
+String bootProbeResult = "{\"verdict\":\"not run\"}";
 
 uint8_t serialBaudIndex;
 uint16_t printerUsedBuffer;
@@ -935,59 +938,51 @@ inline String getState() {
 // accumulated here. A reading is a point measurement of a load that steps between a
 // few watts and most of a kilowatt, so the trapezoid between two of them is an
 // estimate and nothing more.
-// Whether anything is on the other end of the receive wire, told apart from a wire
-// that dangles: a line a live UART holds idle stays high against a pull down, a
-// broken one follows whichever pull is applied.
+// Whether anything actually arrives on the receive wire. Reading the level says
+// nothing on this board, which pulls the pin up harder than the chip pulls it down,
+// so the wire is listened to instead: a line carrying data spends part of its time low.
+String probeReceiveLine(const uint32_t milliseconds) {
+  pinMode(PRINTER_RX_PIN, INPUT);
+  delay(5);
+
+  uint32_t samples = 0, low = 0, edges = 0;
+  int last = digitalRead(PRINTER_RX_PIN);
+  const uint32_t until = millis() + milliseconds;
+  while ((int32_t)(millis() - until) < 0) {
+    const int now = digitalRead(PRINTER_RX_PIN);
+    if (now != last)
+      ++edges;
+    last = now;
+    if (!now)
+      ++low;
+    ++samples;
+  }
+
+  String verdict;
+  if (edges > 0)
+    verdict = "data is arriving on this wire";
+  else if (low == samples)
+    verdict = "stuck low, shorted to ground or the far end holds it down";
+  else if (low == 0)
+    verdict = "idle high the whole time, nothing was sent down this wire";
+  else
+    verdict = "unreadable";
+
+  return "{\"pin\":" + String(PRINTER_RX_PIN) +
+         ",\"milliseconds\":" + String(milliseconds) +
+         ",\"samples\":" + String(samples) +
+         ",\"low\":" + String(low) +
+         ",\"edges\":" + String(edges) +
+         ",\"verdict\":\"" + verdict + "\"}";
+}
+
 void handleLineProbe() {
   if (!lineProbeRequested)
     return;
   lineProbeRequested = false;
 
   PrinterSerial.end();
-
-  const auto sample = [](const uint8_t mode, const int count) {
-    pinMode(PRINTER_RX_PIN, mode);
-    delay(5);
-    int high = 0;
-    for (int i = 0; i < count; ++i) {
-      high += digitalRead(PRINTER_RX_PIN);
-      delayMicroseconds(50);
-    }
-    return high;
-  };
-
-  const int againstPullDown = sample(INPUT_PULLDOWN, 200);
-  const int againstPullUp = sample(INPUT_PULLUP, 200);
-
-  pinMode(PRINTER_RX_PIN, INPUT);
-  delay(5);
-  int floating = 0, edges = 0, last = digitalRead(PRINTER_RX_PIN);
-  for (int i = 0; i < 2000; ++i) {
-    const int now = digitalRead(PRINTER_RX_PIN);
-    floating += now;
-    if (now != last)
-      ++edges;
-    last = now;
-    delayMicroseconds(50);
-  }
-
-  String verdict;
-  if (againstPullDown > 180 && againstPullUp > 180)
-    verdict = "driven high, something live is on the other end";
-  else if (againstPullDown < 20 && againstPullUp > 180)
-    verdict = "floating, nothing is driving this wire";
-  else if (againstPullDown < 20 && againstPullUp < 20)
-    verdict = "held low, shorted to ground or the far end is stuck";
-  else
-    verdict = "changing while measured, there is traffic on this wire";
-
-  lineProbeResult = "{\"pin\":" + String(PRINTER_RX_PIN) +
-                    ",\"againstPullDown\":" + String(againstPullDown) +
-                    ",\"againstPullUp\":" + String(againstPullUp) +
-                    ",\"floatingHigh\":" + String(floating) +
-                    ",\"edges\":" + String(edges) +
-                    ",\"verdict\":\"" + verdict + "\"}";
-
+  lineProbeResult = probeReceiveLine(LINE_PROBE_MS);
   PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
 }
 
@@ -1125,6 +1120,8 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
 }
 
 void setup() {
+  bootProbeResult = probeReceiveLine(BOOT_PROBE_MS);
+
   commandQueue.begin();
   storageFS.begin();
   yandexHome.begin();
@@ -1730,7 +1727,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 
   server.on("/api/line", HTTP_GET, [](AsyncWebServerRequest * request) {
     lineProbeRequested = true;
-    request->send(200, "application/json", lineProbeResult);
+    request->send(200, "application/json", "{\"atBoot\":" + bootProbeResult + ",\"now\":" + lineProbeResult + "}");
   });
 
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest * request) {
@@ -2153,8 +2150,10 @@ void loop() {
 
   static String telnetCommand;
   while (serverClient && serverClient.available()) {  // get data from Client
-    {
-    char ch = serverClient.read();
+    const int ch = serverClient.read();
+    if (ch < 0)                 // available() can promise a byte that read() then refuses to hand over
+      break;
+
     if (ch == '\r' || ch == '\n') {
       if (telnetCommand.length() > 0) {
         commandQueue.push(telnetCommand);
@@ -2162,8 +2161,7 @@ void loop() {
       }
     }
     else
-      telnetCommand += ch;
-    }
+      telnetCommand += (char)ch;
   }
 
   esp_task_wdt_reset();
