@@ -107,7 +107,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
           <div class="kv"><div class="k">Finishes</div><div class="v" id="jend">—</div></div>
           <div class="kv"><div class="k">Fan</div><div class="v" id="jfan">—</div></div>
           <div class="kv" id="kwatt"><div class="k">Drawing</div><div class="v" id="jwatt">—</div></div>
-          <div class="kv" id="kwh"><div class="k">Used</div><div class="v" id="jwh">—</div></div>
           <div class="kv" id="kgram"><div class="k">Filament</div><div class="v" id="jgram">—</div></div>
           <div class="kv" id="kcost"><div class="k">Cost</div><div class="v" id="jcost">—</div></div>
         </div>
@@ -205,14 +204,14 @@ function render(d){
   $('jfan').textContent = j.fan < 0 ? '—' : Math.round(j.fan/2.55) + '%';
 
   const e = d.energy, metered = e.watt >= 0 || e.wh > 0, weighed = e.grams > 0;
-  ['kwatt','kwh'].forEach(function(id) { $(id).classList.toggle('hide', !metered); });
+  $('kwatt').classList.toggle('hide', !metered);
   $('kgram').classList.toggle('hide', !weighed);
   $('kcost').classList.toggle('hide', !metered && !weighed);
   $('jwatt').textContent = e.watt < 0 ? '—' : e.watt.toFixed(0) + ' W';
-  $('jwh').textContent = (e.wh < 1000 ? e.wh.toFixed(0) + ' Wh' : (e.wh/1000).toFixed(2) + ' kWh');
   $('jgram').textContent = e.grams.toFixed(1) + ' g';
   $('jcost').textContent = e.cost.toFixed(2) + ' AZN';
-  $('jcost').title = 'filament ' + e.filament.toFixed(3) + ' + power ' + e.power.toFixed(3) + ' AZN';
+  $('jcost').title = 'filament ' + e.filament.toFixed(3) + ' AZN, power ' + e.power.toFixed(3)
+    + ' AZN for ' + (e.wh < 1000 ? e.wh.toFixed(0) + ' Wh' : (e.wh/1000).toFixed(2) + ' kWh');
   const th = $('jthumb'), want = j.file && j.file !== 'Unknown' ? '/thumbnail?name=' + encodeURIComponent(j.file) : '';
   if (th.dataset.src !== want) { th.dataset.src = want; th.className = 'thumb'; th.src = want; }
   const auto_ = $('cauto');
