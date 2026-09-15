@@ -106,6 +106,9 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
           <div class="kv"><div class="k">Remaining</div><div class="v" id="jrem">—</div></div>
           <div class="kv"><div class="k">Finishes</div><div class="v" id="jend">—</div></div>
           <div class="kv"><div class="k">Fan</div><div class="v" id="jfan">—</div></div>
+          <div class="kv" id="kwatt"><div class="k">Drawing</div><div class="v" id="jwatt">—</div></div>
+          <div class="kv" id="kwh"><div class="k">Used</div><div class="v" id="jwh">—</div></div>
+          <div class="kv" id="kcost"><div class="k">Cost</div><div class="v" id="jcost">—</div></div>
         </div>
         <div class="row" style="margin-top:16px">
           <button class="p" id="bprint">Print selected</button>
@@ -199,6 +202,14 @@ function render(d){
   $('jrem').textContent = j.remaining >= 0 ? hhmm(j.remaining) : '—';
   $('jend').textContent = j.remaining >= 0 ? new Date(Date.now() + j.remaining*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '—';
   $('jfan').textContent = j.fan < 0 ? '—' : Math.round(j.fan/2.55) + '%';
+
+  const e = d.energy, metered = e.watt >= 0 || e.wh > 0;
+  ['kwatt','kwh','kcost'].forEach(function(id) { $(id).classList.toggle('hide', !metered); });
+  if (metered) {
+    $('jwatt').textContent = e.watt < 0 ? '—' : e.watt.toFixed(0) + ' W';
+    $('jwh').textContent = (e.wh < 1000 ? e.wh.toFixed(0) + ' Wh' : (e.wh/1000).toFixed(2) + ' kWh');
+    $('jcost').textContent = e.cost.toFixed(3) + ' AZN';
+  }
   const th = $('jthumb'), want = j.file && j.file !== 'Unknown' ? '/thumbnail?name=' + encodeURIComponent(j.file) : '';
   if (th.dataset.src !== want) { th.dataset.src = want; th.className = 'thumb'; th.src = want; }
   const auto_ = $('cauto');

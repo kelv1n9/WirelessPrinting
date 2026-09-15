@@ -10,6 +10,7 @@
 #define YANDEX_TASK_STACK 10240
 #define YANDEX_TIMEOUT    15000
 #define YANDEX_JSON_SIZE  16384
+#define YANDEX_DEVICE_JSON 8192
 
 static const char YANDEX_ROOT_CA[] =
 "-----BEGIN CERTIFICATE-----\n"
@@ -41,6 +42,8 @@ TaskHandle_t YandexHome::task = NULL;
 volatile YandexHome::Request YandexHome::pending = YandexHome::None;
 String YandexHome::token, YandexHome::deviceId, YandexHome::deviceName,
        YandexHome::devices, YandexHome::status;
+float YandexHome::power = -1;
+uint32_t YandexHome::powerAt = 0;
 
 class Guard {
   public:
@@ -148,6 +151,18 @@ String YandexHome::getStatus() {
   return status;
 }
 
+float YandexHome::getPower() {
+  Guard guard(mutex);
+
+  return power;
+}
+
+uint32_t YandexHome::getPowerAt() {
+  Guard guard(mutex);
+
+  return powerAt;
+}
+
 bool YandexHome::call(const String path, const String payload, String &body) {
   String bearer;
   {
@@ -253,6 +268,44 @@ void YandexHome::switchTo(const bool on) {
                                                      : "device refused: " + body;
 }
 
+// A socket that measures consumption exposes it as a float property. Many sockets
+// have no meter at all, in which case the property is simply absent and there is
+// nothing to report.
+void YandexHome::fetchPower() {
+  const String id = getDeviceId();
+  if (id == "") {
+    Guard guard(mutex);
+    status = "no device selected";
+    return;
+  }
+
+  String body;
+  if (!call("/v1.0/devices/" + id, "", body))
+    return;
+
+  DynamicJsonDocument document(YANDEX_DEVICE_JSON);
+  if (deserializeJson(document, body)) {
+    Guard guard(mutex);
+    status = "cannot parse the device";
+    return;
+  }
+
+  float watts = -1;
+  for (JsonObject property : document["properties"].as<JsonArray>()) {
+    JsonObject state = property["state"];
+    if (state["instance"] == "power" && !state["value"].isNull()) {
+      watts = state["value"].as<float>();
+      break;
+    }
+  }
+
+  Guard guard(mutex);
+  power = watts;
+  powerAt = millis();
+  if (watts < 0)
+    status = "this socket does not measure power";
+}
+
 void YandexHome::run(void *argument) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -264,6 +317,8 @@ void YandexHome::run(void *argument) {
       switchTo(true);
     else if (what == PowerOff)
       switchTo(false);
+    else if (what == PowerDraw)
+      fetchPower();
 
     pending = None;
   }

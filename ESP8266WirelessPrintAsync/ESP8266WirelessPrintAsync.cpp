@@ -52,6 +52,8 @@ DNSServer dns;
 #define POWEROFF_BED 50                 // And the bed below this
 #define POWEROFF_GRACE 30000            // Everything has to stay that way for this long
 #define POWEROFF_RETRY 60000            // Retry interval when the request did not get through
+#define ENERGY_POLL 60000               // How often the socket is asked what the printer is drawing
+#define ENERGY_TARIFF 0.077             // AZN per kWh, the first band for households, overridable
 #define POWEROFF_ATTEMPTS 10            // Attempts before giving up for this print
 const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
@@ -100,6 +102,8 @@ uint32_t wifiRetryTimer, wifiDownSince;
 bool autoPowerOff, powerOffArmed, powerOffSawIdle, updateSucceeded;
 uint8_t powerOffAttempts;
 uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheckTimer;
+float energyWh, energyLastWatt = -1, energyTariff = ENERGY_TARIFF;
+uint32_t energyLastAt, energyPollAt;
 
 uint8_t serialBaudIndex;
 uint16_t printerUsedBuffer;
@@ -417,6 +421,10 @@ void handlePrint() {
       playSound();
       printStartTime = millis();
       isPrinting = true;
+      energyWh = 0;
+      energyLastWatt = -1;
+      energyLastAt = yandexHome.getPowerAt();
+      energyPollAt = millis();
       if (fwProgressCap) {
         commandQueue.push("M530 S1 L0");
         commandQueue.push("M531 " + baseName(printingFile));
@@ -883,6 +891,31 @@ inline String getState() {
     return "Operational";
 }
 
+// The socket reports watts, never energy, so the area under those readings has to be
+// accumulated here. A reading is a point measurement of a load that steps between a
+// few watts and most of a kilowatt, so the trapezoid between two of them is an
+// estimate and nothing more.
+void handleEnergy() {
+  const uint32_t at = yandexHome.getPowerAt();
+  if (at != energyLastAt) {
+    const float watts = yandexHome.getPower();
+    if (watts >= 0) {
+      if (energyLastWatt >= 0 && at > energyLastAt)
+        energyWh += (energyLastWatt + watts) / 2 * (at - energyLastAt) / 3600000.0;
+      energyLastWatt = watts;
+    }
+    energyLastAt = at;
+  }
+
+  if (!isPrinting || yandexHome.busy() || yandexHome.getDeviceId() == "")
+    return;
+  if ((int32_t)(millis() - energyPollAt) < 0)
+    return;
+
+  energyPollAt = millis() + ENERGY_POLL;
+  yandexHome.request(YandexHome::PowerDraw);
+}
+
 void handleAutoPowerOff() {
   const uint32_t now = millis();
   if ((int32_t)(now - powerOffCheckTimer) < 0)
@@ -1025,6 +1058,7 @@ void setup() {
 
   preferences.begin("wirelessprint", true);
   autoPowerOff = preferences.getBool("autooff", false);
+  energyTariff = preferences.getFloat("tariff", ENERGY_TARIFF);
   preferences.end();
 
   server.onNotFound([](AsyncWebServerRequest * request) {
@@ -1084,6 +1118,10 @@ void setup() {
                      "<p><button onclick=\"post('/yandex/devices')\">Load from Yandex</button> "
                      "<button onclick=\"post('/yandex/test')\">Test: switch on</button> "
                      "<button onclick=\"if (confirm('This cuts power to the printer and to this module. Continue?')) post('/yandex/off')\">Switch off now</button></p>"
+                     "<form method=\"POST\" action=\"/yandex/tariff\">"
+                     "<p>Electricity costs <input type=\"number\" step=\"0.001\" min=\"0\" name=\"tariff\" "
+                     "value=\"" + String(energyTariff, 3) + "\" size=\"8\"> AZN per kWh "
+                     "<button type=\"submit\">Save</button></p></form>"
                      "<p><button onclick=\"post('/restart')\">Restart the module</button></p>"
                      "<table>" + list + "</table>"
                      "<p><a href=\"/\">Back</a></p>";
@@ -1099,6 +1137,21 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       return;
     }
     yandexHome.setToken(request->getParam("token", true)->value());
+    request->redirect("/yandex");
+  });
+
+  server.on("/yandex/tariff", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("tariff", true)) {
+      request->send(400, "text/plain", "tariff is required");
+      return;
+    }
+    const float value = request->getParam("tariff", true)->value().toFloat();
+    if (value >= 0) {
+      energyTariff = value;
+      preferences.begin("wirelessprint", false);
+      preferences.putFloat("tariff", value);
+      preferences.end();
+    }
     request->redirect("/yandex");
   });
 
@@ -1536,6 +1589,11 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
         "\"sent\":" + String(linesSent) + ","
         "\"resent\":" + String(linesResent) + ","
         "\"mangled\":" + String(linesMangled) + "},"
+      "\"energy\":{"
+        "\"wh\":" + String(energyWh, 1) + ","
+        "\"watt\":" + String(yandexHome.getPower(), 1) + ","
+        "\"cost\":" + String(energyWh / 1000 * energyTariff, 3) + ","
+        "\"tariff\":" + String(energyTariff, 3) + "},"
       "\"storage\":{"
         "\"selected\":\"" + jsonEscape(baseName(selectedFile)) + "\","
         "\"free\":" + uint64ToString(storageFS.freeBytes()) + ","
@@ -1910,6 +1968,7 @@ void loop() {
     #endif
 
     handlePrint();
+    handleEnergy();
     handleAutoPowerOff();
 
     if (printerRestarted && !isPrinting) {
