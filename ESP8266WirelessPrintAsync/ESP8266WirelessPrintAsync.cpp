@@ -27,7 +27,9 @@ AsyncWebServer server(80);
 DNSServer dns;
 
 // Configurable parameters
-#define SKETCH_VERSION "2.x-localbuild" // Gets inserted at build time by the PlatformIO workflow
+#ifndef SKETCH_VERSION
+  #define SKETCH_VERSION "unknown"   // Set from the git revision at build time, see build_version.py
+#endif
 #define OTA_UPDATES                     // Enable OTA firmware updates, comment if you don't want it (OTA may lead to security issues because someone may load any code on device)
 //#define OTA_PASSWORD ""               // Uncomment to protect OTA updates and assign a password (inside "")
 #define MAX_SUPPORTED_EXTRUDERS 6       // Number of supported extruder
@@ -137,8 +139,12 @@ inline String IpAddress2String(const IPAddress& ipAddress) {
          String(ipAddress[3]);
 }
 
-inline void telnetSend(const String line) {
-  if (serverClient && serverClient.connected())     // send data to telnet client if connected
+inline bool telnetReady() {
+  return serverClient && serverClient.connected();
+}
+
+inline void telnetSend(const String &line) {
+  if (telnetReady())                                // send data to telnet client if connected
     serverClient.println(line);
 }
 
@@ -1685,7 +1691,10 @@ void transmitCommand(const String command, const uint32_t number) {
   lastSentLine = line;
   lineNumber = command.startsWith("M110") ? 0 : number;
 
-  telnetSend(">" + line);
+  if (telnetReady()) {
+    serverClient.print('>');
+    serverClient.println(line);
+  }
 }
 
 int32_t parseResendNumber(const String response, const int from) {
@@ -1734,7 +1743,8 @@ void ReceiveResponses() {
     }
     else {
       bool incompleteResponse = false, unsolicited = false;
-      String responseDetail = "";
+      const char *responseDetail = "";
+      char detailBuffer[52];
 
       while (lineStartPos < (int)serialResponse.length() &&   // A dropped or added byte must not hide an otherwise valid reply
              (serialResponse[lineStartPos] < 32 || serialResponse[lineStartPos] > 126))
@@ -1744,8 +1754,10 @@ void ReceiveResponses() {
         const int32_t requested = parseResendNumber(serialResponse, lineStartPos);
         const bool trusted = requested >= 0 && (lastLineReported < 0 || requested == lastLineReported + 1);
 
-        if (!trusted)
-          responseDetail = "resend ignored, does not match Last Line " + String(lastLineReported);
+        if (!trusted) {
+          snprintf(detailBuffer, sizeof(detailBuffer), "resend ignored, does not match Last Line %d", (int)lastLineReported);
+          responseDetail = detailBuffer;
+        }
         else {
           if ((uint32_t)requested < lineNumber)
             printerRestarted = true;
@@ -1820,7 +1832,13 @@ void ReceiveResponses() {
       }
 
       int responseLength = serialResponse.length();
-      telnetSend("<" + serialResponse.substring(lineStartPos, responseLength) + "#" + responseDetail + "#");
+      if (telnetReady()) {
+        serverClient.print('<');
+        serverClient.write((const uint8_t *)serialResponse.c_str() + lineStartPos, responseLength - lineStartPos);
+        serverClient.print('#');
+        serverClient.print(responseDetail);
+        serverClient.println('#');
+      }
       if (incompleteResponse)
         lineStartPos = responseLength;
       else {

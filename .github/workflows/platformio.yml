@@ -17,11 +17,6 @@ jobs:
     - name: Install PlatformIO
       run: pip install -U platformio
 
-    - name: Stamp the sketch with the commit it was built from
-      run: |
-        sed -i -e 's|#define SKETCH_VERSION ".*"|#define SKETCH_VERSION "'$(git rev-parse --short HEAD)'"|' \
-          ESP8266WirelessPrintAsync/ESP8266WirelessPrintAsync.cpp
-
     - name: Build
       run: pio run
 

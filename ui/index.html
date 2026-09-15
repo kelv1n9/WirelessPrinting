@@ -81,6 +81,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <div class="meta">
     <span id="rssi"></span>
     <span id="up"></span>
+    <span id="build"></span>
     <span><a href="/info">info</a> · <a href="/yandex">socket</a> · <a href="/update">firmware</a></span>
   </div>
   <div class="row">
@@ -185,6 +186,7 @@ function render(d){
   b.className = 'badge ' + (d.printing ? 'busy' : d.connected ? 'live' : 'bad');
   $('rssi').textContent = d.system.rssi + ' dBm';
   $('up').textContent = 'up ' + hhmm(d.system.uptime);
+  $('build').textContent = d.system.version;
 
   const j = d.job;
   $('jobtitle').textContent = d.printing ? 'Printing' : 'Selected';
