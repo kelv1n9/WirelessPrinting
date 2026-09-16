@@ -103,7 +103,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <span class="badge warn hide" id="soon"></span>
   <span class="badge bad hide" id="mangled"></span>
   <div class="meta">
-    <span id="up"></span>
     <span id="build"></span>
     <span><a href="/info">info</a> · <a href="/yandex">socket</a> · <a href="/update">firmware</a></span>
   </div>
@@ -228,7 +227,6 @@ function render(d){
   bars.setAttribute('class', strength >= 2 ? '' : strength === 1 ? 'weak' : 'gone');   // an svg className is not a string
   bars.querySelectorAll('rect').forEach((r, i) => r.classList.toggle('on', i < Math.max(strength, 1)));
   bars.querySelector('title').textContent = rssi + ' dBm';
-  $('up').textContent = 'up ' + hhmm(d.system.uptime);
   $('build').textContent = d.system.version;
 
   const j = d.job;
