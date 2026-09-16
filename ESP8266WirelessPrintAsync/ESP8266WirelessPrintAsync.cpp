@@ -62,6 +62,8 @@ DNSServer dns;
 #define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
 #define LOG_FLUSH_INTERVAL 5000
 #define LOG_LINK_INTERVAL 60000         // A link summary while printing, and only when something changed
+#define LOG_SAMPLES_PER_PRINT 5         // Damaged lines written out in full, enough for a sample
+#define CONSOLE_LINES 60                // What the page can scroll back through
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
@@ -119,7 +121,8 @@ uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheck
 float energyWh, energyLastWatt = -1, energyTariff = ENERGY_TARIFF;
 float filamentGrams = -1, filamentPrice = FILAMENT_PRICE, filamentDefaultPrice = FILAMENT_PRICE;
 uint32_t energyLastAt, energyPollAt;
-String logBuffer;
+String logBuffer, consoleRing[CONSOLE_LINES];
+uint32_t consoleSeq, loggedSamples;
 uint32_t logFlushAt, logLinkAt, loggedSent, loggedResent, loggedMangled, loggedTimeouts, linkTimeouts;
 volatile bool lineProbeRequested, updateRunning;
 uint32_t updateTouchedAt;
@@ -390,6 +393,29 @@ uint16_t readTotalLayers(const String path) {
 // Nothing about a print survives it today: the telnet log exists only while somebody
 // is watching. One line on the card per print is enough to answer, the morning after,
 // what ran, how long, how it ended and how the link behaved.
+void consoleAdd(const String line) {
+  consoleRing[consoleSeq % CONSOLE_LINES] = line;
+  ++consoleSeq;
+}
+
+// A damaged line is worth keeping as it arrived, so escape what cannot be written
+// as text rather than dropping it.
+String printableOnly(const String text) {
+  String out;
+  for (unsigned int i = 0; i < text.length(); ++i) {
+    const char ch = text[i];
+    if (ch >= 32 && ch <= 126)
+      out += ch;
+    else {
+      char hex[6];
+      snprintf(hex, sizeof(hex), "\\x%02X", (uint8_t)ch);
+      out += hex;
+    }
+  }
+
+  return out;
+}
+
 void logFlush();
 
 void logEvent(const String text) {
@@ -562,7 +588,7 @@ void handlePrint() {
       playSound();
       printStartTime = millis();
       isPrinting = true;
-      linkTimeouts = loggedResent = loggedMangled = loggedTimeouts = 0;
+      linkTimeouts = loggedResent = loggedMangled = loggedTimeouts = loggedSamples = 0;
       logLinkAt = millis() + LOG_LINK_INTERVAL;
       logEvent("print start " + baseName(printingFile) + " " + String(printingFileSize) + " bytes, " +
                String(totalLayers) + " layers, rssi " + String(WiFi.RSSI()));
@@ -1847,6 +1873,44 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     request->send(200, "application/json", message);
   });
 
+  // The page asks for what it has not seen rather than the whole ring every second
+  server.on("/api/console", HTTP_GET, [](AsyncWebServerRequest * request) {
+    uint32_t since = 0;
+    if (request->hasParam("since"))
+      since = strtoul(request->getParam("since")->value().c_str(), NULL, 10);
+
+    const uint32_t oldest = consoleSeq > CONSOLE_LINES ? consoleSeq - CONSOLE_LINES : 0;
+    if (since < oldest)
+      since = oldest;
+
+    String json = "{\"seq\":" + String(consoleSeq) + ",\"lines\":[";
+    for (uint32_t i = since; i < consoleSeq; ++i) {
+      if (i != since)
+        json += ",";
+      json += "\"" + jsonEscape(consoleRing[i % CONSOLE_LINES]) + "\"";
+    }
+
+    request->send(200, "application/json", json + "]}");
+  });
+
+  server.on("/api/command", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("cmd", true)) {
+      request->send(400, "text/plain", "cmd is required");
+      return;
+    }
+
+    String command = request->getParam("cmd", true)->value();
+    command.trim();
+    if (command == "") {
+      request->send(400, "text/plain", "cmd is empty");
+      return;
+    }
+
+    consoleAdd(">" + command);          // Shown from here, since a print hides the gcode going out
+    commandQueue.push(command);
+    request->send(204, "text/plain", "");
+  });
+
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest * request) {
     logFlush();                 // Whatever is still in memory belongs in what the reader gets
     const char *path = request->hasParam("previous") ? LOG_PREVIOUS : LOG_PATH;
@@ -2051,9 +2115,15 @@ void ReceiveResponses() {
       const char *responseDetail = "";
       char detailBuffer[52];
 
+      const int firstByte = lineStartPos;
       while (lineStartPos < (int)serialResponse.length() &&   // A dropped or added byte must not hide an otherwise valid reply
              (serialResponse[lineStartPos] < 32 || serialResponse[lineStartPos] > 126))
         ++lineStartPos;
+
+      if (lineStartPos != firstByte && loggedSamples < LOG_SAMPLES_PER_PRINT) {
+        ++loggedSamples;
+        logEvent("damaged reply: " + printableOnly(serialResponse.substring(firstByte)));
+      }
 
       if (serialResponse.startsWith("Resend:", lineStartPos) || serialResponse.startsWith("rs ", lineStartPos)) {
         const int32_t requested = parseResendNumber(serialResponse, lineStartPos);
@@ -2137,6 +2207,20 @@ void ReceiveResponses() {
       }
 
       int responseLength = serialResponse.length();
+
+      const bool boring = unsolicited || (isPrinting && strcmp(responseDetail, "ok") == 0);
+      if (!boring)
+        consoleAdd("<" + serialResponse.substring(lineStartPos, responseLength));
+
+      if (loggedSamples < LOG_SAMPLES_PER_PRINT &&
+          (strcmp(responseDetail, "mangled line reached the printer") == 0 ||
+           strcmp(responseDetail, "resend error") == 0 ||
+           strcmp(responseDetail, "ERROR") == 0)) {
+        ++loggedSamples;
+        logEvent("printer complained: " + printableOnly(serialResponse.substring(lineStartPos, responseLength)) +
+                 " (after " + printableOnly(lastSentLine) + ")");
+      }
+
       if (telnetReady()) {
         serverClient.print('<');
         serverClient.write((const uint8_t *)serialResponse.c_str() + lineStartPos, responseLength - lineStartPos);

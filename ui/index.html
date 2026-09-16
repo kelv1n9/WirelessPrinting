@@ -65,6 +65,17 @@ tr.sel td{background:#161d2a}
 .num{font-variant-numeric:tabular-nums;white-space:nowrap}
 .foot{display:flex;justify-content:space-between;gap:12px;margin-top:14px;flex-wrap:wrap;align-items:center}
 progress{width:190px;height:7px;accent-color:var(--acc)}
+.consec{}
+#conlog{height:300px;overflow-y:auto;background:var(--sunk);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.55;
+  white-space:pre-wrap;word-break:break-word}
+#conlog .out{color:var(--acc)}
+#conlog .in{color:var(--fg)}
+#conlog .empty{color:var(--dim)}
+#conform{display:flex;gap:8px;margin-top:12px}
+#concmd{flex:1;min-width:0;background:var(--sunk);border:1px solid var(--line);border-radius:8px;
+  padding:9px 11px;color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+#concmd:focus{outline:none;border-color:var(--acc)}
 .diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px 18px;font-size:13px}
 .diag b{display:block;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
 .hide{display:none!important}
@@ -137,6 +148,15 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     </div>
   </section>
 
+  <section id="consec">
+    <h2>Console</h2>
+    <div id="conlog"><div class="empty">nothing yet, send a command</div></div>
+    <form id="conform" autocomplete="off">
+      <input id="concmd" placeholder="M105, G28, M117 hello" spellcheck="false">
+      <button type="submit" class="p">Send</button>
+    </form>
+  </section>
+
   <section id="tempsec">
     <h2>Temperatures</h2>
     <div class="tbox">
@@ -184,6 +204,8 @@ function spark(svg, arr){
 
 function render(d){
   $('machine').textContent = d.system.machine;
+  conPrinting = d.printing;
+
   const b = $('state');
   b.textContent = d.state;
   b.className = 'badge ' + (d.printing ? 'busy' : d.connected ? 'live' : 'bad');
@@ -257,9 +279,6 @@ function renderFiles(sel){
     img.src = '/thumbnail?name=' + encodeURIComponent(f.name);
     tr.insertCell().append(img);
     const n = tr.insertCell(); n.className = 'nm'; n.textContent = f.name;
-    const s = tr.insertCell(); s.className = 'num dim'; s.textContent = kib(f.size);
-    const d = tr.insertCell(); d.className = 'num dim';
-    d.textContent = f.date > 1e9 ? new Date(f.date*1000).toLocaleDateString() : '—';
     const a = tr.insertCell(); a.className = 'row';
     a.onclick = e => e.stopPropagation();
     a.append(btn('Print', 'p', () => act('/select?name=' + encodeURIComponent(f.name)).then(() => job('start'))),
@@ -308,10 +327,45 @@ function upload(f){
   x.send(form);
 }
 
+let conSeq = 0, conPrinting = false;
+
+function conLine(text){
+  const div = document.createElement('div');
+  div.className = text.startsWith('>') ? 'out' : 'in';
+  div.textContent = text;
+  const box = $('conlog');
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.appendChild(div);
+  while (box.childElementCount > 300) box.removeChild(box.firstChild);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function pollConsole(){
+  const d = await (await fetch('/api/console?since=' + conSeq)).json();
+  if (d.seq === conSeq) return;
+  conSeq = d.seq;
+  const first = $('conlog').querySelector('.empty');
+  if (first) first.remove();
+  for (const l of d.lines) conLine(l);
+}
+
+$('conform').onsubmit = async e => {
+  e.preventDefault();
+  const cmd = $('concmd').value.trim();
+  if (!cmd) return;
+  if (conPrinting && !confirm('A print is running. Send "' + cmd + '" anyway?')) return;
+  $('concmd').value = '';
+  const body = new URLSearchParams({cmd});
+  const r = await fetch('/api/command', {method:'POST', body});
+  if (!r.ok) toast('rejected: ' + r.status);
+  pollConsole().catch(()=>{});
+};
+
 (async function loop(){
   for (;;) {
     try { render(await (await fetch('/api/status')).json()); }
     catch (e) { $('state').textContent = 'offline'; $('state').className = 'badge bad'; }
+    pollConsole().catch(()=>{});
     await new Promise(r => setTimeout(r, 1200));
   }
 })();
