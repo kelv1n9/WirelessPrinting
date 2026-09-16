@@ -65,7 +65,7 @@ tr.sel td{background:#161d2a}
 .num{font-variant-numeric:tabular-nums;white-space:nowrap}
 .foot{display:flex;justify-content:space-between;gap:12px;margin-top:14px;flex-wrap:wrap;align-items:center}
 progress{width:190px;height:7px;accent-color:var(--acc)}
-.consec{}
+.side{display:grid;gap:18px;align-content:start;min-width:0}
 #conlog{height:300px;overflow-y:auto;background:var(--sunk);border:1px solid var(--line);border-radius:10px;
   padding:10px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.55;
   white-space:pre-wrap;word-break:break-word}
@@ -148,15 +148,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     </div>
   </section>
 
-  <section id="consec">
-    <h2>Console</h2>
-    <div id="conlog"><div class="empty">nothing yet, send a command</div></div>
-    <form id="conform" autocomplete="off">
-      <input id="concmd" placeholder="M105, G28, M117 hello" spellcheck="false">
-      <button type="submit" class="p">Send</button>
-    </form>
-  </section>
-
+  <div class="side">
   <section id="tempsec">
     <h2>Temperatures</h2>
     <div class="tbox">
@@ -170,6 +162,16 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
       <svg class="spark" id="sb" viewBox="0 0 200 34" preserveAspectRatio="none"><polyline fill="none" stroke="var(--bed)" stroke-width="1.6" points=""/></svg>
     </div>
   </section>
+
+  <section id="consec">
+    <h2>Console</h2>
+    <div id="conlog"><div class="empty">nothing yet, send a command</div></div>
+    <form id="conform" autocomplete="off">
+      <input id="concmd" placeholder="M105, G28, M117 hello" spellcheck="false">
+      <button type="submit" class="p">Send</button>
+    </form>
+  </section>
+  </div>
 
 </main>
 
@@ -348,6 +350,8 @@ async function pollConsole(){
   if (first) first.remove();
   for (const l of d.lines) conLine(l);
 }
+
+$('concmd').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('conform').requestSubmit(); } };
 
 $('conform').onsubmit = async e => {
   e.preventDefault();
