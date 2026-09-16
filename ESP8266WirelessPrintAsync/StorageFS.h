@@ -7,8 +7,21 @@ class StorageFS {
     static bool hasSD;
 
   public:
+    // A card that was interrupted mid write sometimes refuses the first mount, so one
+    // failure is not an answer. Nothing else on the module works without it.
+    inline static bool mount() {
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        if (SD_MMC.begin("/sdcard", true))       // ESP32-CAM slot, 1-bit mode frees GPIO4/12/13
+          return hasSD = true;
+        SD_MMC.end();
+        delay(250);
+      }
+
+      return hasSD = false;
+    }
+
     inline static void begin() {
-      hasSD = SD_MMC.begin("/sdcard", true);   // ESP32-CAM slot, 1-bit mode frees GPIO4/12/13
+      mount();
     }
 
     inline static bool isActive() {

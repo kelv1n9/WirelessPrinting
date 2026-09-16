@@ -65,6 +65,7 @@ DNSServer dns;
 #define LOG_SAMPLES_PER_PRINT 5         // Damaged lines written out in full, enough for a sample
 #define DEAD_MAN_SECONDS 120            // Marlin shuts itself down if this module stops talking for this long
 #define TELNET_STALL_MS 200             // A write that takes longer than this is going nowhere
+#define REMOUNT_INTERVAL 30000          // How often to try the card again once it has gone
 #define CONSOLE_LINES 60                // What the page can scroll back through
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
@@ -486,6 +487,24 @@ const char *resetReason() {
     case ESP_RST_DEEPSLEEP:return "deep sleep";
     case ESP_RST_EXT:      return "reset pin";
     default:               return "unknown";
+  }
+}
+
+// Losing the card costs the files, the page and the log at once, so keep asking for it
+// rather than waiting for somebody to notice and reboot.
+void handleStorage() {
+  static uint32_t retryAt;
+
+  if (storageFS.isActive() || isPrinting)
+    return;
+
+  if ((int32_t)(millis() - retryAt) < 0)
+    return;
+
+  retryAt = millis() + REMOUNT_INTERVAL;
+  if (storageFS.mount()) {
+    storageFS.mkdir("/ui");
+    logEvent("card mounted again");
   }
 }
 
@@ -2353,6 +2372,7 @@ void loop() {
   //* Printer handling *
   //********************
   handleLineProbe();
+  handleStorage();
   handleLogging();
 
   if (!printerConnected)
