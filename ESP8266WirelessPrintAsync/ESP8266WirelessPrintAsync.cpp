@@ -475,6 +475,8 @@ void logFlush() {
 // A line per resend would be noise and a line per print would miss the moment things
 // started going wrong, so the counters are reported as a running total, and only when
 // one of them has moved.
+// Why the board started, straight out of the chip. Needs no card, which matters
+// because a boot with no card is exactly the boot that writes nothing down.
 const char *resetReason() {
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON:  return "power on";
@@ -1900,6 +1902,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
         "\"tariff\":" + String(energyTariff, 3) + ","
         "\"kilo\":" + String(filamentPrice, 2) + "},"
       "\"storage\":{"
+        "\"card\":" + stringify(storageFS.isActive()) + ","
         "\"selected\":\"" + jsonEscape(baseName(selectedFile)) + "\","
         "\"free\":" + uint64ToString(storageFS.freeBytes()) + ","
         "\"total\":" + uint64ToString(storageFS.totalBytes()) + "},"
@@ -1915,6 +1918,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
         "\"epoch\":" + String((uint32_t)now) + ","
         "\"rssi\":" + String(WiFi.RSSI()) + ","
         "\"machine\":\"" + jsonEscape(fwMachineType) + "\","
+        "\"bootReason\":\"" + String(resetReason()) + "\","
         "\"version\":\"" SKETCH_VERSION "\"}"
       "}";
     request->send(200, "application/json", message);
