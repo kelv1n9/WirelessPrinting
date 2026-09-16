@@ -63,6 +63,7 @@ DNSServer dns;
 #define LOG_FLUSH_INTERVAL 5000
 #define LOG_LINK_INTERVAL 60000         // A link summary while printing, and only when something changed
 #define LOG_SAMPLES_PER_PRINT 5         // Damaged lines written out in full, enough for a sample
+#define DEAD_MAN_SECONDS 120            // Marlin shuts itself down if this module stops talking for this long
 #define CONSOLE_LINES 60                // What the page can scroll back through
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
@@ -518,6 +519,9 @@ void handlePrint() {
                  String(energyWh / 1000 * energyTariff + grams / 1000 * filamentPrice, 3) + "AZN");
         logFlush();
       }
+      #ifdef DEAD_MAN_SECONDS
+        commandQueue.push("M85 S0");     // Cooling down is silent, and silence must not kill the printer now
+      #endif
       printPause = false;
       isPrinting = false;
       powerOffArmed = autoPowerOff;
@@ -588,6 +592,9 @@ void handlePrint() {
       playSound();
       printStartTime = millis();
       isPrinting = true;
+      #ifdef DEAD_MAN_SECONDS
+        commandQueue.push("M85 S" + String(DEAD_MAN_SECONDS));   // Nothing else turns the heaters off if this module dies
+      #endif
       linkTimeouts = loggedResent = loggedMangled = loggedTimeouts = loggedSamples = 0;
       logLinkAt = millis() + LOG_LINK_INTERVAL;
       logEvent("print start " + baseName(printingFile) + " " + String(printingFileSize) + " bytes, " +
@@ -2341,6 +2348,9 @@ void loop() {
       lastCommandSent = "";
       lastLineReported = -1;
       commandQueue.push("M110 N0");
+      #ifdef DEAD_MAN_SECONDS
+        commandQueue.push("M85 S0");
+      #endif
       commandQueue.push("M104 S0");
       commandQueue.push("M140 S0");
       commandQueue.push("M107");
@@ -2349,9 +2359,12 @@ void loop() {
     else if (cancelPrint && !isPrinting) { // Only when cancelPrint has been processed by 'handlePrint'
       cancelPrint = false;
       swallowNextOk = !commandQueue.isAckEmpty();
-      commandQueue.clear();
+      commandQueue.clear();               // Takes the disarm queued when the print ended with it
       printerUsedBuffer = 0;
       lcd("Print cancelled");
+      #ifdef DEAD_MAN_SECONDS
+        commandQueue.push("M85 S0");
+      #endif
       commandQueue.push("G91");
       commandQueue.push("G1 E-3 F300");
       commandQueue.push("G1 Z10 F600");
