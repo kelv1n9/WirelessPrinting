@@ -31,6 +31,10 @@ class StorageFS {
       return hasSD && path.length() > 1 && path.startsWith("/") && SD_MMC.exists(path);
     }
 
+    inline static bool rename(const String from, const String to) {
+      return hasSD && SD_MMC.rename(from, to);
+    }
+
     inline static uint64_t totalBytes() {
       return hasSD ? SD_MMC.totalBytes() : 0;
     }

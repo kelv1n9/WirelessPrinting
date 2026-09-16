@@ -56,7 +56,12 @@ DNSServer dns;
 #define ENERGY_TARIFF 0.077             // AZN per kWh, the first band for households, overridable
 #define FILAMENT_PRICE 40               // AZN per kg, only used when the file does not say
 #define FILAMENT_SCAN_BYTES 65536       // The slicer appends its summary after the last move
-#define HISTORY_PATH "/log/prints.csv"  // One line per finished print, so a failure at night leaves a trace
+#define LOG_PATH "/log/events.log"      // What happened, so a failure at night leaves something to read
+#define LOG_PREVIOUS "/log/events.1.log"
+#define LOG_MAX_BYTES 262144            // Rolled over at this size, so two files are the whole cost
+#define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
+#define LOG_FLUSH_INTERVAL 5000
+#define LOG_LINK_INTERVAL 60000         // A link summary while printing, and only when something changed
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
@@ -114,6 +119,8 @@ uint32_t powerOffReadySince, powerOffNoticeTimer, powerOffRetryAt, powerOffCheck
 float energyWh, energyLastWatt = -1, energyTariff = ENERGY_TARIFF;
 float filamentGrams = -1, filamentPrice = FILAMENT_PRICE, filamentDefaultPrice = FILAMENT_PRICE;
 uint32_t energyLastAt, energyPollAt;
+String logBuffer;
+uint32_t logFlushAt, logLinkAt, loggedSent, loggedResent, loggedMangled, loggedTimeouts, linkTimeouts;
 volatile bool lineProbeRequested, updateRunning;
 uint32_t updateTouchedAt;
 String lineProbeResult = "{\"verdict\":\"not measured yet, ask once more\"}";
@@ -383,34 +390,77 @@ uint16_t readTotalLayers(const String path) {
 // Nothing about a print survives it today: the telnet log exists only while somebody
 // is watching. One line on the card per print is enough to answer, the morning after,
 // what ran, how long, how it ended and how the link behaved.
-void recordPrint(const char *outcome) {
-  const uint32_t seconds = (millis() - printStartTime) / 1000;
-  String name = baseName(printingFile);
-  name.replace(',', ' ');
-  name.replace('\n', ' ');
-  name.replace('\r', ' ');
+void logFlush();
 
-  const float grams = filamentGrams < 0 ? 0 : filamentGrams * (printingFileSize ? (float)filePos / printingFileSize : 1);
+void logEvent(const String text) {
+  logBuffer += String((uint32_t)time(NULL)) + " " + String(millis() / 1000) + " " + text + "\r\n";
 
-  String line = String((uint32_t)time(NULL)) + "," +
-                name + "," +
-                String(seconds) + "," +
-                outcome + "," +
-                String(currentLayer) + "," +
-                String(totalLayers) + "," +
-                String(linesSent) + "," +
-                String(linesResent) + "," +
-                String(linesMangled) + "," +
-                String(energyWh, 1) + "," +
-                String(grams, 2) + "," +
-                String(energyWh / 1000 * energyTariff + grams / 1000 * filamentPrice, 3) + "\r\n";
+  if (logBuffer.length() > LOG_BUFFER_BYTES)
+    logFlush();
+}
+
+void logFlush() {
+  if (logBuffer == "" || !storageFS.isActive())
+    return;
 
   storageFS.mkdir("/log");
-  FileWrapper file = storageFS.open(HISTORY_PATH, "a");
+
+  FileWrapper probe = storageFS.open(LOG_PATH);
+  const uint32_t size = probe ? probe.size() : 0;
+  if (probe)
+    probe.close();
+
+  if (size > LOG_MAX_BYTES) {          // Roll over rather than grow without end
+    storageFS.remove(LOG_PREVIOUS);
+    storageFS.rename(LOG_PATH, LOG_PREVIOUS);
+  }
+
+  FileWrapper file = storageFS.open(LOG_PATH, "a");
   if (!file)
     return;
-  file.write((const uint8_t *)line.c_str(), line.length());
+  file.write((const uint8_t *)logBuffer.c_str(), logBuffer.length());
   file.close();
+
+  logBuffer = "";
+  logFlushAt = millis() + LOG_FLUSH_INTERVAL;
+}
+
+// A line per resend would be noise and a line per print would miss the moment things
+// started going wrong, so the counters are reported as a running total, and only when
+// one of them has moved.
+const char *resetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_SW:       return "software restart";
+    case ESP_RST_PANIC:    return "panic";
+    case ESP_RST_INT_WDT:  return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_BROWNOUT: return "brownout, supply sagged";
+    case ESP_RST_DEEPSLEEP:return "deep sleep";
+    case ESP_RST_EXT:      return "reset pin";
+    default:               return "unknown";
+  }
+}
+
+void handleLogging() {
+  if (logBuffer != "" && (int32_t)(millis() - logFlushAt) >= 0)
+    logFlush();
+
+  if (!isPrinting || (int32_t)(millis() - logLinkAt) < 0)
+    return;
+
+  logLinkAt = millis() + LOG_LINK_INTERVAL;
+  if (linesResent == loggedResent && linesMangled == loggedMangled && linkTimeouts == loggedTimeouts)
+    return;
+
+  loggedSent = linesSent;
+  loggedResent = linesResent;
+  loggedMangled = linesMangled;
+  loggedTimeouts = linkTimeouts;
+  logEvent("link sent " + String(linesSent) + " resent " + String(linesResent) +
+           " mangled " + String(linesMangled) + " timeouts " + String(linkTimeouts) +
+           " rssi " + String(WiFi.RSSI()));
 }
 
 void handlePrint() {
@@ -430,7 +480,18 @@ void handlePrint() {
       }
       else if (!abortPrint)
         lcd("Complete");
-      recordPrint(printEndedEarly ? "ended early" : abortPrint ? "cancelled" : "complete");
+      {
+        const float grams = filamentGrams < 0 ? 0 : filamentGrams * (printingFileSize ? (float)filePos / printingFileSize : 1);
+        logEvent(String("print end ") + (printEndedEarly ? "ended early" : abortPrint ? "cancelled" : "complete") +
+                 " " + baseName(printingFile) +
+                 " " + String((millis() - printStartTime) / 1000) + "s" +
+                 " layer " + String(currentLayer) + "/" + String(totalLayers) +
+                 " sent " + String(linesSent) + " resent " + String(linesResent) +
+                 " mangled " + String(linesMangled) + " timeouts " + String(linkTimeouts) +
+                 " " + String(energyWh, 1) + "Wh " + String(grams, 2) + "g " +
+                 String(energyWh / 1000 * energyTariff + grams / 1000 * filamentPrice, 3) + "AZN");
+        logFlush();
+      }
       printPause = false;
       isPrinting = false;
       powerOffArmed = autoPowerOff;
@@ -501,6 +562,10 @@ void handlePrint() {
       playSound();
       printStartTime = millis();
       isPrinting = true;
+      linkTimeouts = loggedResent = loggedMangled = loggedTimeouts = 0;
+      logLinkAt = millis() + LOG_LINK_INTERVAL;
+      logEvent("print start " + baseName(printingFile) + " " + String(printingFileSize) + " bytes, " +
+               String(totalLayers) + " layers, rssi " + String(WiFi.RSSI()));
       energyWh = 0;
       energyLastWatt = -1;
       energyLastAt = yandexHome.getPowerAt();
@@ -1102,12 +1167,15 @@ void handleAutoPowerOff() {
 
   if (powerOffAttempts >= POWEROFF_ATTEMPTS) {
     powerOffArmed = false;
+    logEvent("gave up switching the printer off after " + String(POWEROFF_ATTEMPTS) + " attempts");
     lcd("Power off failed");
     return;
   }
 
   ++powerOffAttempts;
   powerOffRetryAt = now + POWEROFF_RETRY;
+  logEvent("switching the printer off, attempt " + String(powerOffAttempts) +
+           ", nozzle " + toolTemperature[0].actual + ", bed " + bedTemperature.actual);
   lcd("Powering off");
   yandexHome.request(YandexHome::PowerOff);
 }
@@ -1165,6 +1233,9 @@ void setup() {
   storageFS.begin();
   yandexHome.begin();
   storageFS.mkdir("/ui");
+
+  logEvent(String("boot ") + SKETCH_VERSION + ", after " + resetReason() +
+           ", free heap " + String(ESP.getFreeHeap()));
 
   for (int t = 0; t < MAX_SUPPORTED_EXTRUDERS; t++)
     toolTemperature[t] = { "0.0", "0.0" };
@@ -1430,6 +1501,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 
     server.on("/update", HTTP_POST, [](AsyncWebServerRequest * request) {
       const bool failed = !updateSucceeded;
+      logEvent(failed ? "firmware upload failed: " + String(Update.errorString()) : "firmware upload done");
       if (updateRunning) {        // The loop stands aside while this is set, and it is the loop that reboots
         updateRunning = false;
         if (failed)
@@ -1449,6 +1521,8 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
         if (!Update.begin(UPDATE_SIZE_UNKNOWN))
           return;
         lcd("Updating...");
+        logEvent("firmware upload started");
+        logFlush();
         updateRunning = true;      // Writing the flash stalls everything that reads from it
         PrinterSerial.end();
       }
@@ -1773,12 +1847,14 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     request->send(200, "application/json", message);
   });
 
-  server.on("/history.csv", HTTP_GET, [](AsyncWebServerRequest * request) {
-    if (!storageFS.exists(HISTORY_PATH)) {
+  server.on("/log", HTTP_GET, [](AsyncWebServerRequest * request) {
+    logFlush();                 // Whatever is still in memory belongs in what the reader gets
+    const char *path = request->hasParam("previous") ? LOG_PREVIOUS : LOG_PATH;
+    if (!storageFS.exists(path)) {
       request->send(404, "text/plain", "nothing recorded yet");
       return;
     }
-    request->send(SD_MMC, HISTORY_PATH, "text/csv");
+    request->send(SD_MMC, path, "text/plain");
   });
 
   server.on("/api/line", HTTP_GET, [](AsyncWebServerRequest * request) {
@@ -2085,12 +2161,15 @@ void ReceiveResponses() {
       commandQueue.clear();
     else {
       telnetSend("#TIMEOUT#");
+      ++linkTimeouts;
       if (lastCommandSent != "" && ++timeoutRetries <= MAX_TIMEOUT_RETRIES)
         transmitCommand(lastCommandSent, lineNumber);
       else {
         timeoutRetries = 0;
         commandQueue.clear();
         printerUsedBuffer = 0;
+        logEvent("printer stopped answering after " + String(MAX_TIMEOUT_RETRIES) +
+                 " tries on line " + String(lineNumber));
         if (isPrinting) {
           cancelPrint = true;
           lcd("Printer not responding");
@@ -2120,6 +2199,8 @@ void loop() {
     //****************
     if (ESPrestartRequired) {  // check the flag here to determine if a restart is required
       ESPrestartRequired = false;
+      logEvent("restarting");
+      logFlush();
       delay(500);
       ESP.restart();
     }
@@ -2127,7 +2208,12 @@ void loop() {
     ArduinoOTA.handle();
   #endif
 
+  static bool wifiWasUp = true;
   if (WiFi.status() != WL_CONNECTED) {
+    if (wifiWasUp) {
+      wifiWasUp = false;
+      logEvent("wifi lost");
+    }
     if ((signed)(wifiRetryTimer - millis()) <= 0) {
       wifiRetryTimer = millis() + WIFI_RETRY_INTERVAL;
       WiFi.begin();       // No disconnect first, tearing down a flapping link only makes it worse
@@ -2135,13 +2221,19 @@ void loop() {
     if (!isPrinting && (signed)(millis() - wifiDownSince) >= WIFI_REBOOT_AFTER)
       ESP.restart();
   }
-  else
+  else {
+    if (!wifiWasUp) {
+      wifiWasUp = true;
+      logEvent("wifi back, rssi " + String(WiFi.RSSI()) + ", ip " + IpAddress2String(WiFi.localIP()));
+    }
     wifiDownSince = millis();
+  }
 
   //********************
   //* Printer handling *
   //********************
   handleLineProbe();
+  handleLogging();
 
   if (!printerConnected)
     printerConnected = detectPrinter();
