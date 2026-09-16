@@ -23,6 +23,11 @@ tr.pick{cursor:pointer}
 tr.pick:hover td{background:#1a1f28}
 .spacer{flex:1}
 .meta{font-size:12px;color:var(--dim);display:flex;gap:14px;flex-wrap:wrap}
+#bars{flex:none;margin-right:-6px}
+#bars rect{fill:var(--line)}
+#bars rect.on{fill:var(--tx)}
+#bars.weak rect.on{fill:var(--warn)}
+#bars.gone rect.on{fill:var(--bad)}
 main{padding:22px;display:grid;gap:18px;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);max-width:1400px;margin:0 auto}
 @media(max-width:900px){main{grid-template-columns:1fr;padding:14px}}
 section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
@@ -60,7 +65,10 @@ th{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);
 tr:last-child td{border-bottom:0}
 tr.sel td{background:#161d2a}
 .tmini{width:40px;height:40px;border-radius:6px;background:var(--sunk);object-fit:contain;display:block}
-.nm{font-weight:500;word-break:break-all}
+.nm{font-weight:500;word-break:break-all;width:100%}
+.thumbcell{width:1%}
+.acts{width:1%;white-space:nowrap}
+.acts .row{justify-content:flex-end;flex-wrap:nowrap}
 .dim{color:var(--dim)}
 .num{font-variant-numeric:tabular-nums;white-space:nowrap}
 .foot{display:flex;justify-content:space-between;gap:12px;margin-top:14px;flex-wrap:wrap;align-items:center}
@@ -70,11 +78,11 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   padding:10px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.55;
   white-space:pre-wrap;word-break:break-word}
 #conlog .out{color:var(--acc)}
-#conlog .in{color:var(--fg)}
+#conlog .in{color:var(--tx)}
 #conlog .empty{color:var(--dim)}
 #conform{display:flex;gap:8px;margin-top:12px}
 #concmd{flex:1;min-width:0;background:var(--sunk);border:1px solid var(--line);border-radius:8px;
-  padding:9px 11px;color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+  padding:9px 11px;color:var(--tx);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
 #concmd:focus{outline:none;border-color:var(--acc)}
 .diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px 18px;font-size:13px}
 .diag b{display:block;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
@@ -84,13 +92,17 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
 </style>
 
 <header>
+  <svg id="bars" viewBox="0 0 18 14" width="18" height="14" aria-hidden="true"><title></title>
+    <rect x="0"  y="9" width="4" height="5"  rx="1"/>
+    <rect x="7"  y="5" width="4" height="9"  rx="1"/>
+    <rect x="14" y="0" width="4" height="14" rx="1"/>
+  </svg>
   <h1 id="machine">printer</h1>
   <span class="badge" id="state">connecting</span>
   <span class="spacer"></span>
   <span class="badge warn hide" id="soon"></span>
   <span class="badge bad hide" id="mangled"></span>
   <div class="meta">
-    <span id="rssi"></span>
     <span id="up"></span>
     <span id="build"></span>
     <span><a href="/info">info</a> · <a href="/yandex">socket</a> · <a href="/update">firmware</a></span>
@@ -211,7 +223,11 @@ function render(d){
   const b = $('state');
   b.textContent = d.state;
   b.className = 'badge ' + (d.printing ? 'busy' : d.connected ? 'live' : 'bad');
-  $('rssi').textContent = d.system.rssi + ' dBm';
+  const rssi = d.system.rssi, bars = $('bars');
+  const strength = rssi >= -60 ? 3 : rssi >= -70 ? 2 : rssi >= -80 ? 1 : 0;
+  bars.setAttribute('class', strength >= 2 ? '' : strength === 1 ? 'weak' : 'gone');   // an svg className is not a string
+  bars.querySelectorAll('rect').forEach((r, i) => r.classList.toggle('on', i < Math.max(strength, 1)));
+  bars.querySelector('title').textContent = rssi + ' dBm';
   $('up').textContent = 'up ' + hhmm(d.system.uptime);
   $('build').textContent = d.system.version;
 
@@ -279,12 +295,14 @@ function renderFiles(sel){
     img.className = 'tmini'; img.loading = 'lazy'; img.alt = '';
     img.onerror = () => img.classList.add('noimg');
     img.src = '/thumbnail?name=' + encodeURIComponent(f.name);
-    tr.insertCell().append(img);
+    const t = tr.insertCell(); t.className = 'thumbcell'; t.append(img);
     const n = tr.insertCell(); n.className = 'nm'; n.textContent = f.name;
-    const a = tr.insertCell(); a.className = 'row';
+    const a = tr.insertCell(); a.className = 'acts';
     a.onclick = e => e.stopPropagation();
-    a.append(btn('Print', 'p', () => act('/select?name=' + encodeURIComponent(f.name)).then(() => job('start'))),
-             btn('Delete', 'd', () => confirm('Delete ' + f.name + '?') && act('/delete?name=' + encodeURIComponent(f.name))));
+    const box = document.createElement('div'); box.className = 'row';
+    box.append(btn('Print', 'p', () => act('/select?name=' + encodeURIComponent(f.name)).then(() => job('start'))),
+               btn('Delete', 'd', () => confirm('Delete ' + f.name + '?') && act('/delete?name=' + encodeURIComponent(f.name))));
+    a.append(box);
   }
 }
 
