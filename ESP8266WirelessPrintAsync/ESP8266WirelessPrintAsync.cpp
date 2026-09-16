@@ -2159,8 +2159,8 @@ void ReceiveResponses() {
         else if (fwAutoreportTempCap && lastCommandSent.startsWith(AUTOTEMP_COMMAND))
           autoreportTempEnabled = (lastCommandSent[6] != '0');
 
-        unsigned int cmdLen = commandQueue.popAcknowledge().length();     // Go on with next command
-        printerUsedBuffer = max(printerUsedBuffer - cmdLen, 0u);
+        const unsigned int cmdLen = commandQueue.popAcknowledge().length();     // Go on with next command
+        printerUsedBuffer = cmdLen < printerUsedBuffer ? printerUsedBuffer - cmdLen : 0;   // max(a - b, 0u) turns a negative into a huge unsigned
         timeoutRetries = 0;
         responseDetail = "ok";
       }
