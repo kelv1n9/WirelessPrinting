@@ -56,6 +56,7 @@ DNSServer dns;
 #define ENERGY_TARIFF 0.077             // AZN per kWh, the first band for households, overridable
 #define FILAMENT_PRICE 40               // AZN per kg, only used when the file does not say
 #define FILAMENT_SCAN_BYTES 65536       // The slicer appends its summary after the last move
+#define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
 #define LINE_PROBE_MS 3000              // Long enough to catch a printer that only speaks now and then
@@ -1123,6 +1124,7 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
 
 void setup() {
   bootProbeResult = probeReceiveLine(BOOT_PROBE_MS);
+  PrinterSerial.setRxBufferSize(PRINTER_SERIAL_RX_BUFFER);
 
   commandQueue.begin();
   storageFS.begin();
@@ -1393,9 +1395,10 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 
     server.on("/update", HTTP_POST, [](AsyncWebServerRequest * request) {
       const bool failed = !updateSucceeded;
-      if (failed && updateRunning) {
+      if (updateRunning) {        // The loop stands aside while this is set, and it is the loop that reboots
         updateRunning = false;
-        PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
+        if (failed)
+          PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
       }
       AsyncWebServerResponse *response = request->beginResponse(failed ? 500 : 200, "text/plain",
                                                                 failed ? String(Update.errorString()) : String("OK, rebooting"));
