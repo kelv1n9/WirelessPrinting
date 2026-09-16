@@ -630,8 +630,8 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
       uploadFailure = "no storage";
     else if (!isGcodeFilename(name))
       uploadFailure = "not a gcode file";
-    else if (isPrinting && "/" + name == printingFile)
-      uploadFailure = "that file is being printed";
+    else if (isPrinting)
+      uploadFailure = "a print is running, the card is busy";
     else if (request->contentLength() >= storageFS.freeBytes())
       uploadFailure = "not enough free space";
     else {
@@ -689,6 +689,8 @@ void handleInterfaceUpload(AsyncWebServerRequest *request, String filename, size
     const String name = sanitizeFilename(filename);
     if (!storageFS.isActive())
       uploadFailure = "no storage";
+    else if (isPrinting)
+      uploadFailure = "a print is running, the card is busy";
     else if (!isInterfaceFilename(name))
       uploadFailure = "not an interface file";
     else if (request->contentLength() >= storageFS.freeBytes())

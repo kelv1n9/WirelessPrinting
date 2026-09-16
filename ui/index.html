@@ -333,7 +333,10 @@ $('bprint').onclick = () => job('start');
 $('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel');
 $('brestart').onclick = () => confirm('Restart the module? The printer keeps running.') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
 $('bpower').onclick = () => confirm('Cut mains to the printer? This module loses power too and cannot switch it back on.') && call('/yandex/off', {method:'POST'}).then(() => toast('switching off'));
-$('bpick').onclick = () => $('file').click();
+$('bpick').onclick = () => {
+  if (conPrinting) { toast('a print is running, upload when it finishes'); return; }
+  $('file').click();
+};
 $('file').onchange = e => { if (e.target.files[0]) upload(e.target.files[0]); e.target.value = ''; };
 
 function upload(f){
