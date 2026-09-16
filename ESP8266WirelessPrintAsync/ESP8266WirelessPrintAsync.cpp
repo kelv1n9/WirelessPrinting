@@ -57,7 +57,6 @@ DNSServer dns;
 #define FILAMENT_PRICE 40               // AZN per kg, only used when the file does not say
 #define FILAMENT_SCAN_BYTES 65536       // The slicer appends its summary after the last move
 #define HISTORY_PATH "/log/prints.csv"  // One line per finished print, so a failure at night leaves a trace
-#define HISTORY_SHOWN 30                // Most recent entries handed to the page
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
@@ -412,62 +411,6 @@ void recordPrint(const char *outcome) {
     return;
   file.write((const uint8_t *)line.c_str(), line.length());
   file.close();
-}
-
-String jsonEscape(const String text);
-
-// The file grows by a line a print and is never rewritten, so it is walked from the
-// start keeping only the tail in memory rather than read into a string whole.
-String historyJson() {
-  String ring[HISTORY_SHOWN];
-  int count = 0, next = 0;
-
-  FileWrapper file = storageFS.open(HISTORY_PATH);
-  if (file) {
-    while (file.available()) {
-      String line = file.readStringUntil('\n');
-      line.trim();
-      if (line == "")
-        continue;
-      ring[next] = line;
-      next = (next + 1) % HISTORY_SHOWN;
-      if (count < HISTORY_SHOWN)
-        ++count;
-    }
-    file.close();
-  }
-
-  String json = "{\"prints\":[";
-  for (int i = 0; i < count; ++i) {
-    const String &line = ring[(next - 1 - i + HISTORY_SHOWN * 2) % HISTORY_SHOWN];   // newest first
-
-    String field[12];
-    int part = 0, from = 0;
-    for (unsigned int at = 0; at <= line.length() && part < 12; ++at)
-      if (at == line.length() || line[at] == ',') {
-        field[part++] = line.substring(from, at);
-        from = at + 1;
-      }
-    if (part < 12)
-      continue;
-
-    if (i)
-      json += ",";
-    json += "{\"epoch\":" + field[0] +
-            ",\"file\":\"" + jsonEscape(field[1]) + "\"" +
-            ",\"seconds\":" + field[2] +
-            ",\"outcome\":\"" + jsonEscape(field[3]) + "\"" +
-            ",\"layer\":" + field[4] +
-            ",\"layers\":" + field[5] +
-            ",\"sent\":" + field[6] +
-            ",\"resent\":" + field[7] +
-            ",\"mangled\":" + field[8] +
-            ",\"wh\":" + field[9] +
-            ",\"grams\":" + field[10] +
-            ",\"cost\":" + field[11] + "}";
-  }
-
-  return json + "]}";
 }
 
 void handlePrint() {
@@ -1828,10 +1771,6 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
         "\"version\":\"" SKETCH_VERSION "\"}"
       "}";
     request->send(200, "application/json", message);
-  });
-
-  server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest * request) {
-    request->send(200, "application/json", historyJson());
   });
 
   server.on("/history.csv", HTTP_GET, [](AsyncWebServerRequest * request) {

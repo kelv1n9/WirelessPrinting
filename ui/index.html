@@ -137,16 +137,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     </div>
   </section>
 
-  <section class="wide" id="histsec">
-    <h2>History</h2>
-    <table>
-      <thead><tr><th>When</th><th>File</th><th>Took</th><th>Ended</th><th>Layers</th><th>Resent</th><th>Used</th><th>Cost</th></tr></thead>
-      <tbody id="htab"></tbody>
-    </table>
-    <div class="foot"><div class="row"><span class="dim num" id="hnote">nothing recorded yet</span></div>
-      <div class="row"><a class="dim" href="/history.csv">download csv</a></div></div>
-  </section>
-
   <section id="tempsec">
     <h2>Temperatures</h2>
     <div class="tbox">
@@ -168,7 +158,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
 <script>
 const $ = id => document.getElementById(id);
 const hist = {n:[], b:[]};
-let wasPrinting = false;
 let files = [], seen = null;
 
 const hhmm = s => { s = Math.max(0, Math.round(s));
@@ -195,10 +184,6 @@ function spark(svg, arr){
 
 function render(d){
   $('machine').textContent = d.system.machine;
-  if (wasPrinting && !d.printing)      // a print just ended, there is a new line to show
-    loadHistory().catch(()=>{});
-  wasPrinting = d.printing;
-
   const b = $('state');
   b.textContent = d.state;
   b.className = 'badge ' + (d.printing ? 'busy' : d.connected ? 'live' : 'bad');
@@ -323,41 +308,6 @@ function upload(f){
   x.send(form);
 }
 
-function hms(s){
-  s = Math.round(s);
-  const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
-  return h ? h + 'h ' + m + 'm' : m ? m + 'm ' + (s%60) + 's' : s + 's';
-}
-
-async function loadHistory(){
-  const d = await (await fetch('/api/history')).json();
-  const rows = d.prints || [];
-  $('hnote').textContent = rows.length ? rows.length + ' most recent' : 'nothing recorded yet';
-  $('htab').innerHTML = '';
-  for (const p of rows) {
-    const tr = document.createElement('tr');
-    const pct = p.sent ? (100 * p.resent / p.sent) : 0;
-    const cells = [
-      new Date(p.epoch * 1000).toLocaleString([], {day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'}),
-      p.file,
-      hms(p.seconds),
-      p.outcome,
-      p.layers ? p.layer + ' / ' + p.layers : String(p.layer),
-      p.sent ? pct.toFixed(2) + '%' : '\u2014',
-      p.grams.toFixed(1) + ' g',
-      p.cost.toFixed(3) + ' AZN',
-    ];
-    cells.forEach((text, i) => {
-      const td = document.createElement('td');
-      td.textContent = text;
-      if (i === 3 && p.outcome !== 'complete') td.style.color = 'var(--bad)';
-      if (i === 5 && pct > 1) td.style.color = 'var(--bad)';
-      tr.appendChild(td);
-    });
-    $('htab').appendChild(tr);
-  }
-}
-
 (async function loop(){
   for (;;) {
     try { render(await (await fetch('/api/status')).json()); }
@@ -366,5 +316,4 @@ async function loadHistory(){
   }
 })();
 loadFiles().catch(()=>{});
-loadHistory().catch(()=>{});
 </script>
