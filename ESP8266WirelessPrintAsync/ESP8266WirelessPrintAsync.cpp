@@ -2120,7 +2120,7 @@ void ReceiveResponses() {
              (serialResponse[lineStartPos] < 32 || serialResponse[lineStartPos] > 126))
         ++lineStartPos;
 
-      if (lineStartPos != firstByte && loggedSamples < LOG_SAMPLES_PER_PRINT) {
+      if (lineStartPos != firstByte && printerConnected && loggedSamples < LOG_SAMPLES_PER_PRINT) {
         ++loggedSamples;
         logEvent("damaged reply: " + printableOnly(serialResponse.substring(firstByte)));
       }
@@ -2212,7 +2212,7 @@ void ReceiveResponses() {
       if (!boring)
         consoleAdd("<" + serialResponse.substring(lineStartPos, responseLength));
 
-      if (loggedSamples < LOG_SAMPLES_PER_PRINT &&
+      if (printerConnected && loggedSamples < LOG_SAMPLES_PER_PRINT &&
           (strcmp(responseDetail, "mangled line reached the printer") == 0 ||
            strcmp(responseDetail, "resend error") == 0 ||
            strcmp(responseDetail, "ERROR") == 0)) {
