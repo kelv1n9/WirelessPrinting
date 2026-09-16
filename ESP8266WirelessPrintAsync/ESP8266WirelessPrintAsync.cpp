@@ -64,6 +64,7 @@ DNSServer dns;
 #define LOG_LINK_INTERVAL 60000         // A link summary while printing, and only when something changed
 #define LOG_SAMPLES_PER_PRINT 5         // Damaged lines written out in full, enough for a sample
 #define DEAD_MAN_SECONDS 120            // Marlin shuts itself down if this module stops talking for this long
+#define TELNET_STALL_MS 200             // A write that takes longer than this is going nowhere
 #define CONSOLE_LINES 60                // What the page can scroll back through
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
@@ -168,13 +169,31 @@ inline String IpAddress2String(const IPAddress& ipAddress) {
          String(ipAddress[3]);
 }
 
+void logEvent(const String text);
+
 inline bool telnetReady() {
   return serverClient && serverClient.connected();
 }
 
+// A client whose machine went to sleep leaves a socket that is neither closed nor
+// listening, and a write to it costs ten seconds in the core's own retry loop. Two of
+// those in one pass of the loop is most of the watchdog's patience, so the debug
+// stream is dropped rather than allowed to hold up a print.
+inline void telnetDropIfStalled(const uint32_t began) {
+  if (millis() - began <= TELNET_STALL_MS)
+    return;
+
+  serverClient.stop();
+  logEvent("dropped a telnet client that had stopped reading");
+}
+
 inline void telnetSend(const String &line) {
-  if (telnetReady())                                // send data to telnet client if connected
-    serverClient.println(line);
+  if (!telnetReady())
+    return;
+
+  const uint32_t began = millis();
+  serverClient.println(line);
+  telnetDropIfStalled(began);
 }
 
 bool isFloat(const String value) {
@@ -2070,8 +2089,10 @@ void transmitCommand(const String command, const uint32_t number) {
   lineNumber = command.startsWith("M110") ? 0 : number;
 
   if (telnetReady()) {
+    const uint32_t began = millis();
     serverClient.print('>');
     serverClient.println(line);
+    telnetDropIfStalled(began);
   }
 }
 
@@ -2110,7 +2131,11 @@ void ReceiveResponses() {
   static String serialResponse;
 
   while (PrinterSerial.available()) {
-    char ch = (char)PrinterSerial.read();
+    const int incoming = PrinterSerial.read();
+    if (incoming < 0)
+      break;
+
+    const char ch = (char)incoming;
     if (ch != '\n') {
       serialResponse += ch;
       if (serialResponse.length() > MAX_RESPONSE_LENGTH) {
@@ -2231,11 +2256,13 @@ void ReceiveResponses() {
       }
 
       if (telnetReady()) {
+        const uint32_t began = millis();
         serverClient.print('<');
         serverClient.write((const uint8_t *)serialResponse.c_str() + lineStartPos, responseLength - lineStartPos);
         serverClient.print('#');
         serverClient.print(responseDetail);
         serverClient.println('#');
+        telnetDropIfStalled(began);
       }
       if (incompleteResponse)
         lineStartPos = responseLength;
