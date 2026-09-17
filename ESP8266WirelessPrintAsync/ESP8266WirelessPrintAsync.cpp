@@ -440,7 +440,9 @@ String printableOnly(const String text) {
 void logFlush();
 
 void logEvent(const String text) {
-  logBuffer += String((uint32_t)time(NULL)) + " " + String(millis() / 1000) + " " + text + "\r\n";
+  const time_t now = time(NULL);   // Straight after a power cut the clock is nonsense until NTP answers
+  logBuffer += (now > 1600000000 ? String((uint32_t)now) : String("-")) +
+               " " + String(millis() / 1000) + " " + text + "\r\n";
 
   if (logBuffer.length() > LOG_BUFFER_BYTES)
     logFlush();
