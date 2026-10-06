@@ -53,6 +53,8 @@ section h2{margin:0 0 14px;font-size:12px;text-transform:uppercase;letter-spacin
 .tlabel{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);margin-bottom:6px}
 .spark{display:block;width:100%;height:34px;margin-top:6px}
 .tbox+.tbox{margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}
+.settable{cursor:pointer;border-radius:8px;margin-left:-8px;margin-right:-8px;padding-left:8px;padding-right:8px}
+.settable:hover{background:var(--line)}
 button{font:inherit;color:var(--tx);background:var(--sunk);border:1px solid var(--line);border-radius:8px;padding:7px 13px;cursor:pointer}
 button:hover:not(:disabled){border-color:#3a424e;background:#20252d}
 button:disabled{opacity:.4;cursor:default}
@@ -163,12 +165,12 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <div class="side">
   <section id="tempsec">
     <h2>Temperatures</h2>
-    <div class="tbox">
+    <div class="tbox settable" id="boxn" title="Click to set the nozzle target">
       <div class="tlabel">Nozzle</div>
       <div class="temp"><span class="now" id="tn">—</span><span class="tgt" id="tnt"></span></div>
       <svg class="spark" id="sn" viewBox="0 0 200 34" preserveAspectRatio="none"><polyline fill="none" stroke="var(--hot)" stroke-width="1.6" points=""/></svg>
     </div>
-    <div class="tbox">
+    <div class="tbox settable" id="boxb" title="Click to set the bed target">
       <div class="tlabel">Bed</div>
       <div class="temp"><span class="now" id="tb">—</span><span class="tgt" id="tbt"></span></div>
       <svg class="spark" id="sb" viewBox="0 0 200 34" preserveAspectRatio="none"><polyline fill="none" stroke="var(--bed)" stroke-width="1.6" points=""/></svg>
@@ -265,6 +267,7 @@ function render(d){
   $('bcancel').disabled = !d.printing;
 
   const t = d.temperature;
+  targets.n = t.tool.target; targets.b = t.bed.target;
   $('tn').textContent = t.tool.actual.toFixed(1) + '°';
   $('tnt').textContent = t.tool.target > 0 ? '→ ' + t.tool.target.toFixed(0) + '°' : 'off';
   $('tb').textContent = t.bed.actual.toFixed(1) + '°';
@@ -305,12 +308,22 @@ function renderFiles(sel){
     a.onclick = e => e.stopPropagation();
     const box = document.createElement('div'); box.className = 'row';
     box.append(btn('Print', 'p', () => act('/select?name=' + encodeURIComponent(f.name)).then(() => job('start'))),
+               btn('Rename', '', () => rename(f.name)),
                btn('Delete', 'd', () => confirm('Delete ' + f.name + '?') && act('/delete?name=' + encodeURIComponent(f.name))));
     a.append(box);
   }
 }
 
 function btn(text, cls, fn){ const b = document.createElement('button'); b.textContent = text; if (cls) b.className = cls; b.onclick = fn; return b; }
+
+// The extension is put back by the firmware, so dropping it here is harmless.
+async function rename(from){
+  const to = prompt('New name for ' + from, from);
+  if (to === null || to.trim() === '' || to === from) return;
+  await call('/api/rename', {method: 'POST', body: new URLSearchParams({from, to})});
+  await loadFiles();
+  toast('renamed');
+}
 
 async function act(url){ await call(url, {method:'POST'}); await loadFiles(); }
 async function job(cmd){
@@ -381,6 +394,26 @@ async function send(cmd){
   if (!r.ok) toast('rejected: ' + r.status);
   return r.ok;
 }
+
+// Clicking a temperature box asks for a new target. The ceilings match the firmware:
+// HEATER_0_MAXTEMP minus HOTEND_OVERSHOOT, and the same for the bed.
+const targets = {n: 0, b: 0};
+
+async function askTemp(which){
+  const nozzle = which === 'n';
+  const max = nozzle ? 275 : 110;
+  const name = nozzle ? 'nozzle' : 'bed';
+  const answer = prompt('Target for the ' + name + ' in °C, 0 turns it off (up to ' + max + ')',
+                        String(Math.round(targets[which])));
+  if (answer === null) return;
+  const wanted = Math.round(Number(answer.replace(',', '.')));
+  if (!Number.isFinite(wanted) || wanted < 0 || wanted > max) { toast('0 to ' + max + ' only'); return; }
+  if (await send((nozzle ? 'M104 S' : 'M140 S') + wanted))
+    toast(name + (wanted ? ' heating to ' + wanted + '°' : ' off'));
+}
+
+$('boxn').onclick = () => askTemp('n');
+$('boxb').onclick = () => askTemp('b');
 
 // The same numbers the firmware's own presets use, so the buttons and the printer's
 // own menu mean the same thing.

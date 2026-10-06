@@ -1534,6 +1534,51 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     request->send(204, "text/plain", "");
   });
 
+  server.on("/api/rename", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (isPrinting) {
+      request->send(409, "text/plain", "a print is running, the card is busy");
+      return;
+    }
+    if (!request->hasParam("from", true) || !request->hasParam("to", true)) {
+      request->send(400, "text/plain", "from and to are required");
+      return;
+    }
+
+    const String from = "/" + sanitizeFilename(request->getParam("from", true)->value());
+    String wanted = sanitizeFilename(request->getParam("to", true)->value());
+    wanted.trim();
+    if (wanted == "" || wanted == ".") {
+      request->send(400, "text/plain", "the new name is empty");
+      return;
+    }
+
+    const int dot = from.lastIndexOf('.');                  // Keep the extension, a gcode file has to stay one
+    if (dot != -1 && !wanted.endsWith(from.substring(dot)))
+      wanted += from.substring(dot);
+    const String to = "/" + wanted;
+
+    if (!storageFS.exists(from)) {
+      request->send(404, "text/plain", "no such file");
+      return;
+    }
+    if (to == from) {
+      request->send(204, "text/plain", "");
+      return;
+    }
+    if (storageFS.exists(to)) {
+      request->send(409, "text/plain", "that name is taken");
+      return;
+    }
+    if (!storageFS.rename(from, to)) {
+      request->send(500, "text/plain", "the card refused to rename it");
+      return;
+    }
+
+    if (from == selectedFile)
+      selectFile(to);
+    request->send(204, "text/plain", "");
+  });
+
   // Info page
   server.on("/info", HTTP_GET, [](AsyncWebServerRequest * request) {
     String message = "<pre>"
