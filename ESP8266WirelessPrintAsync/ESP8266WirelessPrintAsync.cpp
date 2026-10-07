@@ -60,6 +60,7 @@ DNSServer dns;
 #define LOG_PREVIOUS "/log/events.1.log"
 #define LOG_MAX_BYTES 262144            // Rolled over at this size, so two files are the whole cost
 #define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
+#define UPLOAD_BUFFER_BYTES 16384       // Gathered before touching the card, one FatFs trip instead of eleven
 #define LOG_FLUSH_INTERVAL 5000
 #define LOG_LINK_INTERVAL 60000         // A link summary while printing, and only when something changed
 #define LOG_SAMPLES_PER_PRINT 5         // Damaged lines written out in full, enough for a sample
@@ -654,11 +655,27 @@ void handlePrint() {
   }
 }
 
+// The server hands the body over in packets of about 1.4 KB. Writing each one straight
+// to the card costs a full FatFs round trip, and on a 20 MB file that is fourteen thousand
+// of them, so they are gathered here and written in one go.
+static uint8_t uploadBuffer[UPLOAD_BUFFER_BYTES];
+static size_t uploadBuffered;
+
+static bool uploadFlush(FileWrapper &file) {
+  if (uploadBuffered == 0)
+    return true;
+
+  const size_t pending = uploadBuffered;
+  uploadBuffered = 0;
+  return file.write(uploadBuffer, pending) == pending;
+}
+
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
   static FileWrapper file;
   static String path;
 
   if (!index) {
+    uploadBuffered = 0;
     if (file) {
       file.close();
       if (path != "")
@@ -687,12 +704,29 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
     }
   }
 
-  if (uploadFailure == "" && file && file.write(data, len) != len)
-    uploadFailure = "write error, card full";
+  if (uploadFailure == "" && file) {
+    size_t taken = 0;
+    while (taken < len) {
+      const size_t room = UPLOAD_BUFFER_BYTES - uploadBuffered;
+      const size_t piece = room < len - taken ? room : len - taken;
+      memcpy(uploadBuffer + uploadBuffered, data + taken, piece);
+      uploadBuffered += piece;
+      taken += piece;
+
+      if (uploadBuffered == UPLOAD_BUFFER_BYTES && !uploadFlush(file)) {
+        uploadFailure = "write error, card full";
+        break;
+      }
+    }
+  }
 
   if (final) {
-    if (file)
+    if (file) {
+      if (uploadFailure == "" && !uploadFlush(file))   // Whatever is left over still belongs in the file
+        uploadFailure = "write error, card full";
       file.close();
+    }
+    uploadBuffered = 0;
     if (uploadFailure != "") {
       if (path != "")
         storageFS.remove(path);
