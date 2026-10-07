@@ -670,11 +670,28 @@ static bool uploadFlush(FileWrapper &file) {
   return file.write(uploadBuffer, pending) == pending;
 }
 
+// One file handle serves every upload, so a second client arriving mid-transfer would
+// write its body into the first one's file. The latecomer is turned away instead.
+bool uploadIsBusy(AsyncWebServerRequest *request) {
+  return request->_tempObject != NULL;
+}
+
+static void refuseUpload(AsyncWebServerRequest *request) {
+  if (!request->_tempObject)
+    request->_tempObject = malloc(1);     // Freed with the request, and only its presence matters
+}
+
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
   static FileWrapper file;
   static String path;
+  static AsyncWebServerRequest *owner;
 
   if (!index) {
+    if (file && owner && owner != request) {
+      refuseUpload(request);
+      return;
+    }
+    owner = request;
     uploadBuffered = 0;
     if (file) {
       file.close();
@@ -703,6 +720,9 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
       }
     }
   }
+
+  if (uploadIsBusy(request))        // Turned away at the door, its body goes nowhere
+    return;
 
   if (uploadFailure == "" && file) {
     size_t taken = 0;
@@ -734,6 +754,7 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
     else if (path != "")
       selectFile(path);
     path = "";
+    owner = NULL;
   }
 }
 
@@ -1837,6 +1858,11 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     for (int i = 0; i < request->params(); ++i) {
       AsyncWebParameter *param = request->getParam(i);
       lastUploadFields += " " + param->name() + "=" + param->value();
+    }
+
+    if (uploadIsBusy(request)) {
+      request->send(409, "application/json", "{\"error\": \"another upload is already running\"}");
+      return;
     }
 
     if (uploadFailure != "") {
