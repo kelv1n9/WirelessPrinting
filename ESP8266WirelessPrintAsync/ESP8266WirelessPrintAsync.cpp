@@ -61,6 +61,7 @@ DNSServer dns;
 #define LOG_MAX_BYTES 262144            // Rolled over at this size, so two files are the whole cost
 #define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
 #define UPLOAD_BUFFER_BYTES 16384       // Gathered before touching the card, one FatFs trip instead of eleven
+#define UPLOAD_ABANDONED_AFTER 10000  // A transfer that has gone quiet this long has lost its client
 #define LOG_FLUSH_INTERVAL 5000
 #define LOG_LINK_INTERVAL 60000         // A link summary while printing, and only when something changed
 #define LOG_SAMPLES_PER_PRINT 5         // Damaged lines written out in full, enough for a sample
@@ -660,6 +661,7 @@ void handlePrint() {
 // of them, so they are gathered here and written in one go.
 static uint8_t uploadBuffer[UPLOAD_BUFFER_BYTES];
 static size_t uploadBuffered;
+static uint32_t uploadTouchedAt;
 
 static bool uploadFlush(FileWrapper &file) {
   if (uploadBuffered == 0)
@@ -687,9 +689,18 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
   static AsyncWebServerRequest *owner;
 
   if (!index) {
+    // A dropped connection never delivers its final chunk, so the handle would stay
+    // open and lock every later upload out. Silence for long enough means it is gone.
     if (file && owner && owner != request) {
-      refuseUpload(request);
-      return;
+      if (millis() - uploadTouchedAt < UPLOAD_ABANDONED_AFTER) {
+        refuseUpload(request);
+        return;
+      }
+      file.close();
+      if (path != "")
+        storageFS.remove(path);
+      path = "";
+      logEvent("gave up on an upload that went quiet, taking the card back");
     }
     owner = request;
     uploadBuffered = 0;
@@ -723,6 +734,8 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
 
   if (uploadIsBusy(request))        // Turned away at the door, its body goes nowhere
     return;
+
+  uploadTouchedAt = millis();
 
   if (uploadFailure == "" && file) {
     size_t taken = 0;
