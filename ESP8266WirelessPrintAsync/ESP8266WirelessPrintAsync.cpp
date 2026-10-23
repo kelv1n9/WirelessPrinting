@@ -62,6 +62,8 @@ DNSServer dns;
 #define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
 #define UPLOAD_BUFFER_BYTES 16384       // Gathered before touching the card, one FatFs trip instead of eleven
 #define UPLOAD_ABANDONED_AFTER 10000  // A transfer that has gone quiet this long has lost its client
+#define SERIAL_LINES_PER_LOOP 40        // Replies handled per pass, so a shouting printer cannot starve the loop
+#define DOWNLOAD_CACHE_BYTES 8192       // Read ahead so the card is not asked for every packet
 #define LOG_FLUSH_INTERVAL 5000
 #define LOG_LINK_INTERVAL 60000         // A link summary while printing, and only when something changed
 #define LOG_SAMPLES_PER_PRINT 5         // Damaged lines written out in full, enough for a sample
@@ -1829,18 +1831,34 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     probe.close();
 
     AsyncWebServerResponse *response = request->beginResponse("application/x-gcode", fileSize, [path, fileSize](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      // The server asks for about 1.4 KB at a time. Reading that straight off the card
+      // costs a FatFs round trip each, so whole blocks are fetched and handed out from here.
       static size_t downloadBytesLeft;
       static FileWrapper downloadFile;
+      static uint8_t cache[DOWNLOAD_CACHE_BYTES];
+      static size_t cacheHave, cacheTaken;
 
       if (!index) {
         downloadFile = storageFS.open(path);
         downloadBytesLeft = fileSize;
+        cacheHave = cacheTaken = 0;
       }
-      size_t bytes = min(downloadBytesLeft, maxLen);
-      bytes = min(bytes, (size_t)2048);
-      bytes = downloadFile.read(buffer, bytes);
+
+      if (cacheTaken == cacheHave) {
+        cacheHave = downloadFile.read(cache, DOWNLOAD_CACHE_BYTES);
+        cacheTaken = 0;
+        if (cacheHave == 0) {
+          downloadFile.close();
+          return 0;
+        }
+      }
+
+      size_t bytes = min(maxLen, cacheHave - cacheTaken);
+      bytes = min(bytes, downloadBytesLeft);
+      memcpy(buffer, cache + cacheTaken, bytes);
+      cacheTaken += bytes;
       downloadBytesLeft -= bytes;
-      if (bytes <= 0)
+      if (downloadBytesLeft == 0)
         downloadFile.close();
 
       return bytes;
@@ -2299,6 +2317,10 @@ void ReceiveResponses() {
   static int lineStartPos;
   static String serialResponse;
 
+  // A printer in trouble can shout thousands of lines a second. Handling all of them
+  // in one pass starves the watchdog, so the rest waits in the buffer for the next one.
+  int linesThisPass = 0;
+
   while (PrinterSerial.available()) {
     const int incoming = PrinterSerial.read();
     if (incoming < 0)
@@ -2486,6 +2508,9 @@ void ReceiveResponses() {
       }
       if (!unsolicited)
         restartSerialTimeout();
+
+      if (++linesThisPass >= SERIAL_LINES_PER_LOOP)
+        break;
     }
   }
 
