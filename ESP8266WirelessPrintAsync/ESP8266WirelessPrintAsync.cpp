@@ -87,7 +87,8 @@ bool ESPrestartRequired;  // Set this flag in the callbacks to restart ESP
 // Information from M115
 String fwMachineType = "Unknown";
 uint8_t fwExtruders = 1;
-bool fwAutoreportTempCap, fwProgressCap, fwBuildPercentCap;
+bool fwAutoreportTempCap, fwProgressCap, fwBuildPercentCap, fwAutoreportSDCap;
+bool externalPrinting;           // The printer is running a file from its own card, not from us
 
 // Printer status
 bool printerConnected,
@@ -127,6 +128,7 @@ float energyWh, energyLastWatt = -1, energyTariff = ENERGY_TARIFF;
 float filamentGrams = -1, filamentPrice = FILAMENT_PRICE, filamentDefaultPrice = FILAMENT_PRICE;
 uint32_t energyLastAt, energyPollAt;
 String logBuffer, consoleRing[CONSOLE_LINES];
+SemaphoreHandle_t logMutex;      // logEvent is reached from the loop and from the server task
 uint32_t consoleSeq, loggedSamples;
 uint32_t logFlushAt, logLinkAt, loggedSent, loggedResent, loggedMangled, loggedTimeouts, linkTimeouts;
 volatile bool lineProbeRequested, updateRunning;
@@ -153,6 +155,8 @@ String lastUploadFields, uploadFailure;
 // Temperature for printer status reporting
 #define TEMP_COMMAND      "M105"
 #define AUTOTEMP_COMMAND  "M155 S"
+#define SDREPORT_COMMAND  "M27 S"       // The printer tells us when it prints from its own card
+#define SDREPORT_INTERVAL 5
 
 struct Temperature {
   String actual, target;
@@ -441,17 +445,36 @@ String printableOnly(const String text) {
 
 void logFlush();
 
+// The web server runs in its own task, so uploads and the main loop both land here.
+// Appending to a String is read, reallocate and copy, which two tasks cannot share.
 void logEvent(const String text) {
   const time_t now = time(NULL);   // Straight after a power cut the clock is nonsense until NTP answers
-  logBuffer += (now > 1600000000 ? String((uint32_t)now) : String("-")) +
-               " " + String(millis() / 1000) + " " + text + "\r\n";
+  const String line = (now > 1600000000 ? String((uint32_t)now) : String("-")) +
+                      " " + String(millis() / 1000) + " " + text + "\r\n";
 
-  if (logBuffer.length() > LOG_BUFFER_BYTES)
+  if (logMutex)
+    xSemaphoreTake(logMutex, portMAX_DELAY);
+  logBuffer += line;
+  const bool full = logBuffer.length() > LOG_BUFFER_BYTES;
+  if (logMutex)
+    xSemaphoreGive(logMutex);
+
+  if (full)
     logFlush();
 }
 
 void logFlush() {
   if (logBuffer == "" || !storageFS.isActive())
+    return;
+
+  if (logMutex)                    // Taken out of the way first, so the card is written unlocked
+    xSemaphoreTake(logMutex, portMAX_DELAY);
+  const String pending = logBuffer;
+  logBuffer = "";
+  if (logMutex)
+    xSemaphoreGive(logMutex);
+
+  if (pending == "")
     return;
 
   storageFS.mkdir("/log");
@@ -469,10 +492,9 @@ void logFlush() {
   FileWrapper file = storageFS.open(LOG_PATH, "a");
   if (!file)
     return;
-  file.write((const uint8_t *)logBuffer.c_str(), logBuffer.length());
+  file.write((const uint8_t *)pending.c_str(), pending.length());
   file.close();
 
-  logBuffer = "";
   logFlushAt = millis() + LOG_FLUSH_INTERVAL;
 }
 
@@ -987,6 +1009,7 @@ bool detectPrinter() {
           value = M115ExtractString(lastReceivedResponse, "EXTRUDER_COUNT");
           fwExtruders = value == "" ? 1 : min(value.toInt(), (long)MAX_SUPPORTED_EXTRUDERS);
           fwAutoreportTempCap = M115ExtractBool(lastReceivedResponse, "Cap:AUTOREPORT_TEMP");
+          fwAutoreportSDCap = M115ExtractBool(lastReceivedResponse, "Cap:AUTOREPORT_SD_STATUS");
           fwProgressCap = M115ExtractBool(lastReceivedResponse, "Cap:PROGRESS");
           fwBuildPercentCap = M115ExtractBool(lastReceivedResponse, "Cap:BUILD_PERCENT");
 
@@ -998,6 +1021,8 @@ bool detectPrinter() {
 
           if (fwAutoreportTempCap)
             commandQueue.push(AUTOTEMP_COMMAND + String(TEMPERATURE_REPORT_INTERVAL));   // Start auto report temperatures
+          if (fwAutoreportSDCap)
+            commandQueue.push(SDREPORT_COMMAND + String(SDREPORT_INTERVAL));             // And when it prints without us
           else
             temperatureTimer = millis();
           return true;
@@ -1371,6 +1396,7 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
 }
 
 void setup() {
+  logMutex = xSemaphoreCreateMutex();   // Before anything can log
   bootProbeResult = probeReceiveLine(BOOT_PROBE_MS);
   PrinterSerial.setRxBufferSize(PRINTER_SERIAL_RX_BUFFER);
 
@@ -2350,6 +2376,50 @@ void ReceiveResponses() {
           responseDetail = "position";
         else if (serialResponse.startsWith("echo:busy"))
           responseDetail = "busy";
+        else if (serialResponse.startsWith("SD printing byte", lineStartPos) ||
+                 serialResponse.startsWith("Not SD printing", lineStartPos)) {
+          // Only the printer's own card prints produce these, our files never touch it
+          unsolicited = true;
+          responseDetail = "sd status";
+          const bool running = serialResponse.startsWith("SD printing byte", lineStartPos);
+          if (running != externalPrinting) {
+            externalPrinting = running;
+            if (running)
+              logEvent("the printer started a file from its own card");
+            else {
+              logEvent("the print from the printer's own card ended");
+              powerOffArmed = autoPowerOff;     // Arm the socket just as we do for our own prints
+              powerOffSawIdle = false;
+              powerOffReadySince = 0;
+              powerOffAttempts = 0;
+            }
+          }
+        }
+        else if (serialResponse.startsWith("//action:", lineStartPos)) {
+          // The printer's own screen talking to us, nobody asked for this line
+          unsolicited = true;
+          const String action = serialResponse.substring(lineStartPos + 9);
+          if (action.startsWith("cancel")) {
+            responseDetail = "screen asked to cancel";
+            if (isPrinting) {
+              cancelPrint = true;
+              logEvent("cancelled from the printer's screen");
+            }
+          }
+          else if (action.startsWith("pause")) {
+            responseDetail = "screen asked to pause";
+            if (isPrinting) {
+              printPause = true;
+              logEvent("paused from the printer's screen");
+            }
+          }
+          else if (action.startsWith("resume")) {
+            responseDetail = "screen asked to resume";
+            printPause = false;
+          }
+          else
+            responseDetail = "host action";
+        }
         else if (serialResponse.indexOf("Unknown command") != -1) {
           if (isPrinting)
             ++linesMangled;          // The checksum cannot catch a dropped pair of identical bytes
