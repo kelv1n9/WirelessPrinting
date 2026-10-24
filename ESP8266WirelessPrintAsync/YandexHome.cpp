@@ -6,6 +6,8 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 
+extern SemaphoreHandle_t tlsGate;   // Shared with the bot: one encrypted connection fits, not two
+
 #define YANDEX_HOST      "https://api.iot.yandex.net"
 #define YANDEX_TASK_STACK 10240
 #define YANDEX_TIMEOUT    15000
@@ -180,6 +182,12 @@ bool YandexHome::call(const String path, const String payload, String &body) {
     return false;
   }
 
+  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(30000)) != pdTRUE) {
+    Guard guard(mutex);
+    status = "the other connection is busy";
+    return false;
+  }
+
   WiFiClientSecure client;
   client.setCACert(YANDEX_ROOT_CA);
   client.setTimeout(YANDEX_TIMEOUT / 1000);
@@ -187,6 +195,7 @@ bool YandexHome::call(const String path, const String payload, String &body) {
   HTTPClient http;
   http.setTimeout(YANDEX_TIMEOUT);
   if (!http.begin(client, YANDEX_HOST + path)) {
+    xSemaphoreGive(tlsGate);
     Guard guard(mutex);
     status = "cannot open connection";
     return false;
@@ -204,6 +213,8 @@ bool YandexHome::call(const String path, const String payload, String &body) {
   if (code > 0)
     body = http.getString();
   http.end();
+  client.stop();                  // Hands the encryption buffers back at once
+  xSemaphoreGive(tlsGate);
 
   Guard guard(mutex);
   if (code == 401 || code == 403)

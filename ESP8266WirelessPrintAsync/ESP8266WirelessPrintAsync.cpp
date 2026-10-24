@@ -17,6 +17,7 @@
 
 #include "CommandQueue.h"
 #include "YandexHome.h"
+#include "TelegramBot.h"
 
 // Use Serial1 rather than the normal Serial0, which prints stuff during boot that confuses the printer
 HardwareSerial PrinterSerial(1);
@@ -133,6 +134,7 @@ float filamentGrams = -1, filamentPrice = FILAMENT_PRICE, filamentDefaultPrice =
 uint32_t energyLastAt, energyPollAt;
 String logBuffer, consoleRing[CONSOLE_LINES];
 SemaphoreHandle_t logMutex;      // logEvent is reached from the loop and from the server task
+SemaphoreHandle_t tlsGate;       // One encrypted conversation at a time: two will not fit in the heap
 uint32_t consoleSeq, loggedSamples;
 uint32_t logFlushAt, logLinkAt, loggedSent, loggedResent, loggedMangled, loggedTimeouts, linkTimeouts;
 volatile bool lineProbeRequested, updateRunning;
@@ -588,6 +590,13 @@ void handlePrint() {
                  " " + String(energyWh, 1) + "Wh " + String(grams, 2) + "g " +
                  String(energyWh / 1000 * energyTariff + grams / 1000 * filamentPrice, 3) + "AZN");
         logFlush();
+        // Before the socket is armed, because switching it off also switches off the
+        // radio that would carry this.
+        telegramBot.notify(String(printEndedEarly ? "Print ended early: " : abortPrint ? "Print cancelled: " : "Print finished: ")
+                           + baseName(printingFile) + "\n"
+                           + String((millis() - printStartTime) / 60000) + " min, "
+                           + String(grams, 1) + " g, "
+                           + String(energyWh / 1000 * energyTariff + grams / 1000 * filamentPrice, 2) + " AZN");
       }
       #ifdef DEAD_MAN_SECONDS
         commandQueue.push("M85 S0");     // Cooling down is silent, and silence must not kill the printer now
@@ -749,6 +758,8 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
       uploadFailure = "not a gcode file";
     else if (isPrinting)
       uploadFailure = "a print is running, the card is busy";
+    else if (telegramBot.receiving())
+      uploadFailure = "a file is arriving from Telegram, the card is busy";
     else if (request->contentLength() >= storageFS.freeBytes())
       uploadFailure = "not enough free space";
     else {
@@ -1103,6 +1114,31 @@ String urlEncode(const String text) {
   return encoded;
 }
 
+// The bot numbers the files so a phone keyboard never has to spell one out.
+String storedFile(const int wanted, String &listing) {
+  String found;
+  int seen = 0;
+
+  FileWrapper dir = storageFS.open("/");
+  if (dir) {
+    FileWrapper file = dir.openNextFile();
+    while (file) {
+      const String name = baseName(file.name());
+      if (!file.isDirectory() && isGcodeFilename(name)) {
+        seen++;
+        listing += String(seen) + ". " + name + "  (" + String(file.size() / 1024) + " KB)\n";
+        if (seen == wanted)
+          found = "/" + name;
+      }
+      file.close();
+      file = dir.openNextFile();
+    }
+    dir.close();
+  }
+
+  return found;
+}
+
 String firstStoredFile() {
   String found;
 
@@ -1192,6 +1228,106 @@ String fileListHtml() {
   });
 
   return html == "" ? "<tr><td colspan=\"3\"><i>No files</i></td></tr>" : html;
+}
+
+inline String getState();
+
+// The bot's task only carries messages. Orders are carried out here, in the loop, so
+// nothing the printer owns is touched from two places at once.
+void handleTelegram() {
+  static String awaitingStop;     // Cancelling asks twice, and only the chat that asked
+
+  String chat, line;
+  while (telegramBot.nextCommand(chat, line)) {
+    line.trim();
+    const int space = line.indexOf(' ');
+    String verb = space < 0 ? line : line.substring(0, space);
+    const String rest = space < 0 ? "" : line.substring(space + 1);
+    verb.toLowerCase();
+    const int addressed = verb.indexOf('@');      // In a group a bot is called /status@thebot
+    if (addressed > 0)
+      verb = verb.substring(0, addressed);
+
+    if (verb == "/start" || verb == "/help") {
+      telegramBot.send(chat,
+        String(getDeviceName()) + "\n\n"
+        "/status - what the printer is doing\n"
+        "/files - what is on the card\n"
+        "/print <number> - start that file\n"
+        "/stop - cancel the running print\n"
+        "/off - cut power at the socket\n\n"
+        "Send a .gcode file to put it on the card. Telegram only lets a bot fetch files "
+        "up to 20 MB, anything larger has to go through the slicer.");
+    }
+    else if (verb == "/status") {
+      String text = getState() + "\n"
+                    "Nozzle " + toolTemperature[0].actual + " / " + toolTemperature[0].target + "\n"
+                    "Bed " + bedTemperature.actual + " / " + bedTemperature.target + "\n";
+      if (isPrinting) {
+        const int32_t elapsed = (millis() - printStartTime) / 1000;
+        const int32_t left = printCompletion > 0.5 ? (int32_t)(elapsed / printCompletion * (100 - printCompletion)) : -1;
+        text += baseName(printingFile) + "\n" +
+                String(printCompletion, 1) + "%, layer " + String(currentLayer) + "/" + String(totalLayers) + "\n" +
+                String(elapsed / 60) + " min in" +
+                (left >= 0 ? ", about " + String(left / 60) + " min left" : "") + "\n";
+      }
+      else
+        text += "Selected: " + (selectedFile == "" ? String("nothing") : baseName(selectedFile)) + "\n";
+      const float watts = yandexHome.getPower();
+      if (watts >= 0)
+        text += String(watts, 1) + " W\n";
+      telegramBot.send(chat, text);
+    }
+    else if (verb == "/files") {
+      String listing;
+      storedFile(0, listing);
+      telegramBot.send(chat, listing == "" ? "The card is empty." : listing + "\nSend /print <number> to start one.");
+    }
+    else if (verb == "/print") {
+      String listing;
+      const String wanted = storedFile(rest.toInt(), listing);
+      if (isPrinting)
+        telegramBot.send(chat, "Already printing " + baseName(printingFile) + ".");
+      else if (!printerConnected)
+        telegramBot.send(chat, "The printer is not answering.");
+      else if (rest.toInt() <= 0 || wanted == "")
+        telegramBot.send(chat, "No file with that number. Send /files to see them.");
+      else {
+        selectFile(wanted);
+        startPrint = true;
+        telegramBot.send(chat, "Starting " + baseName(wanted) + ".");
+      }
+    }
+    else if (verb == "/stop") {
+      if (!isPrinting) {
+        telegramBot.send(chat, "Nothing is printing.");
+        awaitingStop = "";
+      }
+      else if (rest == "yes" || awaitingStop == chat) {
+        cancelPrint = true;
+        awaitingStop = "";
+        telegramBot.send(chat, "Cancelling " + baseName(printingFile) + ".");
+      }
+      else {
+        awaitingStop = chat;
+        telegramBot.send(chat, "Cancel " + baseName(printingFile) + " at " + String(printCompletion, 1)
+                               + "%? Send /stop again to confirm.");
+      }
+    }
+    else if (verb == "/off") {
+      if (isPrinting)
+        telegramBot.send(chat, "A print is running. Send /stop first.");
+      else if (!yandexHome.hasToken() || yandexHome.getDeviceId() == "")
+        telegramBot.send(chat, "No socket is set up.");
+      else if (yandexHome.request(YandexHome::PowerOff))
+        telegramBot.send(chat, "Switching the socket off. This module runs off the printer, so it goes "
+                               "quiet too and cannot switch anything back on.");
+      else
+        telegramBot.send(chat, "The socket would not take the order.");
+    }
+    else
+      telegramBot.send(chat, "I do not know that one. Send /help.");
+  }
 }
 
 void initSelectedFile() {
@@ -1405,12 +1541,14 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
 
 void setup() {
   logMutex = xSemaphoreCreateMutex();   // Before anything can log
+  tlsGate = xSemaphoreCreateMutex();    // Before anything can reach out over TLS
   bootProbeResult = probeReceiveLine(BOOT_PROBE_MS);
   PrinterSerial.setRxBufferSize(PRINTER_SERIAL_RX_BUFFER);
 
   commandQueue.begin();
   storageFS.begin();
   yandexHome.begin();
+  telegramBot.begin();
   storageFS.mkdir("/ui");
 
   logEvent(String("boot ") + SKETCH_VERSION + ", after " + resetReason() +
@@ -1521,6 +1659,75 @@ void setup() {
 function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); setTimeout(function(){ location.reload(); }, 2500); }); }
 </script>)HTML";
     request->send(200, "text/html; charset=utf-8", message);
+  });
+
+  server.on("/telegram", HTTP_GET, [](AsyncWebServerRequest * request) {
+    String rows;
+    for (int which = 0; which < 2; which++) {
+      const String list = which == 0 ? telegramBot.getChats() : telegramBot.getSeen();
+      int at = 0;
+      while (at < (int)list.length()) {
+        const int comma = list.indexOf(',', at);
+        const String one = comma < 0 ? list.substring(at) : list.substring(at, comma);
+        if (one != "")
+          rows += "<tr><td><code>" + htmlEscape(one) + "</code></td>"
+                  "<td>" + String(which == 0 ? "allowed" : "knocked, not allowed") + "</td>"
+                  "<td>" + (which == 0
+                    ? "<button onclick=\"post('/telegram/deny?chat=" + urlEncode(one) + "')\">Remove</button>"
+                    : "<button onclick=\"post('/telegram/allow?chat=" + urlEncode(one) + "')\">Allow</button>") +
+                  "</td></tr>";
+        if (comma < 0)
+          break;
+        at = comma + 1;
+      }
+    }
+    if (rows == "")
+      rows = "<tr><td colspan=\"3\"><i>Nobody yet. Send the bot a message and reload this page.</i></td></tr>";
+
+    String message = "<h1>Telegram</h1>"
+                     "<p>Status: <b>" + htmlEscape(telegramBot.getStatus()) + "</b></p>"
+                     "<p>Token: <b>" + String(telegramBot.hasToken() ? "stored" : "not set") + "</b></p>"
+                     "<form method=\"POST\" action=\"/telegram/token\">"
+                     "<input name=\"token\" type=\"password\" size=\"60\" placeholder=\"Bot token from BotFather\" required/> "
+                     "<input type=\"submit\" value=\"Store token\"/>"
+                     "</form>"
+                     "<p>The token is written to NVS and never shown again.</p>"
+                     "<h2>Who may command the printer</h2>"
+                     "<p>Only the chats listed as allowed are answered. Anyone else is ignored in silence, "
+                     "and their id turns up here so you can let them in.</p>"
+                     "<table>" + rows + "</table>"
+                     "<p><a href=\"/\">Back</a></p>";
+    message += R"HTML(<script>
+function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) alert('Failed: ' + r.status); setTimeout(function(){ location.reload(); }, 500); }); }
+</script>)HTML";
+    request->send(200, "text/html; charset=utf-8", message);
+  });
+
+  server.on("/telegram/token", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("token", true)) {
+      request->send(400, "text/plain", "token is required");
+      return;
+    }
+    telegramBot.setToken(request->getParam("token", true)->value());
+    request->redirect("/telegram");
+  });
+
+  server.on("/telegram/allow", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("chat")) {
+      request->send(400, "text/plain", "chat is required");
+      return;
+    }
+    telegramBot.allow(request->getParam("chat")->value());
+    request->send(204, "text/plain", "");
+  });
+
+  server.on("/telegram/deny", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("chat")) {
+      request->send(400, "text/plain", "chat is required");
+      return;
+    }
+    telegramBot.deny(request->getParam("chat")->value());
+    request->send(204, "text/plain", "");
   });
 
   server.on("/yandex/token", HTTP_POST, [](AsyncWebServerRequest * request) {
@@ -2699,6 +2906,7 @@ void loop() {
   handleLineProbe();
   handleStorage();
   handleLogging();
+  handleTelegram();      // Answers even with the printer silent, so /status always says something
 
   if (!printerConnected)
     printerConnected = detectPrinter();
