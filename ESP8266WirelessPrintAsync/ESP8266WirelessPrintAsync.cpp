@@ -47,8 +47,8 @@ DNSServer dns;
 #define WIFI_REBOOT_AFTER 600000        // Reboot after this long offline, so a changed network can be configured again
 #define WDT_TIMEOUT 30                  // Seconds without a loop iteration before the watchdog reboots the device
 #define MAX_LISTED_FILES 64             // Upper bound on the directory listing, so a full card cannot exhaust the heap
-#define THUMBNAIL_SCAN_BYTES 262144     // How far into a file to look for an embedded preview
-#define THUMBNAIL_MAX_BYTES 131072      // Refuse to decode a preview larger than this
+#define THUMBNAIL_SCAN_BYTES 65536      // Slicers put the preview at the very top, so looking further only costs time
+#define THUMBNAIL_MAX_BYTES 49152       // A hundred pixel preview is two kilobytes; anything near the heap size is a trap
 #define CANCEL_PARK "G1 X0 Y180 F6000"  // Where a cancelled print leaves the head, comment out to home only
 #define POWEROFF_NOZZLE 100             // Nozzle has to be below this before the socket may be switched off
 #define POWEROFF_BED 50                 // And the bed below this
@@ -1989,26 +1989,44 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       return;
     }
 
-    String encoded;
-    bool inside = false;
+    // Read in blocks and cut the lines here. Asking the card for one line at a time
+    // means asking it for one byte at a time, and a header of sixty kilobytes then
+    // takes five seconds, which is long enough to hold up every other request the
+    // page makes at the same time.
+    static char block[1024] __attribute__((aligned(32)));
+    String encoded, line;
+    bool inside = false, finished = false;
     unsigned int scanned = 0;
-    while (file.available() && scanned < THUMBNAIL_SCAN_BYTES && encoded.length() < THUMBNAIL_MAX_BYTES) {
-      String line = file.readStringUntil('\n');
-      scanned += line.length() + 1;
-      line.trim();
-      if (!line.startsWith(";"))
-        continue;
 
-      if (!inside) {
-        inside = line.indexOf("thumbnail begin") != -1;
-        continue;
-      }
-      if (line.indexOf("thumbnail end") != -1)
+    while (!finished && scanned < THUMBNAIL_SCAN_BYTES && encoded.length() < THUMBNAIL_MAX_BYTES) {
+      const int taken = file.read((uint8_t *)block, sizeof(block));
+      if (taken <= 0)
         break;
+      scanned += taken;
 
-      line = line.substring(1);
-      line.trim();
-      encoded += line;
+      for (int at = 0; at < taken; at++) {
+        if (block[at] != '\n') {
+          if (block[at] != '\r')
+            line += block[at];
+          continue;
+        }
+
+        line.trim();
+        if (line.startsWith(";")) {
+          if (!inside)
+            inside = line.indexOf("thumbnail begin") != -1;
+          else if (line.indexOf("thumbnail end") != -1) {
+            finished = true;
+            break;
+          }
+          else {
+            line = line.substring(1);
+            line.trim();
+            encoded += line;
+          }
+        }
+        line = "";
+      }
     }
     file.close();
 
