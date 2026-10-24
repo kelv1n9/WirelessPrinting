@@ -61,7 +61,7 @@ DNSServer dns;
 #define LOG_PATH "/log/events.log"      // What happened, so a failure at night leaves something to read
 #define LOG_PREVIOUS "/log/events.1.log"
 #define LOG_MAX_BYTES 262144            // Rolled over at this size, so two files are the whole cost
-#define LOG_TAIL_BYTES 8192             // How much of it a read hands back: the server copies this again
+#define LOG_TAIL_BYTES 4096             // How much of it a read hands back: the server copies this again
 #define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
 #define DOWNLOAD_CACHE_BYTES 8192       // Bigger reads faster, but every byte here is a byte TLS cannot have
 #define BENCH_BURST_BYTES 65536      // Only the card bench uses this, and only while it runs
@@ -2468,6 +2468,13 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     // Handing over a quarter of a megabyte means reading the card from inside the
     // network callback for seconds on end, which starves the loop until the watchdog
     // reboots the module. The tail is what anyone reads anyway.
+    // The bot holds a lot of memory while it is talking, and building a page on top of
+    // that is what used to reboot the module.
+    if (ESP.getFreeHeap() < 60000) {
+      request->send(503, "text/plain", "busy, ask again in a moment");
+      return;
+    }
+
     FileWrapper file = storageFS.open(path);
     if (!file) {
       request->send(404, "text/plain", "nothing recorded yet");

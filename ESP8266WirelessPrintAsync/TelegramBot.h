@@ -44,6 +44,8 @@ class TelegramBot {
     static Message inbox[QUEUE], outbox[QUEUE];
     static int inboxHead, inboxTail, outboxHead, outboxTail;
     static int64_t offset;
+    static String waitingChat, waitingId, waitingName;   // A document asked for, fetched once the
+    static size_t waitingSize;                           // answer it arrived in has been let go
     static volatile bool landing;
 
     static void run(void *argument);

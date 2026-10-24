@@ -69,6 +69,8 @@ String TelegramBot::token, TelegramBot::chats, TelegramBot::seen, TelegramBot::s
 TelegramBot::Message TelegramBot::inbox[TelegramBot::QUEUE], TelegramBot::outbox[TelegramBot::QUEUE];
 int TelegramBot::inboxHead = 0, TelegramBot::inboxTail = 0;
 int TelegramBot::outboxHead = 0, TelegramBot::outboxTail = 0;
+String TelegramBot::waitingChat, TelegramBot::waitingId, TelegramBot::waitingName;
+size_t TelegramBot::waitingSize = 0;
 int64_t TelegramBot::offset = -1;
 volatile bool TelegramBot::landing = false;
 static bool telegramPrimed = false;      // The first answer is only read for its place in the queue
@@ -318,7 +320,7 @@ bool TelegramBot::call(const String path, String &body, const uint32_t timeout) 
 
   // Standing aside is the whole fix for the spiral that took the module down: a cramped
   // heap makes the handshake fail, a failed handshake leaves the heap more cramped.
-  if (ESP.getFreeHeap() < TELEGRAM_HEAP_FLOOR) {
+  if (ESP.getFreeHeap() < (isPrinting ? TELEGRAM_HEAP_FLOOR + 20000 : TELEGRAM_HEAP_FLOOR)) {
     Hold hold(mutex);
     status = "waiting for memory";
     return false;
@@ -420,10 +422,18 @@ bool TelegramBot::poll() {
 
     JsonObject file = message["document"];
     if (!file.isNull()) {
+      // Fetching it here would open a second encrypted connection while the first one
+      // and the answer it carried are both still held, which is more memory than this
+      // module has. It is noted and collected on the next round instead.
       const char *id = file["file_id"];
-      if (id)
-        fetchDocument(chat, String(id), String((const char *)(file["file_name"] | "print.gcode")),
-                      file["file_size"] | 0);
+      if (id && waitingId == "") {
+        waitingChat = chat;
+        waitingId = id;
+        waitingName = (const char *)(file["file_name"] | "print.gcode");
+        waitingSize = file["file_size"] | 0;
+      }
+      else if (id)
+        send(chat, "Still busy with the last file, send this one again in a moment.");
       continue;
     }
 
@@ -479,16 +489,23 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
 
   String body;
   if (!call("/getFile?file_id=" + fileId, body, TELEGRAM_TIMEOUT)) {
-    send(chat, "Telegram would not say where that file is.");
+    send(chat, "Could not ask where that file is: " + getStatus() + ", heap " + String(ESP.getFreeHeap()));
     return;
   }
 
   DynamicJsonDocument document(2048);
-  if (deserializeJson(document, body) || !document["result"]["file_path"]) {
-    send(chat, "Telegram would not say where that file is.");
+  if (deserializeJson(document, body)) {
+    send(chat, "Telegram's answer made no sense: " + body.substring(0, 120));
     return;
   }
-  const String remote = document["result"]["file_path"].as<const char *>();
+  // Asking a string field whether it is true answers no, because it does not spell
+  // "true". The pointer is the thing to look at.
+  const char *path = document["result"]["file_path"];
+  if (!path || !*path) {
+    send(chat, "Telegram gave no path for that file.");
+    return;
+  }
+  const String remote = path;
 
   String secret;
   {
@@ -590,5 +607,12 @@ void TelegramBot::run(void *argument) {
       failures++;
 
     vTaskDelay(pdMS_TO_TICKS(failures ? 1000 << (failures - 1) : 50));
+
+    if (waitingId != "") {
+      const String chat = waitingChat, id = waitingId, name = waitingName;
+      const size_t size = waitingSize;
+      waitingId = "";
+      fetchDocument(chat, id, name, size);
+    }
   }
 }
