@@ -1854,12 +1854,6 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     request->send(200, "text/plain; charset=utf-8", out);
   });
 
-  server.on("/bench/sink", HTTP_POST, [](AsyncWebServerRequest * request) {
-    request->send(200, "text/plain", "ok\n");
-  }, NULL, [](AsyncWebServerRequest * request, uint8_t *data, size_t len, size_t index, size_t total) {
-    (void)data; (void)len; (void)index; (void)total;     // Straight into the bin
-  });
-
   server.on("/bench/net", HTTP_GET, [](AsyncWebServerRequest * request) {
     size_t total = 8UL * 1024 * 1024;
     if (request->hasParam("mb"))
