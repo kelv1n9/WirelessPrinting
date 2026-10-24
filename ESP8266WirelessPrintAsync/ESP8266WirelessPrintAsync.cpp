@@ -62,7 +62,7 @@ DNSServer dns;
 #define LOG_PREVIOUS "/log/events.1.log"
 #define LOG_MAX_BYTES 262144            // Rolled over at this size, so two files are the whole cost
 #define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
-#define DOWNLOAD_CACHE_BYTES 32768      // Read in blocks, then handed out packet by packet
+#define DOWNLOAD_CACHE_BYTES 8192       // Bigger reads faster, but every byte here is a byte TLS cannot have
 #define BENCH_BURST_BYTES 65536      // Only the card bench uses this, and only while it runs
 #define UPLOAD_BUFFER_BYTES 16384       // Gathered before touching the card, one FatFs trip instead of eleven
 #define UPLOAD_ABANDONED_AFTER 10000  // A transfer that has gone quiet this long has lost its client

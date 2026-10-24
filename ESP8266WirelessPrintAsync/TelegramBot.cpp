@@ -23,13 +23,13 @@ extern String sanitizeFilename(const String filename);
 extern bool isPrinting;
 
 #define TELEGRAM_HOST    "https://api.telegram.org"
-#define TELEGRAM_STACK   10240         // Measured: a round leaves four fifths of it untouched
+#define TELEGRAM_STACK   16384         // The handshake checks a chain of three and needs the room
 #define TELEGRAM_WAIT    10            // Seconds Telegram holds a quiet request open
 #define TELEGRAM_TIMEOUT 20000
 #define TELEGRAM_JSON    4096
 #define TELEGRAM_REPLY_GRACE 1500      // How long to let the loop answer before asking again
 #define TELEGRAM_MAX_FILE (20UL * 1024 * 1024)   // The bot API will not hand over more
-#define TELEGRAM_CHUNK   8192
+#define TELEGRAM_CHUNK   4096
 #define TELEGRAM_SEEN_MAX 5
 #define TELEGRAM_HEAP_FLOOR 70000      // Encryption needs a big unbroken block, and failing
                                        // to get one leaves rubbish behind every time
@@ -337,6 +337,7 @@ bool TelegramBot::call(const String path, String &body, const uint32_t timeout) 
   client.setTimeout(timeout / 1000);
 
   HTTPClient http;
+  http.setReuse(false);
   http.setTimeout(timeout);
   if (!http.begin(client, String(TELEGRAM_HOST) + "/bot" + secret + path)) {
     xSemaphoreGive(tlsGate);
@@ -345,13 +346,15 @@ bool TelegramBot::call(const String path, String &body, const uint32_t timeout) 
     return false;
   }
 
-  trail("telegram: asking" + path.substring(0, path.indexOf('?') < 0 ? path.length() : path.indexOf('?')));
   const int code = http.GET();
   if (code > 0)
     body = http.getString();
-  http.end();
-  client.stop();                   // Hands the encryption buffers back at once
+  http.end();                      // The client closes itself when it goes out of scope
   xSemaphoreGive(tlsGate);
+
+  if (code != 200)
+    trail("telegram: " + String(code < 0 ? HTTPClient::errorToString(code) : "HTTP " + String(code))
+          + ", heap " + String(ESP.getFreeHeap()));
 
   Hold hold(mutex);
   if (code == 401)
@@ -387,8 +390,6 @@ bool TelegramBot::poll() {
   if (!call("/getUpdates?offset=" + fromInt64(offset) + "&limit=2&timeout=" + String(TELEGRAM_WAIT)
             + "&allowed_updates=%5B%22message%22%5D", body, TELEGRAM_TIMEOUT + TELEGRAM_WAIT * 1000))
     return false;
-
-  trail("telegram: reading " + String(body.length()) + " bytes");
 
   DynamicJsonDocument document(TELEGRAM_JSON);
   if (deserializeJson(document, body)) {
@@ -514,7 +515,6 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
 
   if (http.GET() != 200) {
     http.end();
-    client.stop();
     xSemaphoreGive(tlsGate);
     send(chat, "Telegram refused to hand the file over.");
     return;
@@ -525,7 +525,6 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   if (!card) {
     landing = false;
     http.end();
-    client.stop();
     xSemaphoreGive(tlsGate);
     send(chat, "Could not create " + name + " on the card.");
     return;
@@ -557,7 +556,6 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
 
   card.close();
   http.end();
-  client.stop();
   xSemaphoreGive(tlsGate);
   landing = false;
 

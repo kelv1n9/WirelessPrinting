@@ -212,8 +212,7 @@ bool YandexHome::call(const String path, const String payload, String &body) {
 
   if (code > 0)
     body = http.getString();
-  http.end();
-  client.stop();                  // Hands the encryption buffers back at once
+  http.end();                     // The client closes itself when it goes out of scope
   xSemaphoreGive(tlsGate);
 
   Guard guard(mutex);
