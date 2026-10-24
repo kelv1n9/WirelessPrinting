@@ -61,6 +61,7 @@ DNSServer dns;
 #define LOG_PATH "/log/events.log"      // What happened, so a failure at night leaves something to read
 #define LOG_PREVIOUS "/log/events.1.log"
 #define LOG_MAX_BYTES 262144            // Rolled over at this size, so two files are the whole cost
+#define LOG_TAIL_BYTES 8192             // How much of it a read hands back: the server copies this again
 #define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
 #define DOWNLOAD_CACHE_BYTES 8192       // Bigger reads faster, but every byte here is a byte TLS cannot have
 #define BENCH_BURST_BYTES 65536      // Only the card bench uses this, and only while it runs
@@ -2446,7 +2447,29 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       request->send(404, "text/plain", "nothing recorded yet");
       return;
     }
-    request->send(SD_MMC, path, "text/plain");
+    // Handing over a quarter of a megabyte means reading the card from inside the
+    // network callback for seconds on end, which starves the loop until the watchdog
+    // reboots the module. The tail is what anyone reads anyway.
+    FileWrapper file = storageFS.open(path);
+    if (!file) {
+      request->send(404, "text/plain", "nothing recorded yet");
+      return;
+    }
+    const size_t size = file.size();
+    if (size > LOG_TAIL_BYTES)        // The whole of it would not fit in the heap, let alone quickly
+      file.seek(size - LOG_TAIL_BYTES);
+
+    String text;
+    text.reserve(LOG_TAIL_BYTES + 1);
+    static char block[2049] __attribute__((aligned(32)));
+    int taken;
+    while ((taken = file.read((uint8_t *)block, sizeof(block) - 1)) > 0) {
+      block[taken] = 0;
+      text += block;
+    }
+    file.close();
+
+    request->send(200, "text/plain; charset=utf-8", text);
   });
 
   server.on("/api/line", HTTP_GET, [](AsyncWebServerRequest * request) {
