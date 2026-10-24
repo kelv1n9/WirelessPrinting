@@ -683,62 +683,22 @@ void handlePrint() {
 
 // The server hands the body over in packets of about 1.4 KB. Writing each one straight
 // to the card costs a full FatFs round trip, and on a 20 MB file that is fourteen thousand
-// of them, so they are gathered here and written in one go. There are two of these: the
-// network fills one while the card swallows the other, because a write inside the network
-// callback holds off the acknowledgements and shrinks the window.
-// The card controller moves these over DMA, which wants a word aligned address. Without
-// the hint the driver quietly falls back to copying through a tiny bounce buffer, and
+// of them, so they are gathered here and written in one go.
+//
+// The card controller moves this over DMA, which wants a word aligned address. Without
+// the hint the driver quietly falls back to copying through a small bounce buffer, and
 // writing a megabyte takes thirteen seconds instead of half of one.
-static uint8_t uploadBuffer[2][UPLOAD_BUFFER_BYTES] __attribute__((aligned(32)));
-static uint8_t uploadSlot;
+static uint8_t uploadBuffer[UPLOAD_BUFFER_BYTES] __attribute__((aligned(32)));
 static size_t uploadBuffered;
 static uint32_t uploadTouchedAt;
 
-static FileWrapper uploadFile;          // Opened by the network, written only by the task below
-static QueueHandle_t uploadQueue;       // Full buffers on their way to the card
-static SemaphoreHandle_t uploadFree;    // Buffers the network is allowed to fill
-static bool uploadWriteFailed;
+static bool uploadFlush(FileWrapper &file) {
+  if (uploadBuffered == 0)
+    return true;
 
-struct UploadBlock {
-  uint8_t *data;
-  size_t len;
-};
-
-static void uploadWriter(void *) {
-  UploadBlock block;
-  for (;;) {
-    xQueueReceive(uploadQueue, &block, portMAX_DELAY);
-    if (block.len > 0 && uploadFile && !uploadWriteFailed && uploadFile.write(block.data, block.len) != block.len)
-      uploadWriteFailed = true;
-    xSemaphoreGive(uploadFree);
-  }
-}
-
-// Hands the buffer we hold to the card and claims the other one, waiting only if the
-// card has not finished with it yet.
-static void uploadHandOff() {
-  UploadBlock block = { uploadBuffer[uploadSlot], uploadBuffered };
+  const size_t pending = uploadBuffered;
   uploadBuffered = 0;
-  uploadSlot ^= 1;
-  xQueueSend(uploadQueue, &block, portMAX_DELAY);
-  xSemaphoreTake(uploadFree, portMAX_DELAY);
-}
-
-// Waits for the card to catch up, which it does once both buffers come back.
-static void uploadSettle() {
-  for (int i = 0; i < 2; i++)
-    xSemaphoreTake(uploadFree, portMAX_DELAY);
-  for (int i = 0; i < 2; i++)
-    xSemaphoreGive(uploadFree);
-}
-
-// A transfer that died mid-flight left a buffer claimed. Nothing is in flight by the
-// time anyone notices, so both can simply be declared free.
-static void uploadReset() {
-  while (xSemaphoreTake(uploadFree, 0) == pdTRUE)
-    ;
-  for (int i = 0; i < 2; i++)
-    xSemaphoreGive(uploadFree);
+  return file.write(uploadBuffer, pending) == pending;
 }
 
 // One file handle serves every upload, so a second client arriving mid-transfer would
@@ -753,19 +713,19 @@ static void refuseUpload(AsyncWebServerRequest *request) {
 }
 
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+  static FileWrapper file;
   static String path;
   static AsyncWebServerRequest *owner;
 
   if (!index) {
     // A dropped connection never delivers its final chunk, so the handle would stay
     // open and lock every later upload out. Silence for long enough means it is gone.
-    if (uploadFile && owner && owner != request) {
+    if (file && owner && owner != request) {
       if (millis() - uploadTouchedAt < UPLOAD_ABANDONED_AFTER) {
         refuseUpload(request);
         return;
       }
-      uploadReset();
-      uploadFile.close();
+      file.close();
       if (path != "")
         storageFS.remove(path);
       path = "";
@@ -773,15 +733,11 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
     }
     owner = request;
     uploadBuffered = 0;
-    uploadSlot = 0;
-    uploadWriteFailed = false;
-    if (uploadFile) {
-      uploadReset();
-      uploadFile.close();
+    if (file) {
+      file.close();
       if (path != "")
         storageFS.remove(path);
     }
-    xSemaphoreTake(uploadFree, portMAX_DELAY);    // The buffer this transfer starts in
     path = "";
     uploadFailure = "";
 
@@ -795,8 +751,8 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
     else if (request->contentLength() >= storageFS.freeBytes())
       uploadFailure = "not enough free space";
     else {
-      uploadFile = storageFS.open("/" + name, "w");
-      if (!uploadFile)
+      file = storageFS.open("/" + name, "w");
+      if (!file)
         uploadFailure = "cannot create file";
       else {
         path = "/" + name;
@@ -810,30 +766,27 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
 
   uploadTouchedAt = millis();
 
-  if (uploadFailure == "" && uploadFile) {
+  if (uploadFailure == "" && file) {
     size_t taken = 0;
     while (taken < len) {
       const size_t room = UPLOAD_BUFFER_BYTES - uploadBuffered;
       const size_t piece = room < len - taken ? room : len - taken;
-      memcpy(uploadBuffer[uploadSlot] + uploadBuffered, data + taken, piece);
+      memcpy(uploadBuffer + uploadBuffered, data + taken, piece);
       uploadBuffered += piece;
       taken += piece;
 
-      if (uploadBuffered == UPLOAD_BUFFER_BYTES)
-        uploadHandOff();
+      if (uploadBuffered == UPLOAD_BUFFER_BYTES && !uploadFlush(file)) {
+        uploadFailure = "write error, card full";
+        break;
+      }
     }
-    if (uploadWriteFailed)
-      uploadFailure = "write error, card full";
   }
 
   if (final) {
-    const UploadBlock last = { uploadBuffer[uploadSlot], uploadBuffered };
-    xQueueSend(uploadQueue, &last, portMAX_DELAY);  // Whatever is left over still belongs in the file
-    uploadSettle();                                 // Both buffers back means the card is done
-    if (uploadFile) {
-      if (uploadFailure == "" && uploadWriteFailed)
+    if (file) {
+      if (uploadFailure == "" && !uploadFlush(file))   // Whatever is left over still belongs in the file
         uploadFailure = "write error, card full";
-      uploadFile.close();
+      file.close();
     }
     uploadBuffered = 0;
     if (uploadFailure != "") {
@@ -1451,9 +1404,6 @@ function job(command) { fetch('/api/job', {method: 'POST', headers: {'Content-Ty
 
 void setup() {
   logMutex = xSemaphoreCreateMutex();   // Before anything can log
-  uploadQueue = xQueueCreate(2, sizeof(UploadBlock));
-  uploadFree = xSemaphoreCreateCounting(2, 2);
-  xTaskCreatePinnedToCore(uploadWriter, "upload", 4096, NULL, 2, NULL, 0);
   bootProbeResult = probeReceiveLine(BOOT_PROBE_MS);
   PrinterSerial.setRxBufferSize(PRINTER_SERIAL_RX_BUFFER);
 
@@ -1922,7 +1872,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
   });
 
   server.on("/bench/card", HTTP_GET, [](AsyncWebServerRequest * request) {
-    if (isPrinting || uploadFile || !storageFS.isActive()) {
+    if (isPrinting || !storageFS.isActive()) {
       request->send(409, "text/plain", "the card is busy");
       return;
     }
