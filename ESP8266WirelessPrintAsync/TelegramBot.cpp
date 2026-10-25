@@ -583,7 +583,9 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   }
 
   const uint32_t seconds = (millis() - started) / 1000;
-  send(chat, "Saved " + name + ", " + String(written / 1024) + " KB in " + String(seconds) + " s. "
+  send(chat, "Saved \u2014 " + name + "\n\n"
+             "Size       " + String(written / 1024) + " KB\n"
+             "Transfer   " + String(seconds) + " s\n\n"
              "Send /files to see it, /print <number> to start it.");
 }
 

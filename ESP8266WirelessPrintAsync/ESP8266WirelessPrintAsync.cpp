@@ -187,6 +187,7 @@ inline String IpAddress2String(const IPAddress& ipAddress) {
 }
 
 void logEvent(const String text);
+static String spell(const int32_t minutes);
 
 inline bool telnetReady() {
   return serverClient && serverClient.connected();
@@ -596,11 +597,13 @@ void handlePrint() {
         logFlush();
         // Before the socket is armed, because switching it off also switches off the
         // radio that would carry this.
-        telegramBot.notify(String(printEndedEarly ? "Print ended early: " : abortPrint ? "Print cancelled: " : "Print finished: ")
-                           + baseName(printingFile) + "\n"
-                           + String((millis() - printStartTime) / 60000) + " min, "
-                           + String(grams, 1) + " g, "
-                           + String(energyWh / 1000 * energyTariff + grams / 1000 * filamentPrice, 2) + " AZN");
+        telegramBot.notify(String(printEndedEarly ? "Print ended early" : abortPrint ? "Print cancelled" : "Print finished")
+                           + " \u2014 " + baseName(printingFile) + "\n\n"
+                           + "Duration   " + spell((millis() - printStartTime) / 60000) + "\n"
+                           + "Layers     " + String(currentLayer) + " / " + String(totalLayers) + "\n"
+                           + "Filament   " + String(grams, 1) + " g\n"
+                           + "Energy     " + String(energyWh, 0) + " Wh\n"
+                           + "Cost       " + String(energyWh / 1000 * energyTariff + grams / 1000 * filamentPrice, 2) + " AZN");
       }
       #ifdef DEAD_MAN_SECONDS
         commandQueue.push("M85 S0");     // Cooling down is silent, and silence must not kill the printer now
@@ -1245,6 +1248,16 @@ String fileListHtml() {
 
 inline String getState();
 
+// "3 h 48 min", or "47 min" when there is no hour to speak of.
+static String spell(const int32_t minutes) {
+  if (minutes < 0)
+    return "";
+  if (minutes < 60)
+    return String(minutes) + " min";
+
+  return String(minutes / 60) + " h " + String(minutes % 60) + " min";
+}
+
 // The bot's task only carries messages. Orders are carried out here, in the loop, so
 // nothing the printer owns is touched from two places at once.
 void handleTelegram() {
@@ -1273,34 +1286,54 @@ void handleTelegram() {
         "up to 20 MB, anything larger has to go through the slicer.");
     }
     else if (verb == "/status") {
-      String text = getState() + "\n"
-                    "Nozzle " + toolTemperature[0].actual + " / " + toolTemperature[0].target + "\n"
-                    "Bed " + bedTemperature.actual + " / " + bedTemperature.target + "\n";
+      String text;
+
       if (isPrinting) {
-        const int32_t elapsed = (millis() - printStartTime) / 1000;
-        const int32_t left = printCompletion > 0.5 ? (int32_t)(elapsed / printCompletion * (100 - printCompletion)) : -1;
-        text += baseName(printingFile) + "\n" +
-                String(printCompletion, 1) + "%, layer " + String(currentLayer) + "/" + String(totalLayers) + "\n" +
-                String(elapsed / 60) + " min in" +
-                (left >= 0 ? ", about " + String(left / 60) + " min left" : "") + "\n";
+        const int32_t elapsed = (millis() - printStartTime) / 60000;
+
+        // The slicer's own figure is worth more than anything we can work out here.
+        // Failing that, elapsed time divided by progress is only meaningful once the
+        // print is properly under way: the first minutes are heating and a slow first
+        // layer, and extrapolating from those said twenty-five hours on a four hour job.
+        String left = "working it out";
+        if (slicerMinutesLeft >= 0)
+          left = spell(slicerMinutesLeft);
+        else if (printCompletion >= 5 && elapsed >= 10)
+          left = "about " + spell((int32_t)(elapsed / printCompletion * (100 - printCompletion)));
+
+        text = (printPause ? "Paused" : "Printing") + String(" \u2014 ") + String(printCompletion, 1) + "%\n"
+             + baseName(printingFile) + "\n\n"
+             + "Layer      " + String(currentLayer) + " / " + String(totalLayers) + "\n"
+             + "Elapsed    " + spell(elapsed) + "\n"
+             + "Remaining  " + left + "\n";
       }
-      else
-        text += "Selected: " + (selectedFile == "" ? String("nothing") : baseName(selectedFile)) + "\n";
+      else {
+        text = getState() + "\n"
+             + "Selected   " + (selectedFile == "" ? String("nothing") : baseName(selectedFile)) + "\n\n";
+      }
+
+      text += "Nozzle     " + toolTemperature[0].actual
+            + (toolTemperature[0].target.toFloat() > 0 ? " / " + toolTemperature[0].target : String(" (off)")) + "\n"
+            + "Bed        " + bedTemperature.actual
+            + (bedTemperature.target.toFloat() > 0 ? " / " + bedTemperature.target : String(" (off)")) + "\n";
+
       const float watts = yandexHome.getPower();
       if (watts >= 0)
-        text += String(watts, 1) + " W\n";
+        text += "Power      " + String(watts, 0) + " W\n";
+
       telegramBot.send(chat, text);
     }
     else if (verb == "/files") {
       String listing;
       storedFile(0, listing);
-      telegramBot.send(chat, listing == "" ? "The card is empty." : listing + "\nSend /print <number> to start one.");
+      telegramBot.send(chat, listing == "" ? "The card is empty."
+                                           : "On the card\n\n" + listing + "\nSend /print <number> to start one.");
     }
     else if (verb == "/print") {
       String listing;
       const String wanted = storedFile(rest.toInt(), listing);
       if (isPrinting)
-        telegramBot.send(chat, "Already printing " + baseName(printingFile) + ".");
+        telegramBot.send(chat, "Already printing \u2014 " + baseName(printingFile));
       else if (!printerConnected)
         telegramBot.send(chat, "The printer is not answering.");
       else if (rest.toInt() <= 0 || wanted == "")
@@ -1308,7 +1341,7 @@ void handleTelegram() {
       else {
         selectFile(wanted);
         startPrint = true;
-        telegramBot.send(chat, "Starting " + baseName(wanted) + ".");
+        telegramBot.send(chat, "Starting \u2014 " + baseName(wanted) + "\nSend /status to follow it.");
       }
     }
     else if (verb == "/stop") {
@@ -1319,12 +1352,12 @@ void handleTelegram() {
       else if (rest == "yes" || awaitingStop == chat) {
         cancelPrint = true;
         awaitingStop = "";
-        telegramBot.send(chat, "Cancelling " + baseName(printingFile) + ".");
+        telegramBot.send(chat, "Cancelling \u2014 " + baseName(printingFile));
       }
       else {
         awaitingStop = chat;
         telegramBot.send(chat, "Cancel " + baseName(printingFile) + " at " + String(printCompletion, 1)
-                               + "%? Send /stop again to confirm.");
+                               + "%?\nSend /stop again to confirm.");
       }
     }
     else if (verb == "/off") {
