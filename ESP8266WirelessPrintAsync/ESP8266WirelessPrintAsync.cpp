@@ -79,6 +79,7 @@ DNSServer dns;
 #define CONSOLE_LINES 60                // What the page can scroll back through
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define MDNS_HOSTNAME "kp3s"            // http://kp3s.local, rather than the chip id nobody can type
+#define LOCAL_TIMEZONE "<+04>-4"        // Baku, four hours ahead and no daylight saving since 2016
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
 #define LINE_PROBE_MS 3000              // Long enough to catch a printer that only speaks now and then
@@ -1340,17 +1341,36 @@ void handleTelegram() {
         // Failing that, elapsed time divided by progress is only meaningful once the
         // print is properly under way: the first minutes are heating and a slow first
         // layer, and extrapolating from those said twenty-five hours on a four hour job.
+        int32_t minutesLeft = -1;
         String left = "working it out";
-        if (slicerMinutesLeft >= 0)
-          left = spell(slicerMinutesLeft);
-        else if (printCompletion >= 5 && elapsed >= 10)
-          left = "about " + spell((int32_t)(elapsed / printCompletion * (100 - printCompletion)));
+        if (slicerMinutesLeft >= 0) {
+          minutesLeft = slicerMinutesLeft;
+          left = spell(minutesLeft);
+        }
+        else if (printCompletion >= 5 && elapsed >= 10) {
+          minutesLeft = (int32_t)(elapsed / printCompletion * (100 - printCompletion));
+          left = "about " + spell(minutesLeft);
+        }
 
         text = (printPause ? "Paused" : "Printing") + String(" \u2014 ") + String(printCompletion, 1) + "%\n"
              + baseName(printingFile) + "\n\n"
              + "Layer      " + String(currentLayer) + " / " + String(totalLayers) + "\n"
              + "Elapsed    " + spell(elapsed) + "\n"
              + "Remaining  " + left + "\n";
+
+        // Only worth saying once the clock has been set and there is a figure to add to it.
+        const time_t now = time(NULL);
+        if (minutesLeft >= 0 && now > 1700000000) {
+          const time_t when = now + minutesLeft * 60;
+          struct tm today, ending;
+          char clock[24] = "";
+          if (localtime_r(&now, &today) && localtime_r(&when, &ending))
+            // A print that runs past midnight needs the day said as well, or the time
+            // on its own reads as earlier today.
+            strftime(clock, sizeof(clock), ending.tm_yday == today.tm_yday ? "%H:%M" : "%H:%M, %a %d %b", &ending);
+          if (clock[0])
+            text += "Finishes   " + String(clock) + "\n";
+        }
       }
       else {
         text = getState() + "\n"
@@ -1665,7 +1685,7 @@ void setup() {
   esp_wifi_set_max_tx_power(80);              // 20 dBm, as high as the radio goes
   setCpuFrequencyMhz(240);
   wifiDownSince = millis();
-  configTzTime("UTC0", "pool.ntp.org", "time.google.com");
+  configTzTime(LOCAL_TIMEZONE, "pool.ntp.org", "time.google.com");
 
   telnetServer.begin();
   telnetServer.setNoDelay(true);
