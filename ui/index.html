@@ -95,6 +95,51 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
 .hide{display:none!important}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#20252d;border:1px solid var(--line);padding:10px 18px;border-radius:9px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:9}
 #toast.on{opacity:1}
+
+/* A phone is 375 points wide. The files table cannot hold a thumbnail, a long name
+   and three buttons across that, and when it tries the name ends up one letter per
+   line, so on a narrow screen each row becomes a little card instead. */
+@media(max-width:560px){
+  header{padding:11px 14px;gap:9px}
+  header .meta{font-size:11px;gap:10px;width:100%;order:5}
+  header .row{width:100%;order:6}
+  header .row button{flex:1}
+  .spacer{display:none}
+
+  main{padding:12px;gap:12px}
+  section{padding:14px;border-radius:11px}
+
+  .job{gap:12px}
+  .thumb{width:84px;height:84px}
+  .pct{font-size:34px}
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px}
+  .kv .v{font-size:15px}
+
+  #filesec table,#filesec tbody,#filesec tr,#filesec td{display:block;width:auto}
+  #filesec tr{position:relative;padding:11px 0 11px 52px;min-height:52px;border-bottom:1px solid var(--line)}
+  #filesec tr:last-child{border-bottom:0}
+  #filesec td{border:0;padding:0}
+  #filesec .thumbcell{position:absolute;left:0;top:11px;width:40px}
+  #filesec .nm{word-break:break-word;margin-bottom:9px;line-height:1.35}
+  #filesec .acts{width:auto;white-space:normal}
+  #filesec .acts .row{justify-content:flex-start;flex-wrap:wrap}
+  #filesec tr.sel td{background:transparent}
+  #filesec tr.sel{background:#161d2a;border-radius:9px;padding-left:52px}
+
+  #bprint,#bcancel{flex:1;white-space:nowrap;padding:10px 6px}
+  #jobsec label{width:100%;text-align:left}
+  #conlog{height:190px}
+  button{padding:9px 14px}
+  progress{width:120px}
+}
+
+/* Narrower still, and the preview earns its place less than the name does. */
+@media(max-width:360px){
+  .grid{grid-template-columns:1fr 1fr;gap:10px}
+  #filesec tr{padding-left:0}
+  #filesec tr.sel{padding:11px 10px}
+  #filesec .thumbcell{display:none}
+}
 </style>
 
 <header>
