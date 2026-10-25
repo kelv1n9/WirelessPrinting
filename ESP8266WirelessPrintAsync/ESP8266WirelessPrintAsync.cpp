@@ -76,6 +76,7 @@ DNSServer dns;
 #define REMOUNT_INTERVAL 30000          // How often to try the card again once it has gone
 #define CONSOLE_LINES 60                // What the page can scroll back through
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
+#define MDNS_HOSTNAME "kp3s"            // http://kp3s.local, rather than the chip id nobody can type
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
 #define LINE_PROBE_MS 3000              // Long enough to catch a printer that only speaks now and then
@@ -962,9 +963,9 @@ inline String getDeviceName() {
 
 void mDNSInit() {
   #ifdef OTA_UPDATES
-    MDNS.setInstanceName(getDeviceId().c_str());    // Can't call MDNS.init because it has been already done by 'ArduinoOTA.begin', here I just change instance name
+    MDNS.setInstanceName(getDeviceName().c_str());  // Can't call MDNS.init because 'ArduinoOTA.begin' already did, so only the shown name is changed here
   #else
-    if (!MDNS.begin(getDeviceId().c_str()))
+    if (!MDNS.begin(MDNS_HOSTNAME))
       return;
   #endif
 
@@ -2606,7 +2607,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 
   #ifdef OTA_UPDATES
     // OTA setup
-    ArduinoOTA.setHostname(getDeviceId().c_str());
+    ArduinoOTA.setHostname(MDNS_HOSTNAME);     // This is also the name the network answers to
     #ifdef OTA_PASSWORD
       ArduinoOTA.setPassword(OTA_PASSWORD);
     #endif
