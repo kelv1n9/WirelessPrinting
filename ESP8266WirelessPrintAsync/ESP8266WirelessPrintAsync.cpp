@@ -1263,30 +1263,41 @@ bool firmwareBegin() {
   lcd("Updating...");
   logEvent("firmware over telegram started");
   logFlush();
-  updateRunning = true;      // Writing the flash stalls everything that reads from it
+  updateTouchedAt = millis();   // The loop gives up on an upload that stops moving, and
+  updateRunning = true;         // an unmarked one looks stopped from the moment it starts
   PrinterSerial.end();
 
   return true;
 }
 
 bool firmwareChunk(uint8_t *data, const size_t len) {
+  updateTouchedAt = millis();
+
   return Update.isRunning() && Update.write(data, len) == len;
 }
 
-// Returns what went wrong, or nothing at all when the image is in and sound.
+// Returns what went wrong, or nothing at all when the image is in and sound. The reason
+// is read before anything is aborted, because aborting overwrites it with "Aborted".
 String firmwareEnd(const bool whole) {
-  const bool good = whole && Update.end(true);
-  if (!good)
+  String trouble;
+
+  if (!whole) {
+    trouble = "the transfer stopped early";
     Update.abort();
+  }
+  else if (!Update.end(true)) {
+    trouble = String(Update.errorString()) + " (wrote " + String(Update.progress()) + " bytes)";
+    Update.abort();
+  }
 
   updateRunning = false;
-  if (!good)
+  if (trouble != "")
     PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
 
-  logEvent(good ? "firmware over telegram done" : "firmware over telegram failed: " + String(Update.errorString()));
+  logEvent(trouble == "" ? "firmware over telegram done" : "firmware over telegram failed: " + trouble);
   logFlush();
 
-  return good ? String("") : String(Update.errorString());
+  return trouble;
 }
 
 void firmwareReboot() {
@@ -2174,6 +2185,19 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
   // Two ceiling tests, so a slow transfer can be blamed on the right half of the machine.
   // /bench/net sends made up bytes and never touches the card; /bench/card works the card
   // and never touches the network until it reports.
+  server.on("/bench/ota", HTTP_GET, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("url")) {
+      request->send(400, "text/plain", "url is required");
+      return;
+    }
+    if (isPrinting) {
+      request->send(409, "text/plain", "a print is running");
+      return;
+    }
+    telegramBot.probe(request->getParam("url")->value());
+    request->send(202, "text/plain", "walking it, watch the journal\n");
+  });
+
   server.on("/bench/power", HTTP_GET, [](AsyncWebServerRequest * request) {
     if (request->hasParam("set"))
       esp_wifi_set_max_tx_power(request->getParam("set")->value().toInt());

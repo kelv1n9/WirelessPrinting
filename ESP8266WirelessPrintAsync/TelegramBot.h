@@ -25,6 +25,7 @@ class TelegramBot {
 
     static String getStatus();
     static bool receiving();      // A file is landing on the card, so nothing else may write
+    static void probe(const String url);   // Walks the firmware path against a URL of our own
 
     // The loop's side of the wall
     static bool nextCommand(String &chat, String &text);
@@ -47,6 +48,9 @@ class TelegramBot {
     static String waitingChat, waitingId, waitingName;   // A document asked for, fetched once the
     static size_t waitingSize;                           // answer it arrived in has been let go
     static volatile bool landing;
+    static String probeUrl;
+
+    static void takeFirmware(const String url, const String chat);
 
     static void run(void *argument);
     static bool poll();

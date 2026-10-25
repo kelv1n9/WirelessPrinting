@@ -77,6 +77,7 @@ String TelegramBot::waitingChat, TelegramBot::waitingId, TelegramBot::waitingNam
 size_t TelegramBot::waitingSize = 0;
 int64_t TelegramBot::offset = -1;
 volatile bool TelegramBot::landing = false;
+String TelegramBot::probeUrl;
 static bool telegramPrimed = false;      // The first answer is only read for its place in the queue
 
 class Hold {
@@ -500,9 +501,17 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
     return;
   }
 
+  // Telegram does not always answer the first time, and giving up on one timeout means
+  // giving up on the whole transfer.
   String body;
-  if (!call("/getFile?file_id=" + fileId, body, TELEGRAM_TIMEOUT)) {
-    send(chat, "Could not ask where that file is: " + getStatus() + ", heap " + String(ESP.getFreeHeap()));
+  bool asked = false;
+  for (int attempt = 0; attempt < 3 && !asked; attempt++) {
+    if (attempt)
+      vTaskDelay(pdMS_TO_TICKS(1500));
+    asked = call("/getFile?file_id=" + fileId, body, TELEGRAM_TIMEOUT);
+  }
+  if (!asked) {
+    send(chat, "Could not ask where that file is after three tries: " + getStatus());
     return;
   }
 
@@ -526,7 +535,17 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
     secret = token;
   }
 
+  // Opening the flash erases two megabytes of it, which takes seconds and keeps the
+  // processor to itself. Done after the connection was open, Telegram hung up on the
+  // silence before the first byte ever arrived, so it happens first now.
+  if (firmware && !firmwareBegin()) {
+    send(chat, "The module would not open its flash for writing.");
+    return;
+  }
+
   if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(30000)) != pdTRUE) {
+    if (firmware)
+      firmwareEnd(false);
     send(chat, "Busy talking to the socket, try again in a moment.");
     return;
   }
@@ -539,6 +558,8 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   http.setTimeout(TELEGRAM_TIMEOUT);
   if (!http.begin(client, String(TELEGRAM_HOST) + "/file/bot" + secret + "/" + remote)) {
     xSemaphoreGive(tlsGate);
+    if (firmware)
+      firmwareEnd(false);
     send(chat, "Could not reach Telegram for the file itself.");
     return;
   }
@@ -546,22 +567,15 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   if (http.GET() != 200) {
     http.end();
     xSemaphoreGive(tlsGate);
+    if (firmware)
+      firmwareEnd(false);
     send(chat, "Telegram refused to hand the file over.");
     return;
   }
 
   landing = true;
   FileWrapper card;
-  if (firmware) {
-    if (!firmwareBegin()) {
-      landing = false;
-      http.end();
-      xSemaphoreGive(tlsGate);
-      send(chat, "The module would not open its flash for writing.");
-      return;
-    }
-  }
-  else {
+  if (!firmware) {
     card = storageFS.open("/" + name, "w");
     if (!card) {
       landing = false;
@@ -617,9 +631,11 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   const uint32_t seconds = (millis() - started) / 1000;
 
   if (firmware) {
-    if (!whole || trouble != "") {
-      send(chat, "Firmware not flashed \u2014 " + (trouble != "" ? trouble : String("the file did not arrive whole"))
-                 + "\nThe module is still running what it ran before.");
+    if (trouble != "") {
+      send(chat, "Firmware not flashed \u2014 " + trouble + "\n\n"
+                 "Received   " + String(written) + " of " + String(size) + " bytes\n"
+                 "Elapsed    " + String(seconds) + " s\n\n"
+                 "The module is still running what it ran before.");
       return;
     }
 
@@ -644,6 +660,125 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
              "Send /files to see it, /print <number> to start it.");
 }
 
+void TelegramBot::probe(const String url) {
+  probeUrl = url;
+}
+
+// The firmware path on its own, so it can be walked against a server of our own instead
+// of through Telegram, and every step of it says where it got to.
+void TelegramBot::takeFirmware(const String url, const String chat) {
+  trail("ota: starting, heap " + String(ESP.getFreeHeap()));
+
+  if (!firmwareBegin()) {
+    trail("ota: the flash would not open");
+    return;
+  }
+  trail("ota: flash open, heap " + String(ESP.getFreeHeap()));
+
+  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(30000)) != pdTRUE) {
+    firmwareEnd(false);
+    trail("ota: the other connection would not let go");
+    return;
+  }
+
+  WiFiClientSecure client;
+  if (url.startsWith("https://api.telegram.org"))
+    client.setCACert(TELEGRAM_ROOT_CA);
+  else
+    client.setInsecure();               // Only ever our own server, for walking this path
+  client.setTimeout(TELEGRAM_TIMEOUT / 1000);
+
+  HTTPClient http;
+  http.setTimeout(TELEGRAM_TIMEOUT);
+  if (!http.begin(client, url)) {
+    xSemaphoreGive(tlsGate);
+    firmwareEnd(false);
+    trail("ota: could not open the connection");
+    return;
+  }
+
+  const int code = http.GET();
+  const int length = http.getSize();
+  trail("ota: answer " + String(code) + ", length " + String(length)
+        + ", connected " + String(http.connected() ? "yes" : "no")
+        + ", heap " + String(ESP.getFreeHeap()));
+
+  if (code != 200) {
+    http.end();
+    xSemaphoreGive(tlsGate);
+    firmwareEnd(false);
+    trail("ota: refused");
+    return;
+  }
+
+  static uint8_t buffer[TELEGRAM_CHUNK] __attribute__((aligned(32)));
+  WiFiClient *stream = http.getStreamPtr();
+  const size_t expected = length > 0 ? (size_t)length : 0;
+  size_t written = 0;
+  bool good = true;
+  uint32_t quiet = millis();
+  const uint32_t started = millis();
+
+  while (expected == 0 || written < expected) {
+    const size_t waiting = stream->available();
+    if (!waiting) {
+      if (!http.connected() && !stream->available()) {
+        trail("ota: the other end hung up after " + String(written) + " bytes");
+        break;
+      }
+      if (millis() - quiet > 30000) {
+        trail("ota: nothing arrived for thirty seconds, " + String(written) + " bytes in");
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+    quiet = millis();
+
+    const size_t taken = stream->readBytes(buffer, waiting > TELEGRAM_CHUNK ? TELEGRAM_CHUNK : waiting);
+    if (written == 0 && (taken == 0 || buffer[0] != 0xE9)) {
+      trail("ota: that is not an image for this chip");
+      good = false;
+      break;
+    }
+    if (!firmwareChunk(buffer, taken)) {
+      trail("ota: the flash refused a block at " + String(written));
+      good = false;
+      break;
+    }
+    written += taken;
+    if ((written & 0x3FFFF) < TELEGRAM_CHUNK)
+      trail("ota: " + String(written / 1024) + " KB in, heap " + String(ESP.getFreeHeap()));
+  }
+
+  const bool whole = good && expected && written == expected;
+  const String trouble = firmwareEnd(whole);
+  http.end();
+  xSemaphoreGive(tlsGate);
+
+  const uint32_t seconds = (millis() - started) / 1000;
+  trail("ota: " + String(trouble == "" ? "flashed" : "failed, " + trouble)
+        + ", " + String(written) + " of " + String(expected) + " bytes in " + String(seconds) + " s");
+
+  if (chat != "") {
+    if (trouble != "")
+      send(chat, "Firmware not flashed \u2014 " + trouble + "\n\n"
+                 "Received   " + String(written) + " of " + String(expected) + " bytes\n"
+                 "Elapsed    " + String(seconds) + " s\n\n"
+                 "The module is still running what it ran before.");
+    else {
+      send(chat, "Firmware flashed\n\n"
+                 "Size       " + String(written / 1024) + " KB\n"
+                 "Transfer   " + String(seconds) + " s\n\n"
+                 "Rebooting. Send /status in half a minute.");
+      flush();
+    }
+  }
+
+  if (trouble == "")
+    firmwareReboot();
+}
+
 void TelegramBot::run(void *argument) {
   int failures = 0;
 
@@ -664,6 +799,12 @@ void TelegramBot::run(void *argument) {
       failures++;
 
     vTaskDelay(pdMS_TO_TICKS(failures ? 1000 << (failures - 1) : 50));
+
+    if (probeUrl != "") {
+      const String url = probeUrl;
+      probeUrl = "";
+      takeFirmware(url, "");
+    }
 
     if (waitingId != "") {
       const String chat = waitingChat, id = waitingId, name = waitingName;
