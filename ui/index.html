@@ -338,9 +338,37 @@ function render(d){
   $('bpower').disabled = d.printing || !d.socket.token || !d.socket.device;
 }
 
+// The module has a few tens of kilobytes to spare, and a browser asking for every
+// preview at once was enough to run it out of memory and reboot it. They are fetched
+// one after another instead.
+let thumbQueue = [], thumbBusy = false;
+
+function queueThumb(img, name){
+  thumbQueue.push([img, name, 0]);
+  nextThumb();
+}
+
+function nextThumb(){
+  if (thumbBusy || !thumbQueue.length) return;
+  thumbBusy = true;
+  const [img, name, tries] = thumbQueue.shift();
+  const done = () => { thumbBusy = false; setTimeout(nextThumb, 60); };
+  img.onload = done;
+  img.onerror = () => {
+    // The module turns these away while it is short of memory, so one refusal is
+    // worth sleeping on rather than giving up over.
+    if (tries < 1) thumbQueue.push([img, name, tries + 1]);
+    else img.classList.add('noimg');
+    thumbBusy = false;
+    setTimeout(nextThumb, 700);
+  };
+  img.src = '/thumbnail?name=' + encodeURIComponent(name) + (tries ? '&again=' + tries : '');
+}
+
 function renderFiles(sel){
   const tb = $('ftab');
   tb.textContent = '';
+  thumbQueue = [];
   if (!files.length) { tb.insertRow().insertCell().innerHTML = '<span class="dim">card is empty</span>'; return; }
   for (const f of files) {
     const tr = tb.insertRow();
@@ -348,8 +376,7 @@ function renderFiles(sel){
     tr.onclick = () => act('/select?name=' + encodeURIComponent(f.name));
     const img = document.createElement('img');
     img.className = 'tmini'; img.loading = 'lazy'; img.alt = '';
-    img.onerror = () => img.classList.add('noimg');
-    img.src = '/thumbnail?name=' + encodeURIComponent(f.name);
+    queueThumb(img, f.name);
     const t = tr.insertCell(); t.className = 'thumbcell'; t.append(img);
     const n = tr.insertCell(); n.className = 'nm'; n.textContent = f.name;
     const a = tr.insertCell(); a.className = 'acts';

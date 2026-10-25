@@ -29,7 +29,7 @@ extern bool isPrinting;
 #define TELEGRAM_JSON    4096
 #define TELEGRAM_REPLY_GRACE 1500      // How long to let the loop answer before asking again
 #define TELEGRAM_MAX_FILE (20UL * 1024 * 1024)   // The bot API will not hand over more
-#define TELEGRAM_CHUNK   4096
+#define TELEGRAM_CHUNK   2048
 #define TELEGRAM_SEEN_MAX 5
 #define TELEGRAM_HEAP_FLOOR 70000      // Encryption needs a big unbroken block, and failing
                                        // to get one leaves rubbish behind every time

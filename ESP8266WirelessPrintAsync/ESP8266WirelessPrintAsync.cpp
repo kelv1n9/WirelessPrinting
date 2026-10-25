@@ -63,9 +63,11 @@ DNSServer dns;
 #define LOG_MAX_BYTES 262144            // Rolled over at this size, so two files are the whole cost
 #define LOG_TAIL_BYTES 4096             // How much of it a read hands back: the server copies this again
 #define LOG_BUFFER_BYTES 1024           // Held in memory between writes to keep the card off the hot path
-#define DOWNLOAD_CACHE_BYTES 8192       // Bigger reads faster, but every byte here is a byte TLS cannot have
+#define DOWNLOAD_CACHE_BYTES 4096       // Bigger reads faster, but every byte here is a byte TLS cannot have
 #define BENCH_BURST_BYTES 65536      // Only the card bench uses this, and only while it runs
-#define UPLOAD_BUFFER_BYTES 16384       // Gathered before touching the card, one FatFs trip instead of eleven
+#define UPLOAD_BUFFER_BYTES 8192        // Gathered before touching the card. The card writes at 2.8 MB/s
+                                       // and the link delivers 220 KB/s, so a larger one buys nothing and
+                                       // every byte of it is a byte the encryption cannot have.
 #define UPLOAD_ABANDONED_AFTER 10000  // A transfer that has gone quiet this long has lost its client
 #define SERIAL_LINES_PER_LOOP 40        // Replies handled per pass, so a shouting printer cannot starve the loop
 #define LOG_FLUSH_INTERVAL 5000
@@ -820,6 +822,8 @@ bool isInterfaceFilename(const String name) {
 
   String lowercase = name;
   lowercase.toLowerCase();
+  if (lowercase.endsWith(".gz"))       // index.html.gz is served compressed, and is a third the size
+    lowercase = lowercase.substring(0, lowercase.length() - 3);
 
   return lowercase.endsWith(".html") || lowercase.endsWith(".css") || lowercase.endsWith(".js") ||
          lowercase.endsWith(".json") || lowercase.endsWith(".svg") || lowercase.endsWith(".png") ||
@@ -850,6 +854,13 @@ void handleInterfaceUpload(AsyncWebServerRequest *request, String filename, size
       uploadFailure = "not enough free space";
     else {
       storageFS.mkdir("/ui");
+      // The server prefers the plain file when both are there, so the one being
+      // replaced goes, whichever of the pair it is.
+      if (name.endsWith(".gz"))
+        storageFS.remove("/ui/" + name.substring(0, name.length() - 3));
+      else
+        storageFS.remove("/ui/" + name + ".gz");
+
       file = storageFS.open("/ui/" + name, "w");
       if (!file)
         uploadFailure = "cannot create file";
@@ -1984,6 +1995,13 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       return;
     }
 
+    // Decoding one of these needs room three times over, and a browser asks for every
+    // file at once. Saying no costs a grey square; running out costs a reboot.
+    if (ESP.getFreeHeap() < 60000) {
+      request->send(503, "text/plain", "busy");
+      return;
+    }
+
     FileWrapper file = storageFS.open("/" + sanitizeFilename(request->getParam("name")->value()));
     if (!file) {
       request->send(404, "text/plain", "no such file");
@@ -2487,7 +2505,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 
     String text;
     text.reserve(LOG_TAIL_BYTES + 1);
-    static char block[2049] __attribute__((aligned(32)));
+    static char block[1025] __attribute__((aligned(32)));
     int taken;
     while ((taken = file.read((uint8_t *)block, sizeof(block) - 1)) > 0) {
       block[taken] = 0;
