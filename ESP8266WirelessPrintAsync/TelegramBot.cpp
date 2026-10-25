@@ -21,6 +21,10 @@ static void trail(const String text) {
 
 extern String sanitizeFilename(const String filename);
 extern bool isPrinting;
+extern bool firmwareBegin();
+extern bool firmwareChunk(uint8_t *data, const size_t len);
+extern String firmwareEnd(const bool whole);
+extern void firmwareReboot();
 
 #define TELEGRAM_HOST    "https://api.telegram.org"
 #define TELEGRAM_STACK   16384         // The handshake checks a chain of three and needs the room
@@ -474,15 +478,24 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   }
 
   const String name = sanitizeFilename(fileName);
-  if (!name.endsWith(".gcode") && !name.endsWith(".gco") && !name.endsWith(".g")) {
-    send(chat, "Only gcode files, this one is " + name);
+  const bool firmware = name.endsWith(".bin");
+
+  if (firmware) {
+    // Flashing ends in a reboot, and a reboot in the middle of a print ends the print.
+    if (isPrinting) {
+      send(chat, "A print is running. Firmware has to wait for it to finish.");
+      return;
+    }
+  }
+  else if (!name.endsWith(".gcode") && !name.endsWith(".gco") && !name.endsWith(".g")) {
+    send(chat, "Send a .gcode file for the card, or a .bin to flash the module. This one is " + name);
     return;
   }
-  if (!storageFS.isActive()) {
+  else if (!storageFS.isActive()) {
     send(chat, "No card in the module.");
     return;
   }
-  if (size >= storageFS.freeBytes()) {
+  else if (size >= storageFS.freeBytes()) {
     send(chat, "Not enough room on the card.");
     return;
   }
@@ -538,13 +551,25 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   }
 
   landing = true;
-  FileWrapper card = storageFS.open("/" + name, "w");
-  if (!card) {
-    landing = false;
-    http.end();
-    xSemaphoreGive(tlsGate);
-    send(chat, "Could not create " + name + " on the card.");
-    return;
+  FileWrapper card;
+  if (firmware) {
+    if (!firmwareBegin()) {
+      landing = false;
+      http.end();
+      xSemaphoreGive(tlsGate);
+      send(chat, "The module would not open its flash for writing.");
+      return;
+    }
+  }
+  else {
+    card = storageFS.open("/" + name, "w");
+    if (!card) {
+      landing = false;
+      http.end();
+      xSemaphoreGive(tlsGate);
+      send(chat, "Could not create " + name + " on the card.");
+      return;
+    }
   }
 
   // Aligned, because the card controller moves this over DMA and an odd address makes
@@ -564,25 +589,55 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
       continue;
     }
     const size_t taken = stream->readBytes(buffer, waiting > TELEGRAM_CHUNK ? TELEGRAM_CHUNK : waiting);
-    if (card.write(buffer, taken) != taken) {
+
+    // An image for this chip starts with 0xE9, and a gcode file sent by mistake would
+    // otherwise be written over the firmware before anyone noticed.
+    if (firmware && written == 0 && (taken == 0 || buffer[0] != 0xE9)) {
+      good = false;
+      break;
+    }
+
+    if (!(firmware ? firmwareChunk(buffer, taken) : card.write(buffer, taken) == taken)) {
       good = false;
       break;
     }
     written += taken;
   }
 
-  card.close();
+  const bool whole = good && (!size || written == size);
+  String trouble;
+  if (firmware)
+    trouble = firmwareEnd(whole);
+  else
+    card.close();
   http.end();
   xSemaphoreGive(tlsGate);
   landing = false;
 
-  if (!good || (size && written != size)) {
+  const uint32_t seconds = (millis() - started) / 1000;
+
+  if (firmware) {
+    if (!whole || trouble != "") {
+      send(chat, "Firmware not flashed \u2014 " + (trouble != "" ? trouble : String("the file did not arrive whole"))
+                 + "\nThe module is still running what it ran before.");
+      return;
+    }
+
+    send(chat, "Firmware flashed \u2014 " + name + "\n\n"
+               "Size       " + String(written / 1024) + " KB\n"
+               "Transfer   " + String(seconds) + " s\n\n"
+               "Rebooting. Send /status in half a minute.");
+    flush();                 // The answer has to be out before the module goes down
+    firmwareReboot();
+    return;
+  }
+
+  if (!whole) {
     storageFS.remove("/" + name);
     send(chat, "The file did not arrive whole, nothing was kept.");
     return;
   }
 
-  const uint32_t seconds = (millis() - started) / 1000;
   send(chat, "Saved \u2014 " + name + "\n\n"
              "Size       " + String(written / 1024) + " KB\n"
              "Transfer   " + String(seconds) + " s\n\n"

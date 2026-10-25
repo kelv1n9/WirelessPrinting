@@ -1248,6 +1248,50 @@ String fileListHtml() {
 
 inline String getState();
 
+// Taking firmware over the bot's connection, with the flash handling kept here where
+// everything it has to put aside already lives.
+bool firmwareBegin() {
+  if (isPrinting || updateRunning)
+    return false;
+
+  if (Update.isRunning())
+    Update.abort();
+  if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+    return false;
+
+  lcd("Updating...");
+  logEvent("firmware over telegram started");
+  logFlush();
+  updateRunning = true;      // Writing the flash stalls everything that reads from it
+  PrinterSerial.end();
+
+  return true;
+}
+
+bool firmwareChunk(uint8_t *data, const size_t len) {
+  return Update.isRunning() && Update.write(data, len) == len;
+}
+
+// Returns what went wrong, or nothing at all when the image is in and sound.
+String firmwareEnd(const bool whole) {
+  const bool good = whole && Update.end(true);
+  if (!good)
+    Update.abort();
+
+  updateRunning = false;
+  if (!good)
+    PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
+
+  logEvent(good ? "firmware over telegram done" : "firmware over telegram failed: " + String(Update.errorString()));
+  logFlush();
+
+  return good ? String("") : String(Update.errorString());
+}
+
+void firmwareReboot() {
+  ESPrestartRequired = true;
+}
+
 // "3 h 48 min", or "47 min" when there is no hour to speak of.
 static String spell(const int32_t minutes) {
   if (minutes < 0)
@@ -1282,8 +1326,9 @@ void handleTelegram() {
         "/print <number> - start that file\n"
         "/stop - cancel the running print\n"
         "/off - cut power at the socket\n\n"
-        "Send a .gcode file to put it on the card. Telegram only lets a bot fetch files "
-        "up to 20 MB, anything larger has to go through the slicer.");
+        "Send a .gcode file and it goes on the card. Send a .bin and the module flashes "
+        "itself with it and reboots, which it will not do while a print is running. "
+        "Telegram only lets a bot fetch files up to 20 MB.");
     }
     else if (verb == "/status") {
       String text;
