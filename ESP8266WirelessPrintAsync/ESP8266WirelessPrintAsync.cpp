@@ -2106,8 +2106,8 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 
     // Decoding one of these needs room three times over, and a browser asks for every
     // file at once. Saying no costs a grey square; running out costs a reboot.
-    if (ESP.getFreeHeap() < 60000) {
-      request->send(503, "text/plain", "busy");
+    if (ESP.getFreeHeap() < 80000) {
+      request->send(503, "text/plain", "busy");   // The page waits and asks again
       return;
     }
 
@@ -2174,6 +2174,7 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
       request->send(404, "text/plain", "broken preview");
       return;
     }
+    encoded = String();        // Three copies of the picture were alive at once until here
 
     AsyncResponseStream *response = request->beginResponseStream("image/png", length + 64);
     response->write(decoded, length);
