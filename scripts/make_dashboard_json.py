@@ -31,19 +31,19 @@ def main():
             "day": when.strftime("%Y-%m-%d"),
             "at": job["at"],
             "name": job["name"],
-            "outcome": "завершена" if job["how"] == "complete"
-                       else ("отменена" if job["how"] == "cancelled" else "прервана"),
+            "outcome": "completed" if job["how"] == "complete"
+                       else ("cancelled" if job["how"] == "cancelled" else "ended early"),
             "hours": round(job["seconds"] / 3600, 2),
             "layers": job["layers"],
             "grams": round(job["grams"], 1),
             "wh": round(job["wh"], 1),
             "azn": round(job["azn"], 3),
-            "source": "с карты принтера" if job["external"] else "через модуль",
+            "source": "printer's card" if job["external"] else "module",
         })
 
     with open(target, "w", encoding="utf-8") as handle:
         json.dump(rows, handle, ensure_ascii=False, indent=0)
-    print("%s: %d печатей, %.1f ч" % (target, len(rows), sum(one["hours"] for one in rows)))
+    print("%s: %d prints, %.1f h" % (target, len(rows), sum(one["hours"] for one in rows)))
     return 0
 
 

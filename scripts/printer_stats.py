@@ -53,7 +53,7 @@ def collect(path):
         elif text.startswith(EXT_END) and open_external:
             external.append({
                 "at": when,
-                "name": "(с карты принтера)",
+                "name": "(printer's card)",
                 "how": "complete",
                 "seconds": when - open_external,
                 "layer": 0, "layers": 0, "wh": 0.0, "grams": 0.0, "azn": 0.0,
