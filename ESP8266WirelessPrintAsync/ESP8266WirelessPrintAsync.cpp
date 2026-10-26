@@ -79,6 +79,8 @@ DNSServer dns;
 #define CONSOLE_LINES 60                // What the page can scroll back through
 #define PRINTER_SERIAL_RX_BUFFER 2048   // M503 answers faster than the loop can read one byte at a time
 #define MDNS_HOSTNAME "kp3s"            // http://kp3s.local, rather than the chip id nobody can type
+#define NOZZLE_CEILING 275
+#define BED_CEILING 120
 #define LOCAL_TIMEZONE "<+04>-4"        // Baku, four hours ahead and no daylight saving since 2016
 #define PRINTER_RX_PIN 13               // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX_PIN 16               // not gpio12: it is a strapping pin and a pulled up line stops the board booting
@@ -1337,6 +1339,8 @@ void handleTelegram() {
         "/files - what is on the card\n"
         "/print <number> - start that file\n"
         "/stop - cancel the running print\n"
+        "/nozzle <degrees> - set the hot end, 0 turns it off\n"
+        "/bed <degrees> - set the bed, 0 turns it off\n"
         "/off - cut power at the socket\n\n"
         "Send a .gcode file and it goes on the card. Send a .bin and the module flashes "
         "itself with it and reboots, which it will not do while a print is running. "
@@ -1398,6 +1402,35 @@ void handleTelegram() {
         text += "Power      " + String(watts, 0) + " W\n";
 
       telegramBot.send(chat, text);
+    }
+    else if (verb == "/nozzle" || verb == "/bed") {
+      const bool nozzle = verb == "/nozzle";
+      const int ceiling = nozzle ? NOZZLE_CEILING : BED_CEILING;
+      const Temperature &reading = nozzle ? toolTemperature[0] : bedTemperature;
+      const String what = nozzle ? "Nozzle" : "Bed";
+
+      bool number = rest.length() > 0 && rest.length() <= 3;
+      for (int i = 0; number && i < rest.length(); ++i)
+        number = isDigit(rest[i]);
+
+      if (!printerConnected)
+        telegramBot.send(chat, "The printer is not answering.");
+      else if (rest == "")
+        telegramBot.send(chat, what + " is at " + reading.actual
+                               + (reading.target.toFloat() > 0 ? ", heading for " + reading.target : ", switched off")
+                               + ".\nSend " + verb + " <degrees> to change it, up to "
+                               + String(ceiling) + ", or 0 to switch it off.");
+      else if (!number || rest.toInt() > ceiling)
+        telegramBot.send(chat, "Give a whole number from 0 to " + String(ceiling) + ".");
+      else if (!commandQueue.push((nozzle ? "M104 S" : "M140 S") + String(rest.toInt())))
+        telegramBot.send(chat, "The printer has a full queue right now. Try once more.");
+      else {
+        String said = rest.toInt() == 0 ? what + " switched off."
+                                        : what + " set to " + String(rest.toInt()) + " \u00B0C.";
+        if (isPrinting)
+          said += "\nA print is running, so the file will set it back at the next change.";
+        telegramBot.send(chat, said);
+      }
     }
     else if (verb == "/files") {
       String listing;
@@ -2197,6 +2230,16 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     }
     telegramBot.probe(request->getParam("url")->value());
     request->send(202, "text/plain", "walking it, watch the journal\n");
+  });
+
+  server.on("/bench/telegram", HTTP_GET, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("cmd")) {
+      const String answer = telegramBot.benchAnswer();
+      request->send(200, "text/plain; charset=utf-8", answer == "" ? "nothing yet\n" : answer + "\n");
+      return;
+    }
+    telegramBot.benchSend(request->getParam("cmd")->value());
+    request->send(202, "text/plain", "taken, ask again without cmd for the answer\n");
   });
 
   server.on("/bench/power", HTTP_GET, [](AsyncWebServerRequest * request) {

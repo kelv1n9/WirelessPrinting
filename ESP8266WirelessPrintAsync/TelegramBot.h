@@ -30,6 +30,8 @@ class TelegramBot {
     // The loop's side of the wall
     static bool nextCommand(String &chat, String &text);
     static void send(const String chat, const String text);
+    static void benchSend(const String text);
+    static String benchAnswer();
     static void notify(const String text);      // To everyone allowed
 
   private:

@@ -262,8 +262,30 @@ void TelegramBot::deliver(const String chat, const String text) {
   inboxHead = next;
 }
 
+static const char BENCH_CHAT[] = "bench";
+static String benchReply;
+
+void TelegramBot::benchSend(const String text) {
+  {
+    Hold hold(mutex);
+    benchReply = "";
+  }
+  deliver(BENCH_CHAT, text);
+}
+
+String TelegramBot::benchAnswer() {
+  Hold hold(mutex);
+
+  return benchReply;
+}
+
 void TelegramBot::send(const String chat, const String text) {
   Hold hold(mutex);
+
+  if (chat == BENCH_CHAT) {
+    benchReply = text;
+    return;
+  }
 
   const int next = (outboxHead + 1) % QUEUE;
   if (next == outboxTail)
