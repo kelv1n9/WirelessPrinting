@@ -2335,8 +2335,12 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
 
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest * request) {
     String path = selectedFile;
-    if (request->hasParam("name"))
-      path = "/" + sanitizeFilename(request->getParam("name")->value());
+    if (request->hasParam("name")) {
+      const String name = sanitizeFilename(request->getParam("name")->value());
+      path = (name == "events.log" || name == "events.1.log") ? "/log/" + name : "/" + name;
+      if (path.startsWith("/log/"))
+        logFlush();
+    }
 
     FileWrapper probe = storageFS.open(path);
     if (!probe) {
