@@ -75,11 +75,11 @@ echo "$ANS" | grep -q "202" || { echo "ОШИБКА: модуль отказал
 echo -n "жду"
 for i in $(seq 1 90); do
   sleep 2; echo -n "."
-  LOG=$(curl -s --max-time 6 "$M/log" 2>/dev/null)
-  echo "$LOG" | grep -q "ota: flashed\|ota: failed\|ota: that is not\|ota: refused" && break
+  NEWLOG=$(curl -s --max-time 6 "$M/log" 2>/dev/null | tail -c +$((MARK + 1)))
+  echo "$NEWLOG" | grep -q "ota: flashed\|ota: failed\|ota: that is not\|ota: refused" && break
 done
 echo
-LOG=$(curl -s --max-time 8 "$M/log")
+LOG=$(curl -s --max-time 8 "$M/log" | tail -c +$((MARK + 1)))
 say "$LOG"
 echo "$LOG" | grep "ota:" | tail -4
 echo "$LOG" | grep -q "ota: flashed" \
