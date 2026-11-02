@@ -87,6 +87,7 @@ static char seenLine[LINE_ROOM];
 static size_t seenAt;
 static char saidLog[LOG_ROOM];
 static size_t saidHeld;
+static uint32_t saidSeq;         // counts lines ever kept, so a reader can tell new from old
 static bool printing;
 static uint32_t printAt, printOf;
 
@@ -103,21 +104,56 @@ static void remember(const char *text, const size_t len) {
   memcpy(saidLog + saidHeld, text, len);
   saidHeld += len;
   saidLog[saidHeld++] = '\n';
+  saidSeq++;
 }
 
 static PrinterCard printerCard;
 static bool sawOk;               // a whole line of it, not the tail of "echo:SD card ok"
 
+static float toolNow = 0, toolSet = 0, bedNow = 0, bedSet = 0;
+static uint32_t heardTemp;       // when, so a stale reading can be told from a cold printer
+static char machine[32];
+static char selected[PRINTER_CARD_NAME_BYTES];
+static uint32_t printSince;
+
+// " T:24.37 /0.00 B:23.50 /0.00 @:0 B@:0", from M155's own report and from any ok that
+// carries one. Marlin sends it from idle(), so it arrives whatever the queue is doing.
+static bool sawTemps(const char *text) {
+  const char *t = strstr(text, "T:");
+  if (!t || (t != text && t[-1] != ' '))
+    return false;
+  const char *slash = strchr(t, '/');
+  if (!slash)
+    return false;
+  toolNow = atof(t + 2);
+  toolSet = atof(slash + 1);
+  const char *b = strstr(slash, "B:");
+  if (b) {
+    const char *bslash = strchr(b, '/');
+    if (bslash) {
+      bedNow = atof(b + 2);
+      bedSet = atof(bslash + 1);
+    }
+  }
+  heardTemp = millis();
+  return true;
+}
+
 static void sawLine(const char *text, const size_t len) {
+  const bool hadTemps = sawTemps(text);
   if (!strcmp(text, "ok") || !strncmp(text, "ok ", 3)) {
     sawOk = true;
     return;
   }
+  if (hadTemps)
+    return;                      // the bare autoreport, kept out of the log
   if (printerCard.observe(text))
     return;                      // a listing line belongs to the index and nowhere else
   if (!strncmp(text, "SD printing byte ", 17)) {
     const char *slash = strchr(text + 17, '/');
     if (slash) {
+      if (!printing)
+        printSince = millis();
       printing = true;
       printAt = strtoul(text + 17, NULL, 10);
       printOf = strtoul(slash + 1, NULL, 10);
@@ -131,6 +167,16 @@ static void sawLine(const char *text, const size_t len) {
   if (!strncmp(text, "Done printing file", 18)) {
     printing = false;
     printAt = printOf;
+  }
+  if (!strcmp(text, "start")) {
+    heardTemp = 0;               // its autoreport is off again, and so is what it knew
+    machine[0] = 0;
+    printing = false;
+  }
+  if (!strncmp(text, "File opened: ", 13)) {
+    const char *end = strstr(text + 13, " Size:");
+    const size_t room = end ? (size_t)(end - (text + 13)) : strlen(text + 13);
+    snprintf(selected, sizeof selected, "%.*s", (int)room, text + 13);
   }
   remember(text, len);
 }
@@ -388,16 +434,48 @@ void setup() {
   MDNS.addService("http", "tcp", 80);
 
   server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", PAGE_HTML); });
+  // Everything the page draws, in the shape it has always expected. What this build
+  // cannot know is said as nothing rather than guessed: the page hides those rows.
   server.on("/api/status", HTTP_GET, []() {
-    server.send(200, "application/json",
-      "{\"bare\":true,\"printing\":" + String(printing ? "true" : "false") +
-      ",\"at\":" + String(printAt) + ",\"of\":" + String(printOf) +
-      ",\"slot\":\"" + slot() +
-      "\",\"uptime\":" + String(millis() / 1000) +
-      ",\"heap\":" + String(ESP.getFreeHeap()) +
-      ",\"block\":" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)) +
-      ",\"card\":" + String(cardUp ? "true" : "false") +
-      ",\"guard\":\"" + bootGuardReport() + "\"}");
+    const bool heard = heardTemp && millis() - heardTemp < 20000;
+    const uint32_t ran = printing && printSince ? (millis() - printSince) / 1000 : 0;
+    uint64_t freeCard = 0;
+    if (cardUp)
+      freeCard = SD_MMC.totalBytes() - SD_MMC.usedBytes();
+
+    String j = "{\"bare\":true";
+    j += ",\"printing\":" + String(printing ? "true" : "false");
+    j += ",\"connected\":" + String(heard ? "true" : "false");
+    j += ",\"state\":\"" + String(printing ? "printing" : (heard ? "ready" : "quiet")) + "\"";
+    j += ",\"at\":" + String(printAt) + ",\"of\":" + String(printOf);
+    j += ",\"slot\":\"" + slot() + "\"";
+    j += ",\"uptime\":" + String(millis() / 1000);
+    j += ",\"heap\":" + String(ESP.getFreeHeap());
+    j += ",\"block\":" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    j += ",\"card\":" + String(cardUp ? "true" : "false");
+    j += ",\"guard\":\"" + bootGuardReport() + "\"";
+
+    j += ",\"system\":{\"machine\":\"" + String(machine[0] ? machine : "KP3S") + "\"";
+    j += ",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100);
+    j += ",\"version\":\"" + slot() + " up " + String(millis() / 1000) + "s\"}";
+
+    j += ",\"job\":{\"file\":\"" + String(selected[0] ? selected : "—") + "\"";
+    j += ",\"completion\":" + String(printOf ? (double)printAt * 100.0 / printOf : 0.0, 2);
+    j += ",\"layer\":0,\"layers\":0,\"z\":0";       // the gcode is not read here yet
+    j += ",\"elapsed\":" + String(ran) + ",\"remaining\":-1,\"fan\":-1}";
+
+    // No socket and no meter in this build, so nothing is claimed about either
+    j += ",\"energy\":{\"watt\":-1,\"wh\":0,\"grams\":0,\"cost\":0,\"filament\":0,\"power\":0}";
+    j += ",\"socket\":{\"auto\":false,\"token\":false,\"device\":false,\"state\":\"\"}";
+
+    j += ",\"temperature\":{\"tool\":{\"actual\":" + String(toolNow, 1) + ",\"target\":" + String(toolSet, 1) + "}";
+    j += ",\"bed\":{\"actual\":" + String(bedNow, 1) + ",\"target\":" + String(bedSet, 1) + "}}";
+
+    j += ",\"storage\":{\"free\":" + String((uint32_t)(freeCard / 1024)) +
+         ",\"selected\":\"" + String(selected) + "\"}";
+    j += ",\"link\":{\"mangled\":0}";
+    j += "}";
+    server.send(200, "application/json", j);
   });
 
   Printer.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
@@ -488,9 +566,143 @@ void setup() {
     one.close();
   });
 
+  // The rest of what the page asks for, in the shapes it has always used.
+  server.on("/api/files", HTTP_GET, []() {
+    uint64_t freeCard = 0;
+    String j = "{\"files\":[";
+    if (cardUp) {
+      freeCard = SD_MMC.totalBytes() - SD_MMC.usedBytes();
+      File dir = SD_MMC.open("/");
+      bool first = true;
+      for (File one = dir.openNextFile(); one; one = dir.openNextFile()) {
+        if (!one.isDirectory()) {
+          const char *name = one.name();
+          if (*name == '/')
+            name++;
+          j += String(first ? "" : ",") + "{\"name\":\"" + String(name) +
+               "\",\"size\":" + String((uint32_t)one.size()) + "}";
+          first = false;
+        }
+        one.close();
+      }
+      dir.close();
+    }
+    j += "],\"free\":" + String((uint32_t)(freeCard / 1024)) + "}";
+    server.send(200, "application/json", j);
+  });
+
+  // Choosing a file is remembered here and acted on when the print is asked for: the
+  // printer cannot hold a selection for a file that is not on its card yet.
+  server.on("/select", HTTP_POST, []() {
+    snprintf(selected, sizeof selected, "%s", server.arg("name").c_str());
+    server.send(200, "text/plain", "selected\n");
+  });
+
+  server.on("/delete", HTTP_POST, []() {
+    if (!cardUp) {
+      server.send(503, "text/plain", "the module has no card\n");
+      return;
+    }
+    if (!SD_MMC.remove("/" + server.arg("name"))) {
+      server.send(404, "text/plain", "no such file\n");
+      return;
+    }
+    server.send(200, "text/plain", "gone\n");
+  });
+
+  server.on("/api/rename", HTTP_POST, []() {
+    if (!cardUp) {
+      server.send(503, "text/plain", "the module has no card\n");
+      return;
+    }
+    if (!SD_MMC.rename("/" + server.arg("from"), "/" + server.arg("to"))) {
+      server.send(400, "text/plain", "the card would not rename it\n");
+      return;
+    }
+    server.send(200, "text/plain", "renamed\n");
+  });
+
+  // start takes the selected file the whole way, since it may not be over there yet
+  server.on("/api/job", HTTP_POST, []() {
+    const String body = server.arg("plain");
+    if (body.indexOf("cancel") >= 0) {
+      if (sender.running()) {
+        server.send(409, "text/plain", "a transfer owns the wire\n");
+        return;
+      }
+      server.send(200, "text/plain", say("M524"));
+      return;
+    }
+    if (body.indexOf("start") < 0) {
+      server.send(400, "text/plain", "start or cancel\n");
+      return;
+    }
+    if (!startChore(String(selected), true)) {
+      server.send(409, "text/plain", choreTrouble + "\n");
+      return;
+    }
+    server.send(200, "text/plain", "taken as " + String(choreTarget) + "\n");
+  });
+
+  server.on("/api/command", HTTP_POST, []() {
+    if (sender.running()) {
+      server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
+    const String cmd = server.arg("cmd");
+    if (cmd == "") {
+      server.send(400, "text/plain", "cmd is empty\n");
+      return;
+    }
+    server.send(200, "text/plain", say(cmd));
+  });
+
+  // The console, drained the same way the plain progress route drains it: whoever
+  // asks gets the lines once, and the count says whether there were any.
+  server.on("/api/console", HTTP_GET, []() {
+    String j = "{\"seq\":" + String(saidSeq) + ",\"lines\":[";
+    saidLog[saidHeld] = 0;
+    bool first = true;
+    for (char *at = saidLog; *at; ) {
+      char *nl = strchr(at, '\n');
+      if (nl)
+        *nl = 0;
+      String one(at);
+      one.replace("\\", "\\\\");
+      one.replace("\"", "\\\"");
+      j += String(first ? "" : ",") + "\"" + one + "\"";
+      first = false;
+      if (!nl)
+        break;
+      at = nl + 1;
+    }
+    saidHeld = 0;
+    j += "]}";
+    server.send(200, "application/json", j);
+  });
+
+  // Nothing reads the gcode here yet, so there is no picture to give
+  server.on("/thumbnail", HTTP_GET, []() { server.send(404, "text/plain", "no thumbnail\n"); });
+
+  server.on("/restart", HTTP_POST, []() {
+    if (printing) {
+      server.send(409, "text/plain", "the printer is printing\n");
+      return;
+    }
+    server.send(200, "text/plain", "restarting\n");
+    delay(200);
+    ESP.restart();
+  });
+
   server.on("/printer/files", HTTP_GET, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
+    // M20 waits behind every move already queued, so during a print the answer
+    // would arrive long after the wait and read as an empty card.
+    if (printing) {
+      server.send(409, "text/plain", "the printer is printing, a listing would not come back\n");
       return;
     }
     if (!askPrinterCard()) {
@@ -612,7 +824,7 @@ void setup() {
       "packets  " + String(sender.packets) + ", resends " + String(sender.resends) + "\n" +
       "payload  " + String(sender.theirPayload) + ", their version " + sender.theirVersion + "\n" +
       "as       " + String(choreTarget) + ", chore " + choreName() +
-        (choreTrouble.length() ? ", " + choreTrouble : "") + "\n" +
+        (chore == ChoreFailed && choreTrouble.length() ? ", " + choreTrouble : "") + "\n" +
       "packing  " + String(sender.packing ? "on" : "off") +
         ", printer says " + (sender.theirCompression[0] ? sender.theirCompression : "nothing yet") +
         ", on the wire " + String(sender.sent) + "\n" +
@@ -682,6 +894,29 @@ void loop() {
         say("M27 S3");
         say("M24");
         chore = ChoreDone;
+      }
+    }
+  }
+
+  // The printer can be switched off and on under us, so who it is and how often it
+  // should report its temperature are asked again whenever it has gone quiet.
+  static uint32_t askAgain;
+  if (!sender.running() && (int32_t)(millis() - askAgain) >= 0 &&
+      (!heardTemp || millis() - heardTemp > 30000)) {
+    askAgain = millis() + 15000;
+    if (printing) {
+      // A printer that rebooted mid print has its autoreport off and nobody to turn it
+      // back on. Asked for without waiting, because a wait here would stall the web.
+      Printer.println("M155 S2");
+    }
+    else {
+      const String said = say("M115");
+      const int at = said.indexOf("MACHINE_TYPE:");
+      if (at >= 0) {
+        const int end = said.indexOf(' ', at + 13);
+        snprintf(machine, sizeof machine, "%s",
+                 said.substring(at + 13, end < 0 ? said.length() : end).c_str());
+        say("M155 S2");          // it reports from idle(), so the queue cannot delay it
       }
     }
   }
