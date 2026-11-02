@@ -11,6 +11,7 @@
 #include "../ESP8266WirelessPrintAsync/BinaryTransfer.h"
 #include "../ESP8266WirelessPrintAsync/BootGuard.h"
 #include "page.h"
+#include "printercard.h"
 
 #define JOIN_WAIT_MS   90000
 #define PORTAL_NAME    "KP3S-setup"
@@ -57,6 +58,15 @@ static bool worthPacking(const char *name) {
   return !dot || strcasecmp(dot, ".bin") != 0;
 }
 
+// Upload, send and print are one wish, so they are one piece of state. Each step is
+// entered only once the one before it is known to have worked.
+enum Chore : uint8_t { ChoreNone, ChoreSending, ChoreDone, ChoreFailed };
+
+static Chore chore;
+static bool choreShouldPrint;
+static char choreTarget[PRINTER_CARD_NAME_BYTES];
+static String choreTrouble;
+
 static SerialIo serialIo;
 static CardBytes sendBytes;
 static BinaryTransfer sender;
@@ -94,7 +104,16 @@ static void remember(const char *text, const size_t len) {
   saidLog[saidHeld++] = '\n';
 }
 
+static PrinterCard printerCard;
+static bool sawOk;               // a whole line of it, not the tail of "echo:SD card ok"
+
 static void sawLine(const char *text, const size_t len) {
+  if (!strcmp(text, "ok") || !strncmp(text, "ok ", 3)) {
+    sawOk = true;
+    return;
+  }
+  if (printerCard.observe(text))
+    return;                      // a listing line belongs to the index and nowhere else
   if (!strncmp(text, "SD printing byte ", 17)) {
     const char *slash = strchr(text + 17, '/');
     if (slash) {
@@ -136,12 +155,17 @@ static void drain() {
 
 // Writes one line and gathers whatever comes back, up to the first ok or the wait. What it
 // reads still goes through the parser, so a reply is never lost to the state.
+// Asks the printer what is on its card and fills the index from the answer. The card is
+// released after every binary transfer, so M21 goes first every time.
+static bool askPrinterCard();
+
 static String say(const String line) {
   if (sender.running())
     return "a transfer owns the wire\n";
 
   drain();                       // Anything already waiting belongs to the log, not to this reply
 
+  sawOk = false;
   Printer.println(line);
 
   String out;
@@ -152,11 +176,29 @@ static String say(const String line) {
       feed(ch);
       out += (char)ch;
     }
-    if (out.endsWith("ok\n") || out.endsWith("ok\r\n"))
+    if (sawOk)
       break;
     delay(5);
   }
   return out;
+}
+
+static const char *choreName() {
+  switch (chore) {
+    case ChoreSending: return "sending";
+    case ChoreDone:    return "done";
+    case ChoreFailed:  return "failed";
+    default:           return "none";
+  }
+}
+
+static bool askPrinterCard() {
+  if (sender.running())
+    return false;
+  say("M21");
+  printerCard.begin();
+  say("M20 L");
+  return printerCard.complete();
 }
 
 static const char *phaseName(const BinaryPhase p) {
@@ -164,6 +206,7 @@ static const char *phaseName(const BinaryPhase p) {
     case BinaryIdle:      return "idle";
     case BinarySwitching: return "switching";
     case BinarySyncing:   return "syncing";
+    case BinaryAsking:    return "asking";
     case BinaryOpening:   return "opening";
     case BinaryWriting:   return "writing";
     case BinaryShutting:  return "closing";
@@ -368,6 +411,45 @@ void setup() {
     one.close();
   });
 
+  server.on("/printer/files", HTTP_GET, []() {
+    if (sender.running()) {
+      server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
+    if (!askPrinterCard()) {
+      server.send(502, "text/plain", "the printer did not finish a listing\n");
+      return;
+    }
+    String out;
+    for (uint8_t i = 0; i < printerCard.count(); i++) {
+      const PrinterCardEntry &e = printerCard.at(i);
+      out += String(e.dos) + "  " + String(e.size) + "  " + (e.name[0] ? e.name : e.dos) + "\n";
+    }
+    if (!printerCard.count())
+      out = "nothing on the printer's card\n";
+
+    // What is on our card and not on theirs, worked out afresh rather than remembered
+    if (cardUp) {
+      PrinterCardPick pick;
+      pick.begin();
+      File dir = SD_MMC.open("/");
+      for (File one = dir.openNextFile(); one; one = dir.openNextFile()) {
+        if (!one.isDirectory()) {
+          const char *bare = one.name();
+          if (*bare == '/')             // the core hands roots back with a slash on the front
+            bare++;
+          pick.consider(printerCard, bare, one.size());
+        }
+        one.close();
+      }
+      dir.close();
+      out += "\nwaiting  " + String(pick.waiting) + "\n";
+      if (pick.found)
+        out += "next     " + String(pick.source) + " as " + String(pick.target) + "\n";
+    }
+    server.send(200, "text/plain", out);
+  });
+
   server.on("/printer/send", HTTP_POST, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer is already running\n");
@@ -383,10 +465,19 @@ void setup() {
       server.send(404, "text/plain", "no such file on the module's card\n");
       return;
     }
+    // The printer cannot take every name our card can hold, so it gets one it can.
+    if (!printerCardTarget(name.c_str(), choreTarget, sizeof choreTarget)) {
+      sendBytes.shut();
+      server.send(400, "text/plain", "that name cannot be put on the printer\n");
+      return;
+    }
     strncpy(sendName, name.c_str(), sizeof(sendName) - 1);
     sendName[sizeof(sendName) - 1] = 0;
+    choreShouldPrint = server.arg("print") == "1";
+    choreTrouble = "";
+    chore = ChoreSending;
     sendAsked = true;
-    server.send(200, "text/plain", "taken, watch /printer/send/status\n");
+    server.send(200, "text/plain", "taken as " + String(choreTarget) + ", watch /printer/send/status\n");
   });
 
   // The printer prints from its own card. Nothing here feeds it gcode, which is the
@@ -464,6 +555,8 @@ void setup() {
       "written  " + String(sender.written) + " of " + String(sender.total) + "\n" +
       "packets  " + String(sender.packets) + ", resends " + String(sender.resends) + "\n" +
       "payload  " + String(sender.theirPayload) + ", their version " + sender.theirVersion + "\n" +
+      "as       " + String(choreTarget) + ", chore " + choreName() +
+        (choreTrouble.length() ? ", " + choreTrouble : "") + "\n" +
       "packing  " + String(sender.packing ? "on" : "off") +
         ", printer says " + (sender.theirCompression[0] ? sender.theirCompression : "nothing yet") +
         ", on the wire " + String(sender.sent) + "\n" +
@@ -495,7 +588,7 @@ void loop() {
 
   if (sendAsked) {
     sendAsked = false;
-    sender.start(&sendBytes, sendName, millis(), worthPacking(sendName));
+    sender.start(&sendBytes, choreTarget, millis(), worthPacking(choreTarget));
   }
   if (!sender.running())
     drain();                     // The one reader, whenever the sender does not own the wire
@@ -504,6 +597,37 @@ void loop() {
     sender.service(millis());
     if (!sender.running())
       sendBytes.shut();
+  }
+
+  // The transfer is over. Nothing is believed until the printer's own card says so.
+  if (chore == ChoreSending && !sender.running() && !sendAsked) {
+    const uint32_t was = sendBytes.size();
+    if (sender.phase != BinaryDone) {
+      choreTrouble = sender.trouble ? sender.trouble : "the transfer did not finish";
+      chore = ChoreFailed;
+    }
+    else if (!askPrinterCard()) {
+      choreTrouble = "the printer did not finish a listing";
+      chore = ChoreFailed;
+    }
+    else if (!printerCard.holds(choreTarget, was)) {
+      choreTrouble = "the file is not on the printer's card at the right size";
+      chore = ChoreFailed;
+    }
+    else if (!choreShouldPrint)
+      chore = ChoreDone;
+    else {
+      const String opened = say("M23 " + String(choreTarget));
+      if (opened.indexOf("File opened") < 0) {
+        choreTrouble = "the printer would not open it";
+        chore = ChoreFailed;
+      }
+      else {
+        say("M27 S3");
+        say("M24");
+        chore = ChoreDone;
+      }
+    }
   }
 
   static uint32_t downSince;
