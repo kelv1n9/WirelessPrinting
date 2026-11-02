@@ -21,7 +21,10 @@ struct MarlinSim {
   bool lfnWrite = false;
   bool sdWrite = true;
   bool xonXoff = false;
-  bool binary = false;
+  bool binary = false;              // BINARY_FILE_TRANSFER built into the firmware
+  uint16_t binaryPayload = 96;      // What Marlin hands the stream: MAX_CMD_SIZE
+  uint32_t binaryCorruptEvery = 0;  // One packet byte in this many is flipped
+  uint32_t binaryDropEvery = 0;     // One packet byte in this many never arrives
   bool cardPresent = true;
   size_t cardFree = 8u * 1024 * 1024;
   int executePerTick = 8;           // Commands the main loop gets through in a millisecond
@@ -34,6 +37,10 @@ struct MarlinSim {
   size_t dropped = 0;               // Bytes the ring had no room for. The loss we are hunting
   size_t highWater = 0;             // Fullest the ring ever got
   uint32_t resendsAsked = 0;
+  uint32_t binaryResendsAsked = 0;
+  bool binaryMode = false;          // M28 B1 puts the port here, a control packet takes it back
+  bool binaryOpen = false;          // A file is open for binary writing
+  std::string binaryFile;
   std::vector<std::string> seen;    // Commands that made it through, in order
   std::map<std::string, std::string> card;
   std::map<std::string, std::string> alias;   // Long name to the 8.3 the card really holds
@@ -42,12 +49,22 @@ struct MarlinSim {
     ring.clear(); partial.clear(); cmdq.clear(); out.clear();
     lastN = 0; dropped = highWater = 0; resendsAsked = 0; arrived = 0;
     seen.clear(); card.clear(); alias.clear(); saving.clear(); stallUntil = 0;
+    binaryMode = binaryOpen = false; binaryFile.clear(); binaryResendsAsked = 0;
+    binState = BinWait; binSync = 0; binRetries = 0; binHeld = 0; binTook = 0;
+    binData.clear(); binArrived = 0;
   }
 
   // A byte lands on the printer's pin
   void toPrinter(uint8_t b) {
     if (corruptEvery && ++arrived % corruptEvery == 0)
       b ^= 0x20;                    // A flipped bit inside a word, which a checksum must catch
+    if (binaryMode) {
+      ++binArrived;
+      if (binaryDropEvery && binArrived % binaryDropEvery == 0)
+        return;                     // The byte never lands, the packet is short
+      if (binaryCorruptEvery && binArrived % binaryCorruptEvery == 0)
+        b ^= 0x40;
+    }
     if (ring.size() >= rxBufferSize) {
       dropped++;                    // Exactly what the hardware does: the byte is gone
       return;
@@ -62,6 +79,16 @@ struct MarlinSim {
       stallUntil = now + stallFor;
     if (now < stallUntil)
       return;
+
+    if (binaryMode) {
+      binaryDrain(now);
+      for (int i = 0; i < executePerTick && !cmdq.empty(); i++) {
+        const std::string cmd = cmdq.front();
+        cmdq.pop_front();
+        execute(cmd);
+      }
+      return;
+    }
 
     for (uint32_t i = 0; i < drainPerTick && !ring.empty(); i++) {
       if ((int)cmdq.size() >= bufSize)
@@ -225,6 +252,16 @@ private:
       say("End file list");
     }
     else if (cmd.compare(0, 3, "M28") == 0) {
+      // M28B1 does not open anything and never reaches the card check: it hands the
+      // port to the binary stream. Without the feature built in, Marlin takes the B1
+      // for a filename and opens a file called that.
+      if (binary && cmd.find("B1") != std::string::npos) {
+        binaryMode = true;
+        binState = BinWait; binSync = 0; binRetries = 0; binData.clear();
+        say("Switching to Binary Protocol");
+        ok();
+        return;
+      }
       if (!cardPresent || !sdWrite) { say("Error:No SD card"); ok(); return; }
       const size_t space = cmd.find(' ');
       std::string name = space == std::string::npos ? "OUT.GCO" : cmd.substr(space + 1);
@@ -245,5 +282,212 @@ private:
     }
 
     ok();
+  }
+
+  // ---------------------------------------------------------------- binary protocol
+  // Mirrors BinaryStream::receive in Marlin 2.1.2, including which bytes each checksum
+  // covers and which packet is answered even when the counter disagrees.
+  enum BinState : uint8_t { BinWait, BinHeader, BinData, BinFooter };
+  BinState binState = BinWait;
+  uint8_t binSync = 0, binRetries = 0, binHeader[8] = {0};
+  size_t binHeld = 0, binTook = 0;
+  uint16_t binChecksum = 0, binHeaderChecksum = 0;
+  std::string binData;
+  uint32_t binArrived = 0, binLastByteAt = 0;
+
+  static uint16_t binFletcher(uint16_t cs, const uint8_t value) {
+    const uint16_t low = (uint16_t)(((cs & 0xFF) + value) % 255);
+    return (uint16_t)(((((cs >> 8) + low) % 255) << 8) | low);
+  }
+
+  uint16_t binHeaderWord(const int at) const {
+    return (uint16_t)(binHeader[at] | (binHeader[at + 1] << 8));
+  }
+
+  void binReset() {
+    binState = BinWait;
+    binHeld = binTook = 0;
+    binChecksum = binHeaderChecksum = 0;
+    binData.clear();
+    binHeader[0] = binHeader[1] = 0;
+  }
+
+  void binAskAgain() {
+    binRetries++;
+    binaryResendsAsked++;
+    char b[32];
+    snprintf(b, sizeof b, "rs%u", (unsigned)binSync);
+    say(b);
+    binReset();
+  }
+
+  void binGiveUp() {
+    char b[32];
+    snprintf(b, sizeof b, "fe%u", (unsigned)binHeader[2]);
+    say(b);
+    binSync = 0;
+    binRetries = 0;
+    binReset();
+  }
+
+  void binDispatch(const uint8_t protocol, const uint8_t type) {
+    if (protocol == 0) {                       // control
+      if (type == 2)                           // close, back to reading gcode
+        binaryMode = false;
+      return;
+    }
+    if (protocol != 1) {
+      say("Unsupported Binary Protocol");
+      return;
+    }
+    switch (type) {
+      case 0:                                  // query
+        say("PFT:version:0.1.0:compression:none");
+        break;
+      case 1: {                                // open
+        if (binaryOpen) { say("PFT:busy"); break; }
+        // dummy, compression, then the name with its terminator
+        if (binData.size() < 3 || binData.back() != '\0') { say("PFT:fail"); break; }
+        if (!cardPresent || !sdWrite) { say("PFT:fail"); break; }
+        binaryFileName(binData);
+        binaryOpen = true;
+        card[binaryFile].clear();
+        alias[binaryFile] = dosAlias(binaryFile);
+        say("PFT:success");
+        break;
+      }
+      case 2:                                  // close
+        if (!binaryOpen) { say("PFT:invalid"); break; }
+        binaryOpen = false;
+        say("PFT:success");
+        break;
+      case 3:                                  // write
+        if (!binaryOpen) { say("PFT:invalid"); break; }
+        card[binaryFile] += binData;
+        cardFree -= binData.size();
+        break;
+      case 4:                                  // abort
+        if (binaryOpen) card.erase(binaryFile);
+        binaryOpen = false;
+        say("PFT:success");
+        break;
+      default:
+        say("PTF:invalid");
+        break;
+    }
+  }
+
+  void binaryFileName(const std::string &body) {
+    binaryFile.clear();
+    for (size_t i = 2; i < body.size() && body[i]; i++)
+      binaryFile += body[i];
+  }
+
+  void binaryDrain(const uint32_t now) {
+    if (binState != BinWait && binLastByteAt && now - binLastByteAt > 500) {
+      binLastByteAt = now;
+      binAskAgain();                           // Marlin's PACKET_MAX_WAIT, then a resend
+      return;
+    }
+
+    while (!ring.empty()) {
+      const uint8_t d = ring.front();
+      ring.pop_front();
+      binLastByteAt = now;
+
+      switch (binState) {
+        case BinWait:
+          binHeader[1] = d;
+          if (binHeaderWord(0) == 0xB5AD) {
+            binHeld = 2;
+            binChecksum = 0;
+            binState = BinHeader;
+          }
+          else
+            binHeader[0] = d;
+          break;
+
+        case BinHeader: {
+          binHeader[binHeld++] = d;
+          binChecksum = binFletcher(binChecksum, d);
+          if (binHeld == sizeof(binHeader) - 2)
+            binHeaderChecksum = binChecksum;    // the checksum field itself is not in it
+          if (binHeld < sizeof(binHeader))
+            break;
+
+          if (binHeaderWord(6) != binHeaderChecksum) { binAskAgain(); break; }
+
+          const uint8_t protocol = (uint8_t)((binHeader[3] >> 4) & 0xF);
+          const uint8_t type = (uint8_t)(binHeader[3] & 0xF);
+          const uint8_t theirSync = binHeader[2];
+          const uint16_t size = binHeaderWord(4);
+
+          // The sync packet is answered whatever the counters say, that is its job
+          if (protocol == 0 && type == 1) {
+            char b[64];
+            snprintf(b, sizeof b, "ss%u,%u,0.1.0", (unsigned)binSync, (unsigned)binaryPayload);
+            say(b);
+            binReset();
+            break;
+          }
+          if (theirSync == (uint8_t)(binSync - 1)) {
+            char b[32];                         // our answer was lost, say it again
+            snprintf(b, sizeof b, "ok%u", (unsigned)theirSync);
+            say(b);
+            binReset();
+            break;
+          }
+          if (theirSync != binSync) {
+            if (binRetries) { binReset(); break; }   // already asked, let the pipe drain
+            say("Datastream packet out of order");
+            binAskAgain();
+            break;
+          }
+          if (size > binaryPayload) { binGiveUp(); break; }
+
+          binTook = 0;
+          binHeld = 0;
+          binData.clear();
+          if (size)
+            binState = BinData;
+          else
+            binFinish(protocol, type);
+          break;
+        }
+
+        case BinData:
+          binData.push_back((char)d);
+          binChecksum = binFletcher(binChecksum, d);
+          if (++binHeld == binHeaderWord(4)) {
+            binState = BinFooter;
+            binHeld = 0;
+          }
+          break;
+
+        case BinFooter:
+          binFooter[binHeld++] = d;
+          if (binHeld < 2)
+            break;
+          if ((uint16_t)(binFooter[0] | (binFooter[1] << 8)) != binChecksum) {
+            binAskAgain();
+            break;
+          }
+          binFinish((uint8_t)((binHeader[3] >> 4) & 0xF), (uint8_t)(binHeader[3] & 0xF));
+          break;
+      }
+    }
+  }
+
+  uint8_t binFooter[2] = {0};
+
+  void binFinish(const uint8_t protocol, const uint8_t type) {
+    const uint8_t answered = binHeader[2];
+    binSync = (uint8_t)(binSync + 1);
+    binRetries = 0;
+    char b[32];
+    snprintf(b, sizeof b, "ok%u", (unsigned)answered);
+    say(b);
+    binDispatch(protocol, type);
+    binReset();
   }
 };

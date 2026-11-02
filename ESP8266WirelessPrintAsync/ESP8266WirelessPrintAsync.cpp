@@ -14,6 +14,7 @@
 #include "BootGuard.h"
 #include "PrinterLink.h"
 #include "CardTransfer.h"
+#include "BinaryTransfer.h"
 #include <rom/spi_flash.h>
 #include <Preferences.h>
 #include <time.h>
@@ -933,6 +934,123 @@ void handleCardSend() {
   if (cardSend.running() || !cardSend.quiet())
     return;
   cardSendSettle();
+}
+
+// ---------------------------------------------------------- flashing the printer
+// The image goes onto the printer's own card with Marlin's binary protocol, then M997
+// reboots it and the bootloader on the board picks the image up. No card to pull out.
+#define PRINTER_FIRMWARE_PATH  "/printer.bin"
+#define PRINTER_FIRMWARE_NAME  "Robin_nano35.bin"
+
+LinkIo *printerWire();          // The one object that owns the serial port, defined below
+
+// Kept off the heap until it is wanted: its buffers are nearly three hundred bytes and
+// bss is the segment that runs out on this board. Flashing the printer happens once in
+// a while, with no print running, which is exactly when the heap is whole.
+BinaryTransfer *printerFlash;
+volatile bool printerFlashRunning;
+String printerFlashReport;
+
+struct CardBytes : ByteSource {
+  FileWrapper file;
+  uint32_t taken = 0;
+
+  int next(uint8_t *out, const size_t max) override {
+    if (!file)
+      return -1;
+    int got = 0;
+    if (cardMutex && xSemaphoreTakeRecursive(cardMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      got = file.read(out, max);
+      xSemaphoreGiveRecursive(cardMutex);
+    }
+    else
+      return -1;
+    if (got < 0)
+      return -1;
+    taken += got;
+    return got;
+  }
+
+  uint32_t size() const override { return bytes; }
+  uint32_t bytes = 0;            // FileWrapper cannot be asked through a const handle
+};
+static CardBytes printerFlashBytes;
+
+const char *printerFlashWhyNot() {
+  if (!printerConnected)        return "the printer is not answering";
+  if (isPrinting)               return "this module is printing";
+  if (externalPrinting)         return "the printer is printing from its own card";
+  if (cardSend.running())       return "a file is going to the printer's card";
+  if (printerFlash)             return "the printer is already being flashed";
+  if (updateRunning)            return "this module's own firmware is being written";
+  if (!storageFS.isActive())    return "this module has no card";
+  return NULL;
+}
+
+bool printerFlashBegin(const String &target) {
+  if (printerFlashWhyNot())
+    return false;
+
+  printerFlashBytes.file = storageFS.open(PRINTER_FIRMWARE_PATH);
+  if (!printerFlashBytes.file || !printerFlashBytes.file.size())
+    return false;
+  printerFlashBytes.taken = 0;
+  printerFlashBytes.bytes = printerFlashBytes.file.size();
+
+  printerFlash = new BinaryTransfer();
+  if (!printerFlash) {
+    printerFlashBytes.file.close();
+    return false;
+  }
+  printerFlash->begin(printerWire());
+  if (!printerFlash->start(&printerFlashBytes, target.c_str(), millis())) {
+    delete printerFlash;
+    printerFlash = NULL;
+    printerFlashBytes.file.close();
+    return false;
+  }
+
+  printerFlashRunning = true;
+  logEvent("flashing the printer with " + String(printerFlashBytes.bytes)
+           + " bytes as " + target);
+  lcd("Flashing printer");
+  return true;
+}
+
+void handlePrinterFlash() {
+  if (!printerFlash)
+    return;
+
+  printerFlash->service(millis());
+  if (printerFlash->running())
+    return;
+
+  const bool good = printerFlash->phase == BinaryDone;
+  const uint32_t spent = printerFlash->finishedAt - printerFlash->startedAt;
+  printerFlashReport = String(good ? "flashed" : "failed") + ": "
+                     + String(printerFlash->written) + " bytes in " + String(spent / 1000) + " s, "
+                     + String(printerFlash->packets) + " packets, "
+                     + String(printerFlash->resends) + " repeats"
+                     + (good ? "" : String(", ") + printerFlash->trouble);
+  logEvent(printerFlashReport);
+
+  printerFlashBytes.file.close();
+  delete printerFlash;
+  printerFlash = NULL;
+  printerFlashRunning = false;
+
+  if (!good) {
+    lcd("Flash failed");
+    return;
+  }
+
+  // The image is on the printer's card. M997 is a plain reboot on this board, and the
+  // bootloader is what does the flashing, so the printer goes away for a while.
+  playSound();
+  lcd("Rebooting printer");
+  commandQueue.push("M997");
+  printerCard.stale();
+  logEvent("asked the printer to restart so its bootloader takes the image");
 }
 
 void askCardList() {
@@ -2608,6 +2726,79 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     request->send(204, "text/plain", "");
   });
 
+  // The image for the printer, not for this module. Kept apart from the module's own
+  // /update on purpose: sending one to the other bricks the wrong board.
+  server.on("/printer/firmware", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (uploadFailure != "") {
+      request->send(409, "text/plain", uploadFailure + "\n");
+      uploadFailure = "";
+      return;
+    }
+    request->send(200, "text/plain", "the image is on this module, POST /printer/flash to send it\n");
+  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data,
+        size_t len, bool final) {
+    static FileWrapper image;
+
+    if (!index) {
+      uploadFailure = "";
+      const char *why = printerFlashWhyNot();
+      if (why)
+        uploadFailure = why;
+      else if (!filename.endsWith(".bin"))
+        uploadFailure = "the printer takes a .bin image";
+      else if (request->contentLength() >= storageFS.freeBytes())
+        uploadFailure = "not enough free space";
+      else {
+        storageFS.remove(PRINTER_FIRMWARE_PATH);
+        image = storageFS.open(PRINTER_FIRMWARE_PATH, "w");
+        if (!image)
+          uploadFailure = "cannot create file";
+      }
+    }
+
+    if (uploadFailure == "" && image && image.write(data, len) != len)
+      uploadFailure = "write error, card full";
+
+    if (final) {
+      if (image)
+        image.close();
+      if (uploadFailure != "")
+        storageFS.remove(PRINTER_FIRMWARE_PATH);
+      else
+        logEvent("took an image for the printer, " + String(index + len) + " bytes");
+    }
+  });
+
+  server.on("/printer/flash", HTTP_POST, [](AsyncWebServerRequest * request) {
+    const char *why = printerFlashWhyNot();
+    if (why) {
+      request->send(409, String("text/plain"), String(why) + "\n");
+      return;
+    }
+    const String target = request->hasParam("name", true)
+                        ? sanitizeFilename(request->getParam("name", true)->value())
+                        : String(PRINTER_FIRMWARE_NAME);
+    if (!printerFlashBegin(target)) {
+      request->send(409, "text/plain", "no image on this module, POST it to /printer/firmware first\n");
+      return;
+    }
+    request->send(202, "text/plain", "sending the image, watch the journal\n");
+  });
+
+  server.on("/printer/flash/status", HTTP_GET, [](AsyncWebServerRequest * request) {
+    String out = "{\"running\":";
+    out += printerFlash ? "true" : "false";
+    if (printerFlash) {
+      out += ",\"phase\":" + String((int)printerFlash->phase);
+      out += ",\"written\":" + String(printerFlash->written);
+      out += ",\"total\":" + String(printerFlash->total);
+      out += ",\"packets\":" + String(printerFlash->packets);
+      out += ",\"repeats\":" + String(printerFlash->resends);
+    }
+    out += ",\"last\":\"" + printerFlashReport + "\"}";
+    request->send(200, "application/json", out);
+  });
+
   server.on("/auth/password", HTTP_POST, [](AsyncWebServerRequest * request) {
     if (!request->hasParam("pass", true)) {
       request->send(400, "text/plain", "pass is required");
@@ -4025,6 +4216,8 @@ struct SerialIo : LinkIo {
   uint32_t now() override { return millis(); }
 };
 static SerialIo serialIo;
+
+LinkIo *printerWire() { return &serialIo; }
 PrinterLink printerLink;
 
 // Takes raw text on purpose. An answer arrives thousands of times a print, and a String
@@ -4186,7 +4379,7 @@ void linkBegin() {
 }
 
 void SendCommands() {
-  if (cardSendRunning)
+  if (cardSendRunning || printerFlashRunning)
     return;                       // The transfer owns the wire until it closes the file
   const char *command;
   while ((command = commandQueue.peekSend()) != NULL) {
@@ -4287,6 +4480,7 @@ void loop() {
 
     handlePrint();
     handleCardSend();
+    handlePrinterFlash();
     handleSendQueue();
     handleWebAuthGreeting();
     handleEnergy();
