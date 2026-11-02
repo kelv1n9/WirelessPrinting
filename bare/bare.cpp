@@ -8,6 +8,12 @@
 
 #define JOIN_WAIT_MS   90000
 #define PORTAL_NAME    "KP3S-setup"
+#define PRINTER_RX     13      // gpio14 is taken by the SD_MMC clock
+#define PRINTER_TX     16      // not gpio12, a strapping pin that stops the board booting
+#define PRINTER_BAUD   115200  // What Marlin boots at here; M575 moves it afterwards
+#define REPLY_WAIT_MS  4000
+
+static HardwareSerial Printer(1);
 
 static WebServer server(80);
 static Preferences store;
@@ -102,6 +108,43 @@ void setup() {
       "{\"bare\":true,\"printing\":false,\"slot\":\"" + slot() +
       "\",\"uptime\":" + String(millis() / 1000) +
       ",\"heap\":" + String(ESP.getFreeHeap()) + "}");
+  });
+
+  Printer.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
+
+  // One line in, whatever the printer says back out. Enough to ask a printer what it is.
+  server.on("/gcode", HTTP_GET, []() {
+    const String cmd = server.arg("cmd");
+    if (cmd == "") {
+      server.send(400, "text/plain", "cmd is empty\n");
+      return;
+    }
+
+    while (Printer.available())
+      Printer.read();
+
+    Printer.print(cmd);
+    Printer.print('\n');
+
+    String out;
+    const uint32_t until = millis() + REPLY_WAIT_MS;
+    while ((int32_t)(millis() - until) < 0) {
+      while (Printer.available() && out.length() < 3000)
+        out += (char)Printer.read();
+      if (out.endsWith("ok\n") || out.endsWith("ok\r\n"))
+        break;
+      delay(5);
+    }
+
+    server.send(200, "text/plain", out == "" ? "the printer said nothing\n" : out);
+  });
+
+  // Whatever has arrived on its own, for catching a printer as it starts up.
+  server.on("/printer/heard", HTTP_GET, []() {
+    String out;
+    while (Printer.available() && out.length() < 3000)
+      out += (char)Printer.read();
+    server.send(200, "text/plain", out);
   });
 
   server.on("/update", HTTP_POST, []() {
