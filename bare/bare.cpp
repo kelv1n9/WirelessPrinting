@@ -12,6 +12,7 @@
 #include "../ESP8266WirelessPrintAsync/BootGuard.h"
 #include "page.h"
 #include "printercard.h"
+#include "gcodemeta.h"
 #include "../ESP8266WirelessPrintAsync/YandexHome.h"
 
 // The encrypted connection is the only one, but YandexHome asks for the gate the same
@@ -273,6 +274,95 @@ static const char *choreName() {
   }
 }
 
+// What the scanner finds is written beside the file, under the name the printer will
+// know it by, so the job can be looked up from what the printer says rather than from
+// what we called it here.
+#define META_DIR "/meta"
+
+static String metaPath(const char *target, const char *suffix) {
+  return String(META_DIR "/") + target + suffix;
+}
+
+struct MetaOut : GcodeMetaSink {
+  File into;
+  File picture;
+  String tmp, keepAs;
+
+  void layer(const GcodeMetaLayer &one) override {
+    if (into)
+      into.write((const uint8_t *)&one, sizeof one);
+  }
+
+  // A slicer writes its sizes one after another and only the last one is worth having,
+  // so each goes to a file of its own and the loser is thrown away at once.
+  void thumbOpen(uint16_t, uint16_t) override {
+    if (picture)
+      picture.close();
+    SD_MMC.remove(tmp);
+    picture = SD_MMC.open(tmp, FILE_WRITE);
+  }
+  void thumbByte(uint8_t value) override {
+    if (picture)
+      picture.write(value);
+  }
+  void thumbClose(bool keep) override {
+    if (!picture)
+      return;
+    picture.close();
+    if (!keep) {
+      SD_MMC.remove(tmp);
+      return;
+    }
+    SD_MMC.remove(keepAs);
+    SD_MMC.rename(tmp, keepAs);
+  }
+};
+
+static GcodeMetaScan metaScan;
+static MetaOut metaOut;
+static char metaTarget[PRINTER_CARD_NAME_BYTES];
+static bool metaWanted;
+
+static bool metaHead(const char *target, GcodeMetaHead &head) {
+  File one = SD_MMC.open(metaPath(target, ".hdr"));
+  if (!one)
+    return false;
+  const bool good = one.read((uint8_t *)&head, sizeof head) == (int)sizeof head &&
+                    head.magic == GCODEMETA_MAGIC;
+  one.close();
+  return good;
+}
+
+// The table is on the card, not in memory: a tall print has thousands of rows and the
+// answer needs a dozen of them. Seeking beats reading the lot.
+static uint32_t metaLayerAt(const char *target, const uint32_t count, const uint32_t byte,
+                            uint16_t *z100, uint16_t *minutes) {
+  File table = SD_MMC.open(metaPath(target, ".idx"));
+  if (!table)
+    return 0;
+  uint32_t low = 0, high = count;
+  GcodeMetaLayer one;
+  while (low < high) {
+    const uint32_t mid = low + (high - low) / 2;
+    table.seek(mid * sizeof one);
+    if (table.read((uint8_t *)&one, sizeof one) != (int)sizeof one)
+      break;
+    if (one.at <= byte)
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  if (low) {
+    table.seek((low - 1) * sizeof one);
+    if (table.read((uint8_t *)&one, sizeof one) == (int)sizeof one) {
+      if (z100) *z100 = one.z100;
+      if (minutes) *minutes = one.minutes;
+    }
+  }
+  table.close();
+  return low;
+}
+
 static WebServer server(80);
 
 // One body for both upload routes: the module's own and the one a slicer speaks.
@@ -289,8 +379,22 @@ static void takeUpload() {
       return;
     }
     into = SD_MMC.open("/" + up.filename, FILE_WRITE);
-    if (!into)
+    if (!into) {
       sendTrouble = "the module's card would not take the file";
+      return;
+    }
+
+    // Read once, while it goes past. Reading it again afterwards would be a second
+    // pass over megabytes for something that is right here.
+    metaWanted = printerCardIsGcode(up.filename.c_str()) &&
+                 printerCardTarget(up.filename.c_str(), metaTarget, sizeof metaTarget);
+    if (metaWanted) {
+      SD_MMC.mkdir(META_DIR);
+      metaOut.into = SD_MMC.open(metaPath(metaTarget, ".idx"), FILE_WRITE);
+      metaOut.tmp = metaPath(metaTarget, ".new");
+      metaOut.keepAs = metaPath(metaTarget, ".png");
+      metaScan.begin(&metaOut);
+    }
   }
   else if (up.status == UPLOAD_FILE_WRITE && into) {
     for (size_t at = 0; at < up.currentSize; at += sizeof(lined)) {
@@ -300,10 +404,25 @@ static void takeUpload() {
         sendTrouble = "the module's card stopped taking bytes";
         break;
       }
+      if (metaWanted)
+        metaScan.feed(lined, take);
     }
   }
-  else if (up.status == UPLOAD_FILE_END && into)
+  else if (up.status == UPLOAD_FILE_END && into) {
+    const uint32_t size = into.size();
     into.close();
+    if (metaWanted) {
+      metaScan.finish(size);
+      if (metaOut.into)
+        metaOut.into.close();
+      File head = SD_MMC.open(metaPath(metaTarget, ".hdr"), FILE_WRITE);
+      if (head) {
+        head.write((const uint8_t *)&metaScan.head, sizeof metaScan.head);
+        head.close();
+      }
+      metaWanted = false;
+    }
+  }
 }
 
 // Takes a file on the module's card all the way to the printer, and onto it if asked.
@@ -547,16 +666,36 @@ void setup() {
     j += ",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100);
     j += ",\"version\":\"" + slot() + " up " + String(millis() / 1000) + "s\"}";
 
+    // What the slicer wrote down, looked up by the byte the printer says it is on
+    GcodeMetaHead meta;
+    uint32_t layer = 0, layers = 0;
+    uint16_t z100 = 0, left = 0;
+    double grams = 0;
+    int32_t remaining = -1;
+    if (selected[0] && cardUp && metaHead(selected, meta)) {
+      layers = meta.found ? meta.found : meta.layers;
+      grams = meta.grams;
+      if (printing && printOf) {
+        layer = metaLayerAt(selected, meta.found, printAt, &z100, &left);
+        remaining = left ? (int32_t)left * 60 : -1;
+        if (remaining < 0 && meta.seconds)
+          remaining = (int32_t)(meta.seconds * (1.0 - (double)printAt / printOf));
+      }
+      else if (!printing && meta.seconds)
+        remaining = (int32_t)meta.seconds;
+    }
+
     j += ",\"job\":{\"file\":\"" + String(selected[0] ? selected : "—") + "\"";
     j += ",\"completion\":" + String(printOf ? (double)printAt * 100.0 / printOf : 0.0, 2);
-    j += ",\"layer\":0,\"layers\":0,\"z\":0";       // the gcode is not read here yet
-    j += ",\"elapsed\":" + String(ran) + ",\"remaining\":-1,\"fan\":-1}";
+    j += ",\"layer\":" + String(layer) + ",\"layers\":" + String(layers);
+    j += ",\"z\":" + String(z100 / 100.0, 2);
+    j += ",\"elapsed\":" + String(ran) + ",\"remaining\":" + String(remaining) + ",\"fan\":-1}";
 
     const float watt = yandexHome.getPowerAt() &&
                        millis() - yandexHome.getPowerAt() < 2 * POWERDRAW_IDLE
                      ? yandexHome.getPower() : -1;
     j += ",\"energy\":{\"watt\":" + String(watt, 1) +
-         ",\"wh\":0,\"grams\":0,\"cost\":0,\"filament\":0,\"power\":0}";
+         ",\"wh\":0,\"grams\":" + String(grams, 2) + ",\"cost\":0,\"filament\":0,\"power\":0}";
     j += ",\"socket\":{\"auto\":" + String(autoPowerOff ? "true" : "false") +
          ",\"token\":" + String(yandexHome.hasToken() ? "true" : "false") +
          ",\"device\":" + String(yandexHome.getDeviceId() != "" ? "true" : "false") +
@@ -777,8 +916,29 @@ void setup() {
     server.send(200, "application/json", j);
   });
 
-  // Nothing reads the gcode here yet, so there is no picture to give
-  server.on("/thumbnail", HTTP_GET, []() { server.send(404, "text/plain", "no thumbnail\n"); });
+  // The picture was decoded out of the file as it was uploaded, so this is a plain
+  // read of a small file. It never changes once written, so it is worth caching hard.
+  server.on("/thumbnail", HTTP_GET, []() {
+    if (!cardUp) {
+      server.send(503, "text/plain", "the module has no card\n");
+      return;
+    }
+    const String asked = server.arg("name");
+    char target[PRINTER_CARD_NAME_BYTES];
+    String path = metaPath(asked.c_str(), ".png");
+    if (!SD_MMC.exists(path) && printerCardTarget(asked.c_str(), target, sizeof target))
+      path = metaPath(target, ".png");
+
+    File one = SD_MMC.open(path);
+    if (!one || one.isDirectory() || !one.size()) {
+      if (one) one.close();
+      server.send(404, "text/plain", "no picture for that one\n");
+      return;
+    }
+    server.sendHeader("Cache-Control", "public, max-age=604800, immutable");
+    server.streamFile(one, "image/png");
+    one.close();
+  });
 
   // The socket. The token goes in here and never comes back out: this server has no
   // password, and a token that can be read is a token that is gone.

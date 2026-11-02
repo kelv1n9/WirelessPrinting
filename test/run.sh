@@ -17,7 +17,7 @@ if [ -f "$HS/heatshrink_decoder.cpp" ]; then
 #define ENABLED(V) 1' > "$STAGE/Marlin/src/inc/MarlinConfigPre.h"
 fi
 
-for t in test_boot_guard test_web_auth test_command_queue test_printer_link test_card_transfer test_binary_transfer test_printercard; do
+for t in test_boot_guard test_web_auth test_command_queue test_printer_link test_card_transfer test_binary_transfer test_printercard test_gcodemeta; do
   printf '\n=== %s ===\n' "$t"
   $CXX $FLAGS -I stubs -o "/tmp/$t" "$t.cpp"
   "/tmp/$t" || fail=1

@@ -119,11 +119,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
 .diag b{display:block;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
 /* The printer's card lives in the narrow column, where a name and a button cannot
    sit side by side without pushing one of them off the edge. */
-#cardsec tr{display:block;padding:9px 0;border-bottom:1px solid var(--line)}
-#cardsec tr:last-child{border-bottom:0}
-#cardsec td{display:block;width:auto;border:0;padding:0}
-#cardsec .acts{margin-top:7px;white-space:normal}
-#cardsec .acts .row{justify-content:flex-start}
 .hide{display:none!important}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--panel);border:1px solid var(--line);padding:10px 18px;border-radius:9px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:9}
 #toast.on{opacity:1}
@@ -201,6 +196,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <section class="wide" id="jobsec">
     <h2 id="jobtitle">Job</h2>
     <div class="job">
+      <img class="thumb" id="jthumb" alt="" onerror="this.classList.add('noimg')">
       <div class="jobmain">
         <div class="fname" id="jname">—</div>
         <div class="pct"><span id="jpct">0</span><small>%</small></div>
@@ -213,6 +209,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
           <div class="kv"><div class="k">Finishes</div><div class="v" id="jend">—</div></div>
           <div class="kv"><div class="k">Fan</div><div class="v" id="jfan">—</div></div>
           <div class="kv hide" id="kwatt"><div class="k">Drawing</div><div class="v" id="jwatt">—</div></div>
+          <div class="kv hide" id="kgram"><div class="k">Filament</div><div class="v" id="jgram">—</div></div>
         </div>
         <div class="row" style="margin-top:16px">
           <button class="p" id="bprint">Print selected</button>
@@ -228,30 +225,27 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   </section>
 
   <section id="filesec">
-    <h2>Files</h2>
-    <table><tbody id="ftab"></tbody></table>
+    <h2>On the printer</h2>
+    <table><tbody id="ptab"><tr><td class="dim">asking the printer</td></tr></tbody></table>
     <div class="foot">
       <div class="row">
-        <button id="bpick">Upload</button>
+        <button class="p" id="bpick">Upload and print</button>
         <input type="file" id="file" accept=".gcode,.gco,.g" hidden>
+        <button id="bpcard">Refresh</button>
       </div>
       <div class="row">
         <progress id="uprog" class="hide" max="100" value="0"></progress>
-        <span class="dim num" id="space"></span>
+        <span class="dim num" id="pwait"></span>
       </div>
     </div>
+    <details id="stage">
+      <summary class="dim" style="cursor:pointer;margin-top:14px;font-size:13px">Module card, on the way through</summary>
+      <table><tbody id="ftab"></tbody></table>
+      <div class="foot"><span class="dim num" id="space"></span></div>
+    </details>
   </section>
 
   <div class="side">
-  <section id="cardsec">
-    <h2>Printer card</h2>
-    <table><tbody id="ptab"><tr><td class="dim">not asked yet</td></tr></tbody></table>
-    <div class="foot">
-      <button id="bpcard">Ask the printer</button>
-      <span class="dim num" id="pwait"></span>
-    </div>
-  </section>
-
   <section id="tempsec">
     <h2>Temperatures</h2>
     <div class="tbox settable" id="boxn">
@@ -382,6 +376,10 @@ function render(d){
   const mark = d.storage.selected + '|' + d.printing;
   if (seen !== null && seen !== mark) loadFiles().catch(()=>{});
   seen = mark;
+  const th = $('jthumb'), want = j.file && j.file !== '—' ? '/thumbnail?name=' + encodeURIComponent(j.file) : '';
+  if (th.dataset.src !== want) { th.dataset.src = want; th.className = 'thumb'; th.src = want; }
+  $('kgram').classList.toggle('hide', !(d.energy.grams > 0));
+  $('jgram').textContent = d.energy.grams.toFixed(1) + ' g';
   $('guard').textContent = d.guard || '';
   $('brestart').disabled = d.printing;
 }
@@ -393,7 +391,9 @@ async function pollTransfer(){
   const t = await (await fetch('/printer/send/status')).text();
   const of = s => (t.match(new RegExp('^' + s + ' +(.*)$', 'm')) || ['',''])[1];
   const phase = of('phase'), w = of('written').split(' ');
+  const was = busy;
   busy = phase && 'idle done failed'.indexOf(phase) < 0;
+  if (was && !busy) setTimeout(() => printerCard().catch(()=>{}), 1500);
   const pct = +w[2] ? Math.round(+w[0] * 100 / +w[2]) : 0;
   const chore = (of('as').split(', chore ')[1] || '');
   $('xfer').classList.toggle('hide', !busy);
@@ -476,34 +476,52 @@ $('btheme').onclick = () => {
 
 // The printer's card is asked for on purpose: it costs the wire two commands, and
 // during a print those would wait behind every move already queued.
+let asking = false;
+
 async function printerCard(){
-  $('ptab').innerHTML = '<tr><td class="dim">asking the printer</td></tr>';
-  $('pwait').textContent = '';
-  const r = await fetch('/printer/files');
-  const text = await r.text();
-  const tb = $('ptab');
-  tb.textContent = '';
-  if (!r.ok) { tb.insertRow().insertCell().innerHTML = '<span class="dim"></span>';
-               tb.rows[0].cells[0].firstChild.textContent = text.trim(); return; }
-  let wait = '';
-  for (const line of text.split('\n')) {
-    if (/^waiting |^next /.test(line)) { wait += (wait ? ' · ' : '') + line.trim(); continue; }
-    const m = line.match(/^(\S+)\s+(\d+)\s+(.*)$/);
-    if (!m) continue;
-    const tr = tb.insertRow();
-    const n = tr.insertCell(); n.className = 'nm';
-    n.textContent = m[3];
-    const z = document.createElement('span');
-    z.className = 'dim num'; z.style.marginLeft = '8px'; z.textContent = kib(+m[2]);
-    n.append(z);
-    const a = tr.insertCell(); a.className = 'acts';
-    const box = document.createElement('div'); box.className = 'row';
-    box.append(btn('Print', 'p', () => confirm('Print ' + m[3] + '?') &&
-      call('/printer/print?name=' + encodeURIComponent(m[3]), {method:'POST'}).then(() => toast('printing'))));
-    a.append(box);
-  }
-  if (!tb.rows.length) tb.insertRow().insertCell().innerHTML = '<span class="dim">nothing on the printer card</span>';
-  $('pwait').textContent = wait;
+  if (asking) return;
+  asking = true;
+  try {
+    const r = await fetch('/printer/files');
+    const text = await r.text();
+    const tb = $('ptab');
+    tb.textContent = '';
+    if (!r.ok) {
+      const cell = tb.insertRow().insertCell();
+      cell.className = 'dim';
+      cell.textContent = text.trim();
+      return;
+    }
+    let wait = '';
+    for (const line of text.split('\n')) {
+      if (/^waiting |^next /.test(line)) { wait += (wait ? ' · ' : '') + line.trim(); continue; }
+      const m = line.match(/^(\S+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const tr = tb.insertRow();
+      const img = document.createElement('img');
+      img.className = 'tmini'; img.loading = 'lazy'; img.alt = '';
+      img.onerror = () => img.classList.add('noimg');
+      img.src = '/thumbnail?name=' + encodeURIComponent(m[3]);
+      const t = tr.insertCell(); t.className = 'thumbcell'; t.append(img);
+      const n = tr.insertCell(); n.className = 'nm';
+      n.textContent = m[3];
+      const z = document.createElement('span');
+      z.className = 'dim num'; z.style.marginLeft = '8px'; z.textContent = kib(+m[2]);
+      n.append(z);
+      const a = tr.insertCell(); a.className = 'acts';
+      const box = document.createElement('div'); box.className = 'row';
+      box.append(btn('Print', 'p', () => confirm('Print ' + m[3] + '?') &&
+        call('/printer/print?name=' + encodeURIComponent(m[3]), {method:'POST'})
+          .then(() => { toast('printing'); })));
+      a.append(box);
+    }
+    if (!tb.rows.length) {
+      const cell = tb.insertRow().insertCell();
+      cell.className = 'dim';
+      cell.textContent = 'nothing on the printer card';
+    }
+    $('pwait').textContent = wait;
+  } finally { asking = false; }
 }
 $('bpcard').onclick = () => printerCard().catch(()=>{});
 
@@ -516,6 +534,7 @@ $('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel
 $('brestart').onclick = () => confirm('Restart the module? The printer keeps running.') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
 $('bpick').onclick = () => {
   if (busy) { toast('a transfer is running, upload when it finishes'); return; }
+  if (conPrinting) { toast('a print is running, the wire is not free'); return; }
   $('file').click();
 };
 
@@ -546,9 +565,11 @@ function upload(f){
   x.upload.onprogress = e => { if (e.lengthComputable) p.value = e.loaded * 100 / e.total; };
   x.onloadend = () => {
     p.classList.add('hide');
-    toast(x.status === 201 ? 'uploaded' : ('upload failed: ' + (x.responseText || x.status)));
+    toast(x.status === 201 ? 'uploaded, going to the printer' : ('upload failed: ' + (x.responseText || x.status)));
     loadFiles();
+    pollTransfer().catch(()=>{});
   };
+  form.append('print', 'true');
   x.open('POST', '/api/files/local');
   x.send(form);
 }
@@ -635,6 +656,7 @@ $('conform').onsubmit = async e => {
   }
 })();
 loadFiles().catch(()=>{});
+printerCard().catch(()=>{});
 </script>
 )PAGE";
 
