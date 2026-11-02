@@ -281,6 +281,14 @@ class AsyncWebServerRequest {
 
 typedef std::function<bool(AsyncWebServerRequest *request)> ArRequestFilterFunction;
 
+// PATCH. setAuthentication is honoured by the static handler alone, so putting it on a
+// callback route compiles and guards nothing. Rather than repeat a check at the head of
+// every route, where forgetting one is enough to undo the lot, the callback handler asks
+// this hook first. Returning false means the hook has already answered the request.
+// NULL leaves the server open, which is the stock behaviour.
+typedef bool (*ArAuthGuard)(AsyncWebServerRequest *request);
+extern ArAuthGuard asyncAuthGuard;
+
 bool ON_STA_FILTER(AsyncWebServerRequest *request);
 
 bool ON_AP_FILTER(AsyncWebServerRequest *request);

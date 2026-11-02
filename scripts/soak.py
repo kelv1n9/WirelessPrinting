@@ -11,7 +11,15 @@
 свободен. Без ключа стенд гоняет одну веб-нагрузку.
 """
 
-import argparse, json, random, statistics, sys, threading, time, urllib.error, urllib.request
+import os, argparse, json, random, statistics, sys, threading, time, urllib.error, urllib.request
+
+# The module wants a key now. Put it in KP3S_KEY, it is on the module's front page.
+# Installed as the default opener so every urlopen below carries it unchanged.
+_key = os.environ.get("KP3S_KEY", "")
+if _key:
+    _opener = urllib.request.build_opener()
+    _opener.addheaders = [("X-Api-Key", _key)]
+    urllib.request.install_opener(_opener)
 
 ROUTES = [
     "/api/status", "/api/job", "/api/printer", "/api/files", "/api/console?since=0",

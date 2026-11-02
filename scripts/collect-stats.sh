@@ -8,6 +8,11 @@
 # Если принтер уже работает или печатает, розетка не трогается.
 
 set -u
+
+# The module wants a key now. Put it in KP3S_KEY, it is on the module's front page.
+# Wrapping curl rather than touching every call keeps the two apart.
+KP3S_KEY=${KP3S_KEY:-}
+curl() { command curl ${KP3S_KEY:+-H "X-Api-Key: $KP3S_KEY"} "$@"; }
 # Системный резолвер ждёт обычный DNS пять секунд на каждое имя .local, поэтому
 # имя разбирается один раз, а дальше идёт адрес.
 M=${KP3S:-}

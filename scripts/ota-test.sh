@@ -10,6 +10,11 @@
 # залил бы pio run -t upload.
 
 set -u
+
+# The module wants a key now. Put it in KP3S_KEY, it is on the module's front page.
+# Wrapping curl rather than touching every call keeps the two apart.
+KP3S_KEY=${KP3S_KEY:-}
+curl() { command curl ${KP3S_KEY:+-H "X-Api-Key: $KP3S_KEY"} "$@"; }
 M=${KP3S:-http://kp3s.local}
 BIN=.pio/build/esp32dev/firmware.bin
 V=0

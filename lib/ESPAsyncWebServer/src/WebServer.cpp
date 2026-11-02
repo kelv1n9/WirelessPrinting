@@ -21,6 +21,8 @@
 #include "ESPAsyncWebServer.h"
 #include "WebHandlerImpl.h"
 
+ArAuthGuard asyncAuthGuard = NULL;   // PATCH. Set by the sketch, see ESPAsyncWebServer.h
+
 bool ON_STA_FILTER(AsyncWebServerRequest *request) {
   return WiFi.localIP() == request->client()->localIP();
 }

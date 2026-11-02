@@ -27,6 +27,7 @@
 #include <ESPAsyncWebServer.h>    // https://github.com/me-no-dev/ESPAsyncWebServer
 #include <ESPAsyncWiFiManager.h>  // https://github.com/alanswx/ESPAsyncWiFiManager/
 
+#include "WebAuth.h"
 #include "CommandQueue.h"
 #include "YandexHome.h"
 #include "TelegramBot.h"
@@ -330,8 +331,14 @@ inline String IpAddress2String(const IPAddress& ipAddress) {
 void logEvent(const String &text);
 static String spell(const int32_t minutes);
 
+static bool telnetLoggedIn;
+
+// Whoever reaches this port can push gcode straight at the printer, so until the
+// password has been typed the socket is deaf and nothing is echoed down it. The word
+// itself crosses the house network as typed, which a raw socket cannot help; the web
+// uses digest and never sends it at all.
 inline bool telnetReady() {
-  return serverClient && serverClient.connected();
+  return serverClient && serverClient.connected() && telnetLoggedIn;
 }
 
 // A client whose machine went to sleep leaves a socket that is neither closed nor
@@ -901,6 +908,22 @@ static void cardSendSettle() {
       logEvent("removed " + baseName(cardSendSource) + " from this module, it lives on the printer now");
     }
   }
+}
+
+// A module nobody can reach is as bad as one anyone can, and there is no wire to this
+// one. So the password it invented for itself is put where the owner can read it: the
+// printer's own screen, Telegram if the bot is set up, and the journal. Every boot until
+// it is changed, because a screen is easy to miss.
+void handleWebAuthGreeting() {
+  static bool told;
+
+  if (told || !webAuthIsFresh() || !printerConnected)
+    return;
+  told = true;
+
+  lcd(webAuthGreeting());
+  logEvent(webAuthGreeting());
+  telegramBot.notify(webAuthGreeting() + "\nChange it on the settings page.");
 }
 
 void handleCardSend() {
@@ -2205,6 +2228,18 @@ size_t buildFallbackPage() {
           "<label for=\"printImmediately\">Print immediately</label><br/>\n"
           "<input type=\"submit\" value=\"Upload\"/>\n"
           "</form>"
+          "<h2>Who gets in</h2>");
+  if (webAuthIsFresh())
+    pageAdd("<p><b>This is still the password the module made up for itself. Change it.</b></p>");
+  pageAdd("<form action=\"/auth/password\" method=\"POST\">"
+          "<input name=\"pass\" type=\"password\" minlength=\"8\" required "
+          "placeholder=\"new password, 8 or more\"/> "
+          "<input type=\"submit\" value=\"Change\"/></form>"
+          "<p>Key for the slicer, put it in Orca where it asks for an OctoPrint API key:<br/><code>");
+  pageAdd(htmlEscape(webAuthKey()));
+  pageAdd("</code></p>"
+          "<p><button onclick=\"post('/auth/key')\">Make a new key</button> "
+          "the old one stops working at once</p>"
           "<p><a href=\"/info\">Info</a> | <a href=\"/yandex\">Yandex socket</a></p>"
           "<hr><p>WirelessPrinting <a href=\"https://github.com/kelv1n9/WirelessPrinting/commit/");
   pageAdd(SKETCH_VERSION);
@@ -2390,6 +2425,12 @@ void setup() {
 
   initSelectedFile();
 
+  // Closes every route before the server answers one. It has to stay below the WiFi
+  // call above: esp_random only draws on real entropy once the radio is running, and
+  // the password this invents on a fresh module is drawn from it. Moved any earlier,
+  // every module would invent the same one.
+  webAuthBegin();
+
   preferences.begin("wirelessprint", true);
   autoPowerOff = preferences.getBool("autooff", false);
   energyTariff = preferences.getFloat("tariff", ENERGY_TARIFF);
@@ -2565,6 +2606,26 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
     }
     telegramBot.deny(request->getParam("chat")->value());
     request->send(204, "text/plain", "");
+  });
+
+  server.on("/auth/password", HTTP_POST, [](AsyncWebServerRequest * request) {
+    if (!request->hasParam("pass", true)) {
+      request->send(400, "text/plain", "pass is required");
+      return;
+    }
+    const String chosen = request->getParam("pass", true)->value();
+    if (chosen.length() < 8) {
+      request->send(400, "text/plain", "eight characters at the very least\n");
+      return;
+    }
+    webAuthSetPassword(chosen);
+    lcd("Web password set");
+    request->send(200, "text/plain", "changed, log in again\n");
+  });
+
+  server.on("/auth/key", HTTP_POST, [](AsyncWebServerRequest * request) {
+    webAuthNewKey();
+    request->send(200, "text/plain", "a new key is on the front page\n");
   });
 
   server.on("/yandex/token", HTTP_POST, [](AsyncWebServerRequest * request) {
@@ -3934,9 +3995,9 @@ function post(url) { fetch(url, {method: 'POST'}).then(function(r) { if (!r.ok) 
   #ifdef OTA_UPDATES
     // OTA setup
     ArduinoOTA.setHostname(MDNS_HOSTNAME);     // This is also the name the network answers to
-    #ifdef OTA_PASSWORD
-      ArduinoOTA.setPassword(OTA_PASSWORD);
-    #endif
+    // The same secret as the web, so there is one to lose rather than two. espota needs
+    // it as --auth, and the /update route behind the password is the gentler way in.
+    ArduinoOTA.setPassword(webAuthPassword.c_str());
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
       esp_task_wdt_reset();
     });
@@ -4227,6 +4288,7 @@ void loop() {
     handlePrint();
     handleCardSend();
     handleSendQueue();
+    handleWebAuthGreeting();
     handleEnergy();
     handleAutoPowerOff();
 
@@ -4290,6 +4352,8 @@ void loop() {
 
     serverClient = telnetServer.available();
     serverClient.flush();  // clear input buffer, else you get strange characters
+    telnetLoggedIn = false;
+    serverClient.println("password:");
   }
 
   static String telnetCommand;
@@ -4300,7 +4364,17 @@ void loop() {
 
     if (ch == '\r' || ch == '\n') {
       if (telnetCommand.length() > 0) {
-        commandQueue.push(telnetCommand);
+        if (telnetLoggedIn)
+          commandQueue.push(telnetCommand);
+        else if (telnetCommand == webAuthPassword) {
+          telnetLoggedIn = true;
+          serverClient.println("go ahead");
+        }
+        else {
+          serverClient.println("no");
+          serverClient.stop();
+          logEvent("a telnet client gave the wrong password and was dropped");
+        }
         telnetCommand = "";
       }
     }

@@ -91,16 +91,22 @@ class AsyncCallbackWebHandler: public AsyncWebHandler {
     }
   
     virtual void handleRequest(AsyncWebServerRequest *request) override final {
+      if(asyncAuthGuard && !asyncAuthGuard(request))
+        return;                           // PATCH. The guard has answered it already
       if(_onRequest)
         _onRequest(request);
       else
         request->send(500);
     }
     virtual void handleUpload(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) override final {
+      if(asyncAuthGuard && !asyncAuthGuard(request))
+        return;                           // PATCH. Nothing is written to the card unasked
       if(_onUpload)
         _onUpload(request, filename, index, data, len, final);
     }
     virtual void handleBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) override final {
+      if(asyncAuthGuard && !asyncAuthGuard(request))
+        return;                           // PATCH. Nor is a body acted on
       if(_onBody)
         _onBody(request, data, len, index, total);
     }
