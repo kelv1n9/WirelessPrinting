@@ -63,6 +63,7 @@ static bool worthPacking(const char *name) {
 enum Chore : uint8_t { ChoreNone, ChoreSending, ChoreDone, ChoreFailed };
 
 static Chore chore;
+static String lastUpload;
 static bool choreShouldPrint;
 static char choreTarget[PRINTER_CARD_NAME_BYTES];
 static String choreTrouble;
@@ -192,8 +193,90 @@ static const char *choreName() {
   }
 }
 
+static WebServer server(80);
+
+// One body for both upload routes: the module's own and the one a slicer speaks.
+static void takeUpload() {
+  static File into;
+  static uint8_t lined[2048] __attribute__((aligned(32)));   // SD_MMC moves this over DMA
+  HTTPUpload &up = server.upload();
+
+  if (up.status == UPLOAD_FILE_START) {
+    sendTrouble = "";
+    lastUpload = up.filename;
+    if (!cardUp) {
+      sendTrouble = "the module has no card";
+      return;
+    }
+    into = SD_MMC.open("/" + up.filename, FILE_WRITE);
+    if (!into)
+      sendTrouble = "the module's card would not take the file";
+  }
+  else if (up.status == UPLOAD_FILE_WRITE && into) {
+    for (size_t at = 0; at < up.currentSize; at += sizeof(lined)) {
+      const size_t take = up.currentSize - at < sizeof(lined) ? up.currentSize - at : sizeof(lined);
+      memcpy(lined, up.buf + at, take);
+      if (into.write(lined, take) != take) {
+        sendTrouble = "the module's card stopped taking bytes";
+        break;
+      }
+    }
+  }
+  else if (up.status == UPLOAD_FILE_END && into)
+    into.close();
+}
+
+// Takes a file on the module's card all the way to the printer, and onto it if asked.
+// Says no rather than half doing it, with the reason left in choreTrouble.
+static bool startChore(const String &name, const bool andPrint) {
+  choreTrouble = "";
+  if (sender.running()) {
+    choreTrouble = "a transfer is already running";
+    return false;
+  }
+  if (printing) {
+    choreTrouble = "the printer is printing, the wire is not free";
+    return false;
+  }
+  if (name == "") {
+    choreTrouble = "name is empty";
+    return false;
+  }
+  sendBytes.shut();
+  if (!sendBytes.open(("/" + name).c_str())) {
+    choreTrouble = "no such file on the module's card";
+    return false;
+  }
+  if (!printerCardTarget(name.c_str(), choreTarget, sizeof choreTarget)) {
+    sendBytes.shut();
+    choreTrouble = "that name cannot be put on the printer";
+    return false;
+  }
+  strncpy(sendName, name.c_str(), sizeof(sendName) - 1);
+  sendName[sizeof(sendName) - 1] = 0;
+  choreShouldPrint = andPrint;
+  chore = ChoreSending;
+  sendAsked = true;
+  return true;
+}
+
+// A transfer leaves the printer a moment short of reading gcode again, and anything
+// sent into that gap is swallowed as packet bytes rather than answered. So the wire is
+// not trusted until a plain command has come back with an ok of its own.
+static bool settleWire() {
+  for (int tries = 0; tries < 6; tries++) {
+    say("M105");
+    if (sawOk)
+      return true;
+    delay(100);
+  }
+  return false;
+}
+
 static bool askPrinterCard() {
   if (sender.running())
+    return false;
+  if (!settleWire())
     return false;
   say("M21");
   printerCard.begin();
@@ -217,7 +300,6 @@ static const char *phaseName(const BinaryPhase p) {
   return "?";
 }
 
-static WebServer server(80);
 static Preferences store;
 static bool portal;
 
@@ -347,34 +429,29 @@ void setup() {
       return;
     }
     server.send(200, "text/plain", "stored\n");
-  }, []() {
-    static File into;
-    static uint8_t lined[2048] __attribute__((aligned(32)));   // SD_MMC moves this over DMA
-    HTTPUpload &up = server.upload();
+  }, takeUpload);
 
-    if (up.status == UPLOAD_FILE_START) {
-      sendTrouble = "";
-      if (!cardUp) {
-        sendTrouble = "the module has no card";
-        return;
-      }
-      into = SD_MMC.open("/" + up.filename, FILE_WRITE);
-      if (!into)
-        sendTrouble = "the module's card would not take the file";
-    }
-    else if (up.status == UPLOAD_FILE_WRITE && into) {
-      for (size_t at = 0; at < up.currentSize; at += sizeof(lined)) {
-        const size_t take = up.currentSize - at < sizeof(lined) ? up.currentSize - at : sizeof(lined);
-        memcpy(lined, up.buf + at, take);
-        if (into.write(lined, take) != take) {
-          sendTrouble = "the module's card stopped taking bytes";
-          break;
-        }
-      }
-    }
-    else if (up.status == UPLOAD_FILE_END && into)
-      into.close();
+  // What a slicer speaks. Only the two calls Orca actually makes are here.
+  server.on("/api/version", HTTP_GET, []() {
+    server.send(200, "application/json", "{\"api\":\"0.1\",\"server\":\"1.3.10\",\"text\":\"KP3S module\"}");
   });
+
+  server.on("/api/files/local", HTTP_POST, []() {
+    if (sendTrouble != "") {
+      const String why = sendTrouble;
+      sendTrouble = "";
+      server.send(500, "application/json", "{\"error\":\"" + why + "\"}");
+      return;
+    }
+    const String wanted = server.arg("print");
+    const bool andPrint = wanted == "true" || wanted == "1";
+    String said = "stored";
+    if (andPrint && !startChore(lastUpload, true))
+      said = choreTrouble.length() ? choreTrouble : "the printer is busy";
+    server.send(201, "application/json",
+      "{\"done\":true,\"name\":\"" + lastUpload + "\",\"said\":\"" + said + "\"}");
+  }, takeUpload);
+
 
   server.on("/files", HTTP_GET, []() {
     if (!cardUp) {
@@ -451,32 +528,11 @@ void setup() {
   });
 
   server.on("/printer/send", HTTP_POST, []() {
-    if (sender.running()) {
-      server.send(409, "text/plain", "a transfer is already running\n");
+    if (!startChore(server.arg("name"), server.arg("print") == "1")) {
+      server.send(choreTrouble == "no such file on the module's card" ? 404 : 409,
+                  "text/plain", choreTrouble + "\n");
       return;
     }
-    const String name = server.arg("name");
-    if (name == "") {
-      server.send(400, "text/plain", "name is empty\n");
-      return;
-    }
-    sendBytes.shut();
-    if (!sendBytes.open(("/" + name).c_str())) {
-      server.send(404, "text/plain", "no such file on the module's card\n");
-      return;
-    }
-    // The printer cannot take every name our card can hold, so it gets one it can.
-    if (!printerCardTarget(name.c_str(), choreTarget, sizeof choreTarget)) {
-      sendBytes.shut();
-      server.send(400, "text/plain", "that name cannot be put on the printer\n");
-      return;
-    }
-    strncpy(sendName, name.c_str(), sizeof(sendName) - 1);
-    sendName[sizeof(sendName) - 1] = 0;
-    choreShouldPrint = server.arg("print") == "1";
-    choreTrouble = "";
-    chore = ChoreSending;
-    sendAsked = true;
     server.send(200, "text/plain", "taken as " + String(choreTarget) + ", watch /printer/send/status\n");
   });
 
@@ -607,7 +663,7 @@ void loop() {
       chore = ChoreFailed;
     }
     else if (!askPrinterCard()) {
-      choreTrouble = "the printer did not finish a listing";
+      choreTrouble = "the printer did not answer with a listing";
       chore = ChoreFailed;
     }
     else if (!printerCard.holds(choreTarget, was)) {

@@ -5,19 +5,21 @@
 static const char PAGE_HTML[] = R"PAGE(<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>KP3S</title>
 <style>
-:root{--f:#111;--b:#fff;--l:#ccc;--d:#666}
-@media(prefers-color-scheme:dark){:root{--f:#ddd;--b:#15171a;--l:#444;--d:#999}}
+:root{--f:#111;--b:#fff;--l:#ccc;--d:#666;--sunk:#0000000d;--on:#000;--acc:#4c9aff;--ok:#8ce99a;--warn:#ffd166;--bad:#ff8a80}
+@media(prefers-color-scheme:dark){:root:not([data-t=day]){--f:#e8ebf0;--b:#0d0f12;--l:#262b33;--d:#8a93a2;--sunk:#15181d;--on:#0d0f12;--acc:#5b9cff;--ok:#3ddc84;--warn:#ffb020;--bad:#ff5f56}}
+:root[data-t=night]{--f:#e8ebf0;--b:#0d0f12;--l:#262b33;--d:#8a93a2;--sunk:#15181d;--on:#0d0f12;--acc:#5b9cff;--ok:#3ddc84;--warn:#ffb020;--bad:#ff5f56}
 body{font:15px/1.4 system-ui,sans-serif;color:var(--f);background:var(--b);margin:0 auto;padding:1rem;max-width:44rem}
 h1{font-size:1.2rem;margin:0}h2{font-size:.85rem;text-transform:uppercase;color:var(--d);margin:0 0 .4rem}
 small{font-weight:400;color:var(--d);font-size:.8rem}
 section{border-top:1px solid var(--l);padding:.8rem 0}
-input,button,select{font:inherit;padding:.3rem .5rem;color:var(--f);background:var(--b);border:1px solid var(--l);border-radius:4px}
+input,button,select{font:inherit;padding:.3rem .5rem;color:var(--f);background:var(--sunk);border:1px solid var(--l);border-radius:4px}
 button{cursor:pointer}button:hover{border-color:var(--d)}
-#bn p{margin:.3rem 0;padding:.5rem .7rem;border-radius:4px;font-weight:600;color:#000}
-.nx{background:#ff8a80}.nw{background:#ffd166}.ng{background:#8ce99a}.ni{background:#0001;color:var(--f);font-weight:400}
-.b{height:6px;background:#0002;border-radius:3px;overflow:hidden;margin:.4rem 0}
-.b i{display:block;height:100%;width:0;background:#4c9aff;transition:width .3s}
-pre{white-space:pre-wrap;word-break:break-word;background:#0001;padding:.5rem;border-radius:4px;max-height:11rem;overflow:auto;margin:.4rem 0;font-size:.8rem}
+#bn p{margin:.3rem 0;padding:.5rem .7rem;border-radius:4px;font-weight:600;color:var(--on)}
+.nx{background:var(--bad)}.nw{background:var(--warn)}.ng{background:var(--ok)}
+.ni{background:var(--sunk);color:var(--f);font-weight:400}
+.b{height:6px;background:var(--sunk);border-radius:3px;overflow:hidden;margin:.4rem 0}
+.b i{display:block;height:100%;width:0;background:var(--acc);transition:width .3s}
+pre{white-space:pre-wrap;word-break:break-word;background:var(--sunk);padding:.5rem;border-radius:4px;max-height:11rem;overflow:auto;margin:.4rem 0;font-size:.8rem}
 .f{display:flex;gap:.5rem;align-items:center;padding:.2rem 0;border-bottom:1px solid var(--l)}
 .f b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .f span{color:var(--d);font-size:.8rem}
@@ -25,7 +27,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0001;padding:.5rem;bo
 form{display:inline-flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0}
 </style>
 
-<h1>KP3S module <small id=hd>connecting</small></h1>
+<h1>KP3S module <small id=hd>connecting</small> <button id=th title="day, night or whatever the system says">auto</button></h1>
 <div id=bn></div>
 <div id=ms></div>
 
@@ -37,8 +39,12 @@ form{display:inline-flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0}
 <section><h2>Transfer to printer card</h2>
 <div id=tx>idle</div><div class=b><i id=tb></i></div></section>
 
+<section><h2>Printer card</h2>
+<button id=pr>refresh</button> <span id=pw></span>
+<div id=pl>not asked yet</div></section>
+
 <section><h2>Module card</h2>
-<form id=uf><input type=file name=f required><button>upload</button></form>
+<form id=uf><input type=file name=f required><label><input id=ua type=checkbox> and print it</label><button>upload</button></form>
 <button id=rf>refresh</button><div class=b><i id=ub></i></div>
 <div id=fl>loading</div></section>
 
@@ -53,7 +59,7 @@ form{display:inline-flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0}
 
 <script>
 var $=function(i){return document.getElementById(i)}
-var q=Promise.resolve(),st=null,tr=null,off=0,P={b:0,m:0,at:0,done:0,log:''}
+var q=Promise.resolve(),st=null,tr=null,off=0,P={b:0,m:0,at:0,done:0,log:'',t:'auto'}
 try{P=Object.assign(P,JSON.parse(localStorage.kp3s||'{}'))}catch(e){}
 function save(){try{localStorage.kp3s=JSON.stringify(P)}catch(e){}}
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
@@ -105,7 +111,7 @@ function draw(){
   if(!n.length&&st)n.push(['i','idle'])
   $('bn').innerHTML=n.map(function(x){return'<p class=n'+x[0]+'>'+esc(x[1])+'</p>'}).join('')
 
-  $('tx').textContent=tr?tr.phase+' · '+tr.written+'/'+tr.total+' bytes · '+tr.packets+' packets, '+tr.resends+' resends · '+tr.took+(tr.trouble!='none'?' · trouble: '+tr.trouble:''):'unknown'
+  $('tx').textContent=tr?tr.phase+(tr.as?' · as '+tr.as:'')+' · '+tr.written+'/'+tr.total+' bytes · '+tr.packets+' packets, '+tr.resends+' resends · '+tr.took+(tr.trouble!='none'?' · trouble: '+tr.trouble:''):'unknown'
   $('tb').style.width=tr?pc(tr.written,tr.total)+'%':'0'
   $('pg').textContent=P.m?(P.done?'done · ':'')+P.b+' / '+P.m+' bytes ('+pc(P.b,P.m)+'%)':'nothing seen yet'
   $('pb').style.width=pc(P.b,P.m)+'%'
@@ -122,7 +128,7 @@ function cycle(){
       var w=pick(r.t,'written').split(' ')
       tr={phase:pick(r.t,'phase'),name:pick(r.t,'name'),written:+w[0]||0,total:+w[2]||0,
           packets:(pick(r.t,'packets').split(',')[0]||'0'),resends:(pick(r.t,'packets').split('resends')[1]||'').trim(),
-          took:pick(r.t,'took'),trouble:pick(r.t,'trouble')||'none'}
+          took:pick(r.t,'took'),as:pick(r.t,'as'),trouble:pick(r.t,'trouble')||'none'}
     }
     if(busy())return{s:0,t:''}
     return one('/printer/progress')
@@ -141,23 +147,63 @@ function files(){
       var i=l.lastIndexOf('  ');if(i<0)return''
       var n=l.slice(0,i).replace(/^\//,''),z=+l.slice(i+2)||0
       return'<div class=f><b>'+esc(n)+'</b><span>'+kb(z)+'</span>'+
-        '<button data-s="'+esc(n)+'">to printer</button><button data-p="'+esc(n)+'">print</button></div>'
+        '<button data-s="'+esc(n)+'">to printer</button><button data-g="'+esc(n)+'">send and print</button></div>'
     }).join('')
     $('fl').innerHTML=rows||esc(r.t.trim())
   })
 }
 
-$('fl').onclick=function(e){
-  var s=e.target.getAttribute('data-s'),p=e.target.getAttribute('data-p')
-  if(s){
-    if(!confirm('send '+s+' to the printer card?'))return
-    note('asking for '+s)
-    one('/printer/send?name='+encodeURIComponent(s),{method:'POST'}).then(function(r){note(r.t||'no answer')})
-  }else if(p){
-    if(!confirm('print '+p+'?'))return
-    one('/printer/print?name='+encodeURIComponent(p),{method:'POST'}).then(function(r){note(r.t||'no answer');bump(r.t);draw()})
-  }
+function send(n,andPrint){
+  if(!confirm((andPrint?'send and print ':'send ')+n+'?'))return
+  note('asking for '+n)
+  one('/printer/send?name='+encodeURIComponent(n)+(andPrint?'&print=1':''),{method:'POST'})
+    .then(function(r){note(r.t||'no answer')})
 }
+
+$('fl').onclick=function(e){
+  var s=e.target.getAttribute('data-s'),g=e.target.getAttribute('data-g')
+  if(s)send(s,false)
+  else if(g)send(g,true)
+}
+
+// The printer's card is only asked for on purpose: it costs the wire two commands.
+function printerFiles(){
+  if(busy()){note('a transfer is running, wait for it');return}
+  $('pl').textContent='asking the printer'
+  $('pw').textContent=''
+  one('/printer/files').then(function(r){
+    if(r.s!=200){$('pl').textContent=(r.t||'the printer did not answer').trim();return}
+    var rows=[],wait=''
+    r.t.split('\n').forEach(function(l){
+      if(/^waiting |^next /.test(l)){wait+=(wait?' · ':'')+l.trim();return}
+      var m=l.match(/^(\S+)\s+(\d+)\s+(.*)$/)
+      if(!m)return
+      rows.push('<div class=f><b>'+esc(m[3])+'</b><span>'+kb(+m[2])+'</span>'+
+        '<button data-n="'+esc(m[3])+'">print</button></div>')
+    })
+    $('pw').textContent=wait
+    $('pl').innerHTML=rows.join('')||'nothing on the printer card'
+  })
+}
+$('pr').onclick=printerFiles
+$('pl').onclick=function(e){
+  var n=e.target.getAttribute('data-n')
+  if(!n)return
+  if(!confirm('print '+n+'?'))return
+  one('/printer/print?name='+encodeURIComponent(n),{method:'POST'})
+    .then(function(r){note(r.t||'no answer');bump(r.t);draw()})
+}
+// Three states rather than two: the system's own choice is a choice worth keeping.
+var themes=['auto','day','night']
+function theme(t){
+  if(t=='auto')document.documentElement.removeAttribute('data-t')
+  else document.documentElement.setAttribute('data-t',t)
+  $('th').textContent=t
+  P.t=t;save()
+}
+$('th').onclick=function(){theme(themes[(themes.indexOf(P.t||'auto')+1)%3])}
+theme(P.t||'auto')
+
 $('rf').onclick=files
 $('clr').onclick=function(){P.log='';P.m=0;P.b=0;P.done=0;save();draw()}
 $('can').onclick=function(){
@@ -173,6 +219,9 @@ $('uf').onsubmit=function(e){
   post('/upload',fd,'ub').then(function(r){
     note(r.s==200?'stored '+f.name:(r.t||'the upload failed').trim())
     $('ub').style.width='0';files()
+    if(r.s==200&&$('ua').checked)
+      one('/printer/send?name='+encodeURIComponent(f.name)+'&print=1',{method:'POST'})
+        .then(function(x){note(x.t||'no answer')})
   })
 }
 $('ff').onsubmit=function(e){
