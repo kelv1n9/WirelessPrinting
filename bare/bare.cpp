@@ -56,6 +56,33 @@ static bool sendAsked;
 static bool cardUp;
 static String sendTrouble;
 
+// Writes one line and gathers whatever comes back, up to the first ok or the wait.
+static String say(const String line) {
+  while (Printer.available())
+    Printer.read();
+
+  Printer.println(line);
+
+  String out;
+  const uint32_t until = millis() + REPLY_WAIT_MS;
+  while ((int32_t)(millis() - until) < 0) {
+    while (Printer.available() && out.length() < 3000)
+      out += (char)Printer.read();
+    if (out.endsWith("ok\n") || out.endsWith("ok\r\n"))
+      break;
+    delay(5);
+  }
+  return out;
+}
+
+// Whatever the printer has said on its own since this was last asked.
+static String heard() {
+  String out;
+  while (Printer.available() && out.length() < 3000)
+    out += (char)Printer.read();
+  return out;
+}
+
 static const char *phaseName(const BinaryPhase p) {
   switch (p) {
     case BinaryIdle:      return "idle";
@@ -280,6 +307,35 @@ void setup() {
     sendName[sizeof(sendName) - 1] = 0;
     sendAsked = true;
     server.send(200, "text/plain", "taken, watch /printer/send/status\n");
+  });
+
+  // The printer prints from its own card. Nothing here feeds it gcode, which is the
+  // whole point: the module can reboot, lose the network or be reflashed mid print and
+  // the printer will not notice. M21 is sent every time because a binary transfer leaves
+  // the card unmounted behind it.
+  server.on("/printer/print", HTTP_POST, []() {
+    const String name = server.arg("name");
+    if (name == "") {
+      server.send(400, "text/plain", "name is empty\n");
+      return;
+    }
+    say("M21");
+    const String opened = say("M23 " + name);
+    if (opened.indexOf("File opened") < 0) {
+      server.send(404, "text/plain", "the printer would not open it:\n" + opened);
+      return;
+    }
+    say("M27 S3");            // It reports on its own from idle(), so a full queue cannot delay it
+    say("M24");
+    server.send(200, "text/plain", "printing " + name + "\n");
+  });
+
+  server.on("/printer/cancel", HTTP_POST, []() {
+    server.send(200, "text/plain", say("M524"));
+  });
+
+  server.on("/printer/progress", HTTP_GET, []() {
+    server.send(200, "text/plain", heard());
   });
 
   // Both ends have to move together. M575 is not saved, so a power cycle undoes a mistake.
