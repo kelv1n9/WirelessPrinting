@@ -18,6 +18,8 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <MD5Builder.h>
+#include <base64.h>
 
 // No comma and no colon in here. The challenge header separates its parameters with
 // commas, and although a quoted value may hold one, Safari splits on them anyway and
@@ -30,7 +32,7 @@
 // is registered through.
 WebServer server(80);
 
-static String webAuthPassword, webAuthApiKey;
+static String webAuthPassword, webAuthApiKey, webAuthNonce;
 
 inline bool webAuthSet() { return webAuthPassword != ""; }
 inline const String &webAuthKey() { return webAuthApiKey; }
@@ -45,6 +47,80 @@ static String webAuthInvent(const unsigned int length) {
   return out;
 }
 
+static String webAuthMd5(const String &of) {
+  MD5Builder md5;
+  md5.begin();
+  md5.add(of);
+  md5.calculate();
+  return md5.toString();
+}
+
+// name="value", or name=value up to a comma, whichever the client wrote
+static String webAuthField(const String &from, const char *name) {
+  const String key = String(name) + "=";
+  int at = from.indexOf(key);
+  while (at > 0 && from[at - 1] != ' ' && from[at - 1] != ',')
+    at = from.indexOf(key, at + 1);        // cnonce must not be found inside nonce
+  if (at < 0)
+    return "";
+  at += key.length();
+  if (from[at] == '"') {
+    const int end = from.indexOf('"', at + 1);
+    return end < 0 ? String("") : from.substring(at + 1, end);
+  }
+  int end = from.indexOf(',', at);
+  if (end < 0)
+    end = from.length();
+  String out = from.substring(at, end);
+  out.trim();
+  return out;
+}
+
+static const char *webAuthVerb() {
+  switch (server.method()) {
+    case HTTP_POST:   return "POST";
+    case HTTP_PUT:    return "PUT";
+    case HTTP_DELETE: return "DELETE";
+    case HTTP_PATCH:  return "PATCH";
+    case HTTP_HEAD:   return "HEAD";
+    default:          return "GET";
+  }
+}
+
+// Digest worked out here rather than by the library, because the library keeps one
+// nonce for the whole server and makes a new one with every refusal. A browser asks
+// for a page and its icon and its data at the same time: each refusal overwrites the
+// nonce the others were answered with, every answer then fails to add up, and a right
+// password reads as a wrong one. This nonce is made once and left alone.
+static bool webAuthDigestFits(const String &said) {
+  if (webAuthField(said, "username") != WEBAUTH_USER)
+    return false;
+  if (webAuthField(said, "nonce") != webAuthNonce)
+    return false;
+  const String uri = webAuthField(said, "uri");
+  const String answer = webAuthField(said, "response");
+  if (uri == "" || answer == "")
+    return false;
+
+  const String ha1 = webAuthMd5(String(WEBAUTH_USER) + ":" + WEBAUTH_REALM + ":" + webAuthPassword);
+  const String ha2 = webAuthMd5(String(webAuthVerb()) + ":" + uri);
+
+  const String qop = webAuthField(said, "qop");
+  String ours;
+  if (qop == "auth")
+    ours = webAuthMd5(ha1 + ":" + webAuthNonce + ":" + webAuthField(said, "nc") + ":" +
+                      webAuthField(said, "cnonce") + ":auth:" + ha2);
+  else
+    ours = webAuthMd5(ha1 + ":" + webAuthNonce + ":" + ha2);
+  return ours.equalsIgnoreCase(answer);
+}
+
+static bool webAuthBasicFits(const String &said) {
+  String wanted = base64::encode(String(WEBAUTH_USER) + ":" + webAuthPassword);
+  wanted.trim();
+  return said == wanted;
+}
+
 // Whether this request may go through, without saying anything back. The upload path
 // needs the answer long before there is a reply to put a refusal in.
 static bool webAuthAllows() {
@@ -53,13 +129,23 @@ static bool webAuthAllows() {
   if (webAuthApiKey != "" && server.hasHeader("X-Api-Key")
       && server.header("X-Api-Key") == webAuthApiKey)
     return true;
-  return server.authenticate(WEBAUTH_USER, webAuthPassword.c_str());
+  if (!server.hasHeader("Authorization"))
+    return false;
+  String said = server.header("Authorization");
+  if (said.startsWith("Digest "))
+    return webAuthDigestFits(said.substring(7));
+  if (said.startsWith("Basic "))
+    return webAuthBasicFits(said.substring(6));
+  return false;
 }
 
 static bool webAuthLets() {
   if (webAuthAllows())
     return true;
-  server.requestAuthentication(DIGEST_AUTH, WEBAUTH_REALM,
+  server.sendHeader("WWW-Authenticate",
+    "Digest realm=\"" WEBAUTH_REALM "\", qop=\"auth\", nonce=\"" + webAuthNonce +
+    "\", opaque=\"0\"");
+  server.send(401, "text/html",
     F("<!doctype html><meta charset=utf-8><title>KP3S</title>"
       "<p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. "
       "Reload the page to try again.</p>"));
@@ -101,6 +187,8 @@ inline void webAuthBegin() {
     keep.putString("key", webAuthApiKey);
   }
   keep.end();
+
+  webAuthNonce = webAuthInvent(32);
 
   static const char *wanted[] = {"X-Api-Key"};
   server.collectHeaders(wanted, 1);
