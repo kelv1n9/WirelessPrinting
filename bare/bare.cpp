@@ -342,6 +342,25 @@ void setup() {
     server.send(200, "text/plain", out == "" ? "nothing on the card\n" : out);
   });
 
+  server.on("/download", HTTP_GET, []() {
+    if (!cardUp) {
+      server.send(503, "text/plain", "the module has no card\n");
+      return;
+    }
+    if (sender.running()) {
+      server.send(503, "text/plain", "a transfer owns the card\n");
+      return;
+    }
+    File one = SD_MMC.open("/" + server.arg("name"));
+    if (!one || one.isDirectory()) {
+      if (one) one.close();
+      server.send(404, "text/plain", "no such file\n");
+      return;
+    }
+    server.streamFile(one, "application/octet-stream");
+    one.close();
+  });
+
   server.on("/printer/send", HTTP_POST, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer is already running\n");
