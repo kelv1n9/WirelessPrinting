@@ -81,6 +81,19 @@ public:
     phase = BinaryIdle;
   }
 
+  // Puts a printer that is stuck in packet mode back to reading gcode, from nothing:
+  // no transfer in progress, no idea what sync number it is expecting. SYNC is the one
+  // packet Marlin takes whatever the number says (binary_stream.h: "The SYNC control
+  // packet is a special case"), so it is the way back in. ABORT throws away whatever
+  // file was left half written, and CLOSE returns the printer to ASCII.
+  static void binaryRescue(LinkIo *link) {
+    if (!link)
+      return;
+    bare(link, 0, BinaryControl, BinarySync);
+    bare(link, 1, BinaryFile, BinaryAbort);
+    bare(link, 2, BinaryControl, BinaryClose);
+  }
+
   bool running() const { return phase != BinaryIdle && phase != BinaryDone && phase != BinaryFailed; }
 
   // Compression is asked for, not assumed: the printer is questioned first and the
@@ -91,6 +104,7 @@ public:
 
     source = from;
     stopping = false;
+    spoke = false;
     wanted = pack;
     packing = false;
     sent = 0;
@@ -173,6 +187,7 @@ private:
   uint16_t held;                       // length of the packet last sent, for a repeat
   bool atEnd;
   bool stopping = false;
+  bool spoke = false;            // the printer has answered a packet, so it is in packet mode
 
   char reply[BINARY_REPLY_BYTES];
   uint16_t tail;
@@ -190,8 +205,16 @@ private:
     return cs;
   }
 
+  // Giving up quietly is what left the printer deaf. Marlin only unsticks itself when
+  // a file is already open: binary_stream.h takes its idle timeout under
+  // "if (transfer_active ...)", and transfer_active is false until the open succeeds
+  // and again after it is closed. Break off anywhere outside that window and the
+  // printer stays in packet mode for good, swallowing every gcode line as packet
+  // bytes. So the printer is always told, even when there is nobody left to listen.
   void fail(const char *why) {
     trouble = why;
+    if (spoke)
+      binaryRescue(io);
     phase = BinaryFailed;
   }
 
@@ -204,6 +227,21 @@ private:
 
   // Lays a packet into the buffer and puts it on the wire. The token is not part of
   // either checksum, and the header checksum is part of the payload one.
+  // The same empty packet as put(), but owned by nobody, for the rescue above
+  static void bare(LinkIo *link, const uint8_t number, const uint8_t protocol, const uint8_t type) {
+    uint8_t one[BINARY_HEADER_BYTES];
+    one[0] = BINARY_TOKEN & 0xFF;
+    one[1] = (BINARY_TOKEN >> 8) & 0xFF;
+    one[2] = number;
+    one[3] = (uint8_t)(((protocol & 0xF) << 4) | (type & 0xF));
+    one[4] = 0;
+    one[5] = 0;
+    const uint16_t sum = fletcherOver(one + 2, 4);
+    one[6] = sum & 0xFF;
+    one[7] = (sum >> 8) & 0xFF;
+    link->write(one, BINARY_HEADER_BYTES);
+  }
+
   void put(const uint8_t protocol, const uint8_t type, const uint8_t *data, const uint16_t count) {
     packet[0] = BINARY_TOKEN & 0xFF;
     packet[1] = (BINARY_TOKEN >> 8) & 0xFF;
@@ -373,6 +411,8 @@ private:
 
   // The acknowledgement of a packet moves the work along
   void afterAck(const bool wasSync) {
+    spoke = true;              // from here the printer reads packets, not gcode
+
     if (stopping && phase != BinaryAborting) {
       // The wire is quiet now, so the abort gets a number of its own
       phase = BinaryAborting;

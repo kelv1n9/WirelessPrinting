@@ -13,6 +13,7 @@
 #include "printercard.h"
 #include "gcodemeta.h"
 #include "webauth.h"
+#include "telegram.h"
 #include "../ESP8266WirelessPrintAsync/YandexHome.h"
 
 // The encrypted connection is the only one, but YandexHome asks for the gate the same
@@ -95,12 +96,29 @@ static bool choreShouldPrint;
 static char choreTarget[PRINTER_CARD_NAME_BYTES];
 static String choreTrouble;
 
+static bool cardUp;
+
+// The module is fed by the printer, so it comes up whenever the printer does, and the
+// card is not always ready at that moment. One attempt was losing it for the whole
+// session: twice today the page said the card was empty and a restart brought it back.
+static bool mountCard() {
+  for (int tries = 0; tries < 5; tries++) {
+    if (SD_MMC.begin("/sdcard", true)) {         // 1 bit mode, which leaves gpio13 for the printer
+      cardUp = true;
+      return true;
+    }
+    SD_MMC.end();
+    delay(200);
+  }
+  cardUp = false;
+  return false;
+}
+
 static SerialIo serialIo;
 static CardBytes sendBytes;
 static BinaryTransfer sender;
 static char sendName[BINARY_NAME_BYTES];
 static bool sendAsked;
-static bool cardUp;
 static String sendTrouble;
 
 #define LOG_ROOM   1200
@@ -133,6 +151,13 @@ static void remember(const char *text, const size_t len) {
   saidLog[saidHeld++] = '\n';
   saidSeq++;
 }
+
+// The bot's task lives on the other core and only ever carries messages. These are
+// the three things it asks of this side.
+void logEvent(const String &text) { remember(text.c_str(), text.length()); }
+void logFlush() {}
+bool isPrinting;                 // what the bot calls it, kept in step with printing
+bool somethingIsStreaming();     // the binary sender owns the wire, so the bot waits
 
 static PrinterCard printerCard;
 static bool sawOk;               // a whole line of it, not the tail of "echo:SD card ok"
@@ -463,6 +488,23 @@ static void takeUpload() {
 
 // Takes a file on the module's card all the way to the printer, and onto it if asked.
 // Says no rather than half doing it, with the reason left in choreTrouble.
+bool somethingIsStreaming() { return sender.running(); }
+
+// Said once when a print starts and once when it stops, to everyone the bot knows.
+static void tellTheBot(const String &text) {
+  if (telegramBot.hasToken())
+    telegramBot.notify(text);
+}
+
+static String spanWords(const int32_t seconds) {
+  if (seconds < 0)
+    return "unknown";
+  const int32_t minutes = seconds / 60;
+  if (minutes < 60)
+    return String(minutes) + " min";
+  return String(minutes / 60) + " h " + String(minutes % 60) + " min";
+}
+
 static bool startChore(const String &name, const bool andPrint) {
   choreTrouble = "";
   if (sender.running()) {
@@ -552,12 +594,22 @@ static String powerOffState() {
     : "switching off now, attempt " + String(powerTries);
 }
 
+// A printer that answers nothing is usually not a printer that is busy. It is a
+// printer still in packet mode from a transfer that broke off, reading every gcode
+// line as packet bytes. It will stay there for good, so after the plain asking fails
+// it is handed the one packet that gets it out and asked again.
 static bool settleWire() {
-  for (int tries = 0; tries < 6; tries++) {
-    say("M105");
-    if (sawOk)
-      return true;
-    delay(100);
+  for (int round = 0; round < 2; round++) {
+    for (int tries = 0; tries < 6; tries++) {
+      say("M105");
+      if (sawOk)
+        return true;
+      delay(100);
+    }
+    if (!round) {
+      BinaryTransfer::binaryRescue(&serialIo);
+      remember("the printer answered nothing, so it was let out of packet mode", 58);
+    }
   }
   return false;
 }
@@ -752,7 +804,7 @@ void setup() {
   });
 
   Printer.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
-  cardUp = SD_MMC.begin("/sdcard", true);          // 1 bit mode, which leaves gpio13 for the printer
+  mountCard();
 
   // One line in, whatever the printer says back out. Enough to ask a printer what it is.
   route("/gcode", HTTP_GET, []() {
@@ -983,6 +1035,97 @@ void setup() {
 
   // The socket. The token goes in here and never comes back out: this server has no
   // password, and a token that can be read is a token that is gone.
+  route("/telegram", HTTP_GET, []() {
+    String out =
+      "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+      "<title>bot</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
+      "input,button{font:inherit;padding:.4rem .6rem}form{margin:1rem 0;display:inline-block}code{word-break:break-all}</style>"
+      "<h1>Telegram bot</h1><p><a href=\"/\">back to the printer</a></p>";
+    out += "<p>Token: <b>" + String(telegramBot.hasToken() ? "set" : "not set") + "</b></p>";
+    out += "<p>Last said: " + telegramBot.getStatus() + "</p>";
+    out += "<form method=post action=/telegram/token><input name=token type=password size=40 "
+           "placeholder=\"bot token from BotFather\" required><button>Save</button></form>";
+    if (telegramBot.hasToken())
+      out += " <form method=post action=/telegram/forget><button>Forget the token</button></form>";
+
+    const String allowed = telegramBot.getChats();
+    out += "<h2>Who may give orders</h2>";
+    if (allowed == "")
+      out += "<p>Nobody yet. Write to the bot and its chat will appear below to be let in.</p>";
+    else {
+      out += "<ul>";
+      int at = 0;
+      while (at < (int)allowed.length()) {
+        int comma = allowed.indexOf(',', at);
+        if (comma < 0)
+          comma = allowed.length();
+        const String one = allowed.substring(at, comma);
+        if (one != "")
+          out += "<li><code>" + one + "</code> <form method=post action=\"/telegram/deny?chat=" +
+                 one + "\"><button>Remove</button></form></li>";
+        at = comma + 1;
+      }
+      out += "</ul>";
+    }
+
+    const String knocked = telegramBot.getSeen();
+    if (knocked != "") {
+      out += "<h2>Knocked and were turned away</h2><ul>";
+      int at = 0;
+      while (at < (int)knocked.length()) {
+        int comma = knocked.indexOf(',', at);
+        if (comma < 0)
+          comma = knocked.length();
+        const String one = knocked.substring(at, comma);
+        if (one != "")
+          out += "<li><code>" + one + "</code> <form method=post action=\"/telegram/allow?chat=" +
+                 one + "\"><button>Let in</button></form></li>";
+        at = comma + 1;
+      }
+      out += "</ul>";
+    }
+    server.send(200, "text/html", out);
+  });
+
+  route("/telegram/token", HTTP_POST, []() {
+    const String given = server.arg("token");
+    if (given.indexOf(':') < 10) {
+      server.send(400, "text/plain", "that does not look like a bot token\n");
+      return;
+    }
+    telegramBot.setToken(given);      // straight into NVS, never logged and never shown
+    server.sendHeader("Location", "/telegram");
+    server.send(303, "text/plain", "saved\n");
+  });
+
+  route("/telegram/forget", HTTP_POST, []() {
+    telegramBot.forgetToken();
+    server.sendHeader("Location", "/telegram");
+    server.send(303, "text/plain", "gone\n");
+  });
+
+  route("/telegram/allow", HTTP_POST, []() {
+    telegramBot.allow(server.arg("chat"));
+    server.sendHeader("Location", "/telegram");
+    server.send(303, "text/plain", "let in\n");
+  });
+
+  route("/telegram/deny", HTTP_POST, []() {
+    telegramBot.deny(server.arg("chat"));
+    server.sendHeader("Location", "/telegram");
+    server.send(303, "text/plain", "removed\n");
+  });
+
+  // Somewhere to go other than a restart when the card did not come up
+  route("/card/mount", HTTP_POST, []() {
+    if (sender.running()) {
+      server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
+    server.send(mountCard() ? 200 : 503, "text/plain",
+                cardUp ? "mounted\n" : "the card would not come up\n");
+  });
+
   route("/auth", HTTP_GET, []() {
     String out =
       "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
@@ -1338,12 +1481,163 @@ void setup() {
     settings.end();
   }
   yandexHome.begin();
+  telegramBot.begin();
 
   server.begin();
 }
 
+// The bot's task only carries messages. Orders are carried out here, in the loop, so
+// nothing the printer owns is touched from two places at once.
+static void handleTelegram() {
+  static String awaitingStop;        // Cancelling asks twice, and only the chat that asked
+
+  String chat, line;
+  while (telegramBot.nextCommand(chat, line)) {
+    line.trim();
+    const int space = line.indexOf(' ');
+    String verb = space < 0 ? line : line.substring(0, space);
+    const String rest = space < 0 ? "" : line.substring(space + 1);
+    verb.toLowerCase();
+    const int addressed = verb.indexOf('@');        // In a group a bot is called /status@thebot
+    if (addressed > 0)
+      verb = verb.substring(0, addressed);
+
+    if (verb == "/start" || verb == "/help") {
+      telegramBot.send(chat,
+        String(machine[0] ? machine : "KP3S") + "\n\n"
+        "/status - what the printer is doing\n"
+        "/files - what is on the printer's card\n"
+        "/print <number> - start that file\n"
+        "/stop - cancel the running print\n"
+        "/nozzle <degrees> - set the hotend, 0 to turn it off\n"
+        "/bed <degrees> - set the bed\n"
+        "/on and /off - the socket");
+    }
+
+    else if (verb == "/status") {
+      String out = String(machine[0] ? machine : "KP3S") + "\n";
+      out += printing ? "Printing\n" : "Idle\n";
+      if (selected[0]) {
+        out += "File       " + String(selected) + "\n";
+        if (printing && printOf) {
+          GcodeMetaHead meta;
+          uint16_t z100 = 0, left = 0;
+          out += "Done       " + String(printAt * 100.0 / printOf, 1) + " %\n";
+          if (cardUp && metaHead(selected, meta) && meta.found) {
+            const uint32_t at = metaLayerAt(selected, meta.found, printAt, &z100, &left);
+            out += "Layer      " + String(at) + " of " + String(meta.found) +
+                   ", " + String(z100 / 100.0, 2) + " mm\n";
+            out += "Left       " + spanWords(left ? (int32_t)left * 60 : -1) + "\n";
+          }
+          out += "Elapsed    " + spanWords(printSince ? (int32_t)((millis() - printSince) / 1000) : -1) + "\n";
+        }
+      }
+      out += "Nozzle     " + String(toolNow, 1) + " of " + String(toolSet, 0) + "\n";
+      out += "Bed        " + String(bedNow, 1) + " of " + String(bedSet, 0) + "\n";
+      if (yandexHome.hasToken() && yandexHome.getDeviceId() != "")
+        out += "Socket     " + powerOffState() + "\n";
+      out += "Module     up " + String(millis() / 1000) + " s, heap " + String(ESP.getFreeHeap());
+      telegramBot.send(chat, out);
+    }
+
+    else if (verb == "/files") {
+      if (printing)
+        telegramBot.send(chat, "The printer is printing and will not answer a listing until it stops.");
+      else if (sender.running())
+        telegramBot.send(chat, "A transfer owns the wire, ask again in a moment.");
+      else if (!askPrinterCard())
+        telegramBot.send(chat, "The printer did not finish a listing.");
+      else if (!printerCard.count())
+        telegramBot.send(chat, "Nothing on the printer's card.");
+      else {
+        String out = "On the printer's card:\n";
+        for (uint8_t i = 0; i < printerCard.count(); i++) {
+          const PrinterCardEntry &e = printerCard.at(i);
+          out += String(i + 1) + ". " + String(e.name[0] ? e.name : e.dos) +
+                 "  " + String(e.size / 1024) + " KB\n";
+        }
+        out += "\n/print <number> to start one";
+        telegramBot.send(chat, out);
+      }
+    }
+
+    else if (verb == "/print") {
+      const int which = rest.toInt();
+      if (printing)
+        telegramBot.send(chat, "Already printing.");
+      else if (sender.running())
+        telegramBot.send(chat, "A transfer owns the wire, ask again in a moment.");
+      else if (which <= 0)
+        telegramBot.send(chat, "Say /files first, then /print with the number beside the one you want.");
+      else if (!askPrinterCard() || which > (int)printerCard.count())
+        telegramBot.send(chat, "There is no file with that number. Say /files again.");
+      else {
+        const PrinterCardEntry &e = printerCard.at(which - 1);
+        const String name = e.name[0] ? e.name : e.dos;
+        say("M21");
+        const String opened = say("M23 " + name);
+        if (opened.indexOf("File opened") < 0)
+          telegramBot.send(chat, "The printer would not open " + name + ".");
+        else {
+          say("M27 S3");
+          say("M24");
+          telegramBot.send(chat, "Printing " + name + ".");
+        }
+      }
+    }
+
+    else if (verb == "/stop") {
+      if (!printing) {
+        telegramBot.send(chat, "Nothing is printing.");
+        awaitingStop = "";
+      }
+      else if (rest == "yes" || awaitingStop == chat) {
+        awaitingStop = "";
+        say("M524");
+        telegramBot.send(chat, "Cancelled.");
+      }
+      else {
+        awaitingStop = chat;
+        telegramBot.send(chat, "This will cancel the running print. Say /stop again to go ahead.");
+      }
+    }
+
+    else if (verb == "/nozzle" || verb == "/bed") {
+      const bool nozzle = verb == "/nozzle";
+      if (rest == "")
+        telegramBot.send(chat, nozzle
+          ? "Nozzle " + String(toolNow, 1) + " of " + String(toolSet, 0) + ". Say /nozzle <degrees>."
+          : "Bed " + String(bedNow, 1) + " of " + String(bedSet, 0) + ". Say /bed <degrees>.");
+      else {
+        const int wanted = rest.toInt();
+        if (wanted < 0 || wanted > (nozzle ? 260 : 110))
+          telegramBot.send(chat, "That is outside what this printer will take.");
+        else {
+          say((nozzle ? "M104 S" : "M140 S") + String(wanted));
+          telegramBot.send(chat, String(nozzle ? "Nozzle" : "Bed") + " set to " + String(wanted) + ".");
+        }
+      }
+    }
+
+    else if (verb == "/on" || verb == "/off") {
+      if (!yandexHome.hasToken() || yandexHome.getDeviceId() == "")
+        telegramBot.send(chat, "No socket is set up.");
+      else if (verb == "/off" && printing)
+        telegramBot.send(chat, "The printer is printing. Cancel it first if you really mean this.");
+      else {
+        yandexHome.request(verb == "/on" ? YandexHome::PowerOn : YandexHome::PowerOff);
+        telegramBot.send(chat, String("Asked the socket to go ") + (verb == "/on" ? "on." : "off."));
+      }
+    }
+
+    else
+      telegramBot.send(chat, "I do not know that one. Say /help.");
+  }
+}
+
 void loop() {
   server.handleClient();
+  isPrinting = printing;             // what the bot's task reads, kept in step from one place
   bootGuardWatch(WiFi.status() == WL_CONNECTED);
 
   if (portal)
@@ -1414,6 +1708,19 @@ void loop() {
         say("M155 S2");          // it reports from idle(), so the queue cannot delay it
       }
     }
+  }
+
+  handleTelegram();
+
+  static bool toldPrinting;
+  if (printing != toldPrinting) {
+    toldPrinting = printing;
+    if (printing)
+      tellTheBot("Printing " + String(selected[0] ? selected : "a file") + ".");
+    else
+      tellTheBot(printAt && printAt >= printOf
+                 ? "Finished " + String(selected[0] ? selected : "the file") + "."
+                 : "The print stopped.");
   }
 
   powerOffTick(millis());
