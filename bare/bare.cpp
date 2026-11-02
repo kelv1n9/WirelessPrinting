@@ -36,6 +36,10 @@ static bool powerSawIdle;        // the heaters were seen off, so turning them o
 static uint32_t powerReadySince, powerRetryAt;
 static uint8_t powerTries;
 
+#ifndef SKETCH_VERSION
+  #define SKETCH_VERSION "unknown"   // set from the git revision at build time, build_version.py
+#endif
+
 #define JOIN_WAIT_MS   90000
 #define PORTAL_NAME    "KP3S-setup"
 #define PRINTER_RX     13      // gpio14 is taken by the SD_MMC clock
@@ -285,12 +289,17 @@ static String metaPath(const char *target, const char *suffix) {
 
 struct MetaOut : GcodeMetaSink {
   File into;
+  File fans;
   File picture;
   String tmp, keepAs;
 
   void layer(const GcodeMetaLayer &one) override {
     if (into)
       into.write((const uint8_t *)&one, sizeof one);
+  }
+  void fan(const GcodeMetaFan &one) override {
+    if (fans)
+      fans.write((const uint8_t *)&one, sizeof one);
   }
 
   // A slicer writes its sizes one after another and only the last one is worth having,
@@ -363,6 +372,32 @@ static uint32_t metaLayerAt(const char *target, const uint32_t count, const uint
   return low;
 }
 
+static int metaFanAt(const char *target, const uint32_t count, const uint32_t byte) {
+  File table = SD_MMC.open(metaPath(target, ".fan"));
+  if (!table)
+    return -1;
+  uint32_t low = 0, high = count;
+  GcodeMetaFan one;
+  while (low < high) {
+    const uint32_t mid = low + (high - low) / 2;
+    table.seek(mid * sizeof one);
+    if (table.read((uint8_t *)&one, sizeof one) != (int)sizeof one)
+      break;
+    if (one.at <= byte)
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  int speed = 0;
+  if (low) {
+    table.seek((low - 1) * sizeof one);
+    if (table.read((uint8_t *)&one, sizeof one) == (int)sizeof one)
+      speed = one.speed;
+  }
+  table.close();
+  return speed;
+}
+
 static WebServer server(80);
 
 // One body for both upload routes: the module's own and the one a slicer speaks.
@@ -391,6 +426,7 @@ static void takeUpload() {
     if (metaWanted) {
       SD_MMC.mkdir(META_DIR);
       metaOut.into = SD_MMC.open(metaPath(metaTarget, ".idx"), FILE_WRITE);
+      metaOut.fans = SD_MMC.open(metaPath(metaTarget, ".fan"), FILE_WRITE);
       metaOut.tmp = metaPath(metaTarget, ".new");
       metaOut.keepAs = metaPath(metaTarget, ".png");
       metaScan.begin(&metaOut);
@@ -415,6 +451,8 @@ static void takeUpload() {
       metaScan.finish(size);
       if (metaOut.into)
         metaOut.into.close();
+      if (metaOut.fans)
+        metaOut.fans.close();
       File head = SD_MMC.open(metaPath(metaTarget, ".hdr"), FILE_WRITE);
       if (head) {
         head.write((const uint8_t *)&metaScan.head, sizeof metaScan.head);
@@ -664,19 +702,20 @@ void setup() {
 
     j += ",\"system\":{\"machine\":\"" + String(machine[0] ? machine : "KP3S") + "\"";
     j += ",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100);
-    j += ",\"version\":\"" + slot() + " up " + String(millis() / 1000) + "s\"}";
+    j += ",\"version\":\"" SKETCH_VERSION "\"}";
 
     // What the slicer wrote down, looked up by the byte the printer says it is on
     GcodeMetaHead meta;
     uint32_t layer = 0, layers = 0;
     uint16_t z100 = 0, left = 0;
     double grams = 0;
-    int32_t remaining = -1;
+    int32_t remaining = -1, fan = -1;
     if (selected[0] && cardUp && metaHead(selected, meta)) {
       layers = meta.found ? meta.found : meta.layers;
       grams = meta.grams;
       if (printing && printOf) {
         layer = metaLayerAt(selected, meta.found, printAt, &z100, &left);
+        fan = meta.fans ? metaFanAt(selected, meta.fans, printAt) : -1;
         remaining = left ? (int32_t)left * 60 : -1;
         if (remaining < 0 && meta.seconds)
           remaining = (int32_t)(meta.seconds * (1.0 - (double)printAt / printOf));
@@ -689,7 +728,8 @@ void setup() {
     j += ",\"completion\":" + String(printOf ? (double)printAt * 100.0 / printOf : 0.0, 2);
     j += ",\"layer\":" + String(layer) + ",\"layers\":" + String(layers);
     j += ",\"z\":" + String(z100 / 100.0, 2);
-    j += ",\"elapsed\":" + String(ran) + ",\"remaining\":" + String(remaining) + ",\"fan\":-1}";
+    j += ",\"elapsed\":" + String(ran) + ",\"remaining\":" + String(remaining) +
+         ",\"fan\":" + String(fan) + "}";
 
     const float watt = yandexHome.getPowerAt() &&
                        millis() - yandexHome.getPowerAt() < 2 * POWERDRAW_IDLE
@@ -1121,6 +1161,31 @@ void setup() {
   // whole point: the module can reboot, lose the network or be reflashed mid print and
   // the printer will not notice. M21 is sent every time because a binary transfer leaves
   // the card unmounted behind it.
+  // Deleting on the printer, not here. The sidecars stay: they cost a couple of
+  // kilobytes and they are still right if the same file goes over again.
+  server.on("/printer/delete", HTTP_POST, []() {
+    if (sender.running()) {
+      server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
+    if (printing) {
+      server.send(409, "text/plain", "the printer is printing\n");
+      return;
+    }
+    const String name = server.arg("name");
+    if (name == "") {
+      server.send(400, "text/plain", "name is empty\n");
+      return;
+    }
+    say("M21");
+    const String said = say("M30 " + name);
+    if (said.indexOf("File deleted") < 0) {
+      server.send(404, "text/plain", "the printer would not delete it:\n" + said);
+      return;
+    }
+    server.send(200, "text/plain", "deleted " + name + "\n");
+  });
+
   server.on("/printer/print", HTTP_POST, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");

@@ -29,9 +29,21 @@ struct GcodeMetaHead {
   uint32_t thumbAt;     // first byte of the base64, not of the comment that opens it
   uint32_t thumbLen;    // bytes of base64 including the line breaks and the semicolons
   uint32_t layers;      // what the header declared, which is not always what was found
-  uint32_t found;       // entries written to the sink
+  uint32_t found;       // layer entries written to the sink
+  uint32_t fans;        // fan entries written to the sink
   uint16_t thumbW, thumbH;
   float grams;
+};
+
+// The fan is nowhere in what the printer reports, and asking for it over the wire
+// during a print is exactly the polling this design is built to avoid. It is in the
+// file, though, so it is written down the same way: a speed against the byte it
+// starts at. A whole print turns the fan up or down a couple of dozen times, so the
+// whole table is a few hundred bytes and can be exact rather than per layer.
+struct GcodeMetaFan {
+  uint32_t at;
+  uint8_t speed;        // 0 to 255, as M106 counts it
+  uint8_t pad;
 };
 
 struct GcodeMetaLayer {
@@ -43,6 +55,7 @@ struct GcodeMetaLayer {
 struct GcodeMetaSink {
   virtual ~GcodeMetaSink() {}
   virtual void layer(const GcodeMetaLayer &one) = 0;
+  virtual void fan(const GcodeMetaFan &one) { (void)one; }
 
   // A picture, already decoded, a byte at a time. Slicers write several sizes one
   // after another, so a block that turns out to be smaller than one already taken is
@@ -68,6 +81,7 @@ public:
     bestPixels = 0;
     bits = 0;
     nbits = 0;
+    lastFan = 0;
   }
 
   void feed(const uint8_t *data, const size_t len) {
@@ -116,7 +130,7 @@ private:
   uint32_t bestPixels = 0, thumbStart = 0;
   uint16_t thumbW = 0, thumbH = 0;
   uint32_t bits = 0;
-  uint8_t nbits = 0;
+  uint8_t nbits = 0, lastFan = 0;
 
   // Base64, decoded as it arrives, so nothing has to be held while a picture goes past.
   static int sextet(const char ch) {
@@ -243,6 +257,27 @@ private:
       return;
     }
 
+    if (!strncmp(line, "M106", 4) || !strncmp(line, "M107", 4)) {
+      uint16_t speed = 0;
+      if (line[3] == '6') {
+        const char *sp = strchr(line, 'S');
+        speed = sp ? (uint16_t)strtoul(sp + 1, nullptr, 10) : 255;
+      }
+      if (speed > 255)
+        speed = 255;
+      if (!head.fans || speed != lastFan) {
+        GcodeMetaFan one;
+        one.at = at;
+        one.speed = (uint8_t)speed;
+        one.pad = 0;
+        if (sink)
+          sink->fan(one);
+        head.fans++;
+        lastFan = (uint8_t)speed;
+      }
+      return;
+    }
+
     // M73 carries the time the slicer thinks is left, which beats anything worked out
     // from bytes: the last layers of a print are not the same length as the first.
     if (!strncmp(line, "M73 ", 4)) {
@@ -268,6 +303,19 @@ private:
 
 // Which layer a byte belongs to, by walking a table that is already sorted. The table
 // is handed over whole because it is read from a file into a small window at a time.
+inline uint8_t gcodeMetaFanAt(const GcodeMetaFan *table, const uint32_t count,
+                              const uint32_t byte) {
+  uint32_t low = 0, high = count;
+  while (low < high) {
+    const uint32_t mid = low + (high - low) / 2;
+    if (table[mid].at <= byte)
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  return low ? table[low - 1].speed : 0;
+}
+
 inline uint32_t gcodeMetaLayerAt(const GcodeMetaLayer *table, const uint32_t count,
                                  const uint32_t byte, uint16_t *z100, uint16_t *minutes) {
   uint32_t low = 0, high = count;

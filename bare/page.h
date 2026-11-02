@@ -182,7 +182,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <span class="badge warn hide" id="soon"></span>
   <div class="meta">
     <span id="build"></span>
-    <span id="guard"></span>
     <span><a href="/yandex">socket</a></span>
   </div>
   <div class="row">
@@ -380,7 +379,6 @@ function render(d){
   if (th.dataset.src !== want) { th.dataset.src = want; th.className = 'thumb'; th.src = want; }
   $('kgram').classList.toggle('hide', !(d.energy.grams > 0));
   $('jgram').textContent = d.energy.grams.toFixed(1) + ' g';
-  $('guard').textContent = d.guard || '';
   $('brestart').disabled = d.printing;
 }
 
@@ -512,7 +510,10 @@ async function printerCard(){
       const box = document.createElement('div'); box.className = 'row';
       box.append(btn('Print', 'p', () => confirm('Print ' + m[3] + '?') &&
         call('/printer/print?name=' + encodeURIComponent(m[3]), {method:'POST'})
-          .then(() => { toast('printing'); })));
+          .then(() => { toast('printing'); })),
+        btn('Delete', 'd', () => confirm('Delete ' + m[3] + ' from the printer card?') &&
+          call('/printer/delete?name=' + encodeURIComponent(m[3]), {method:'POST'})
+            .then(() => { toast('deleted'); printerCard().catch(()=>{}); })));
       a.append(box);
     }
     if (!tb.rows.length) {

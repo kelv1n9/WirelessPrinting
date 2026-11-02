@@ -22,7 +22,9 @@ struct Collect : GcodeMetaSink {
   std::string picture, taking;
   int opened = 0, kept = 0;
 
+  std::vector<GcodeMetaFan> fans;
   void layer(const GcodeMetaLayer &one) override { rows.push_back(one); }
+  void fan(const GcodeMetaFan &one) override { fans.push_back(one); }
   void thumbOpen(uint16_t, uint16_t) override { taking.clear(); opened++; }
   void thumbByte(uint8_t value) override { taking += (char)value; }
   void thumbClose(bool keep) override { if (keep) { picture = taking; kept++; } }
@@ -81,7 +83,8 @@ static void scanOne(const std::string &path, const size_t chunk) {
   if (chunk == 4096)
     printf("  %-30s %u layers declared, %zu found, %u s, %.2f g, thumb %ux%u %u bytes\n",
            name, scan.head.layers, into.rows.size(), scan.head.seconds,
-           scan.head.grams, scan.head.thumbW, scan.head.thumbH, scan.head.thumbLen);
+           scan.head.grams, scan.head.thumbW, scan.head.thumbH, scan.head.thumbLen),
+    printf("  %-30s %u fan changes\n", "", scan.head.fans);
 
   // A slicer writes its estimate and its weight in the block it appends at the end,
   // so a file cut short has a header and a picture but none of those.
@@ -132,6 +135,30 @@ static void scanOne(const std::string &path, const size_t chunk) {
     if (body.compare(one.at, 13, ";LAYER_CHANGE"))
       lands = false;
   check(lands, "every offset lands on the layer change itself");
+
+  // The fan table has to land on its own lines, never repeat a speed, and stay sorted
+  bool fanLands = true, fanClimbs = true, fanChanges = true;
+  uint32_t lastFanAt = 0;
+  int lastSpeed = -1;
+  for (const GcodeMetaFan &one : into.fans) {
+    if (body.compare(one.at, 4, "M106") && body.compare(one.at, 4, "M107"))
+      fanLands = false;
+    if (one.at < lastFanAt)
+      fanClimbs = false;
+    if ((int)one.speed == lastSpeed)
+      fanChanges = false;
+    lastFanAt = one.at;
+    lastSpeed = one.speed;
+  }
+  check(fanLands, "every fan entry lands on the command that set it");
+  check(fanClimbs, "the fan table is in order");
+  check(fanChanges, "and holds only the changes");
+  check(into.fans.size() == scan.head.fans, "the count matches what was handed over");
+  check(into.fans.empty() || gcodeMetaFanAt(into.fans.data(), into.fans.size(),
+                                            into.fans.back().at) == into.fans.back().speed,
+        "and a byte reads back the speed in force at it");
+  check(into.fans.empty() || gcodeMetaFanAt(into.fans.data(), into.fans.size(), 0) == 0,
+        "with the fan off before anything turned it on");
 
   // And the lookup has to give the layer a byte really belongs to
   if (into.rows.size() > 3) {
