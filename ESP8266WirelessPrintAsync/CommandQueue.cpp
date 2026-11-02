@@ -1,11 +1,11 @@
 #include "CommandQueue.h"
+#include <string.h>
 
 CommandQueue commandQueue;    //FIFO Queue
 
 int CommandQueue::head = 0;
-int CommandQueue::sendTail = 0;
 int CommandQueue::tail = 0;
-String CommandQueue::commandBuffer[COMMAND_BUFFER_SIZE];
+char CommandQueue::commandBuffer[COMMAND_BUFFER_SIZE][COMMAND_MAX_BYTES];
 SemaphoreHandle_t CommandQueue::mutex = NULL;
 
 class QueueLock {
@@ -45,51 +45,38 @@ int CommandQueue::getFreeSlots() {
 void CommandQueue::clear() {
   QueueLock lock(mutex);
 
-  head = sendTail = tail;
+  head = tail;
 }
 
-// Tries to Add a command to the queue, returns true if possible
-bool CommandQueue::push(const String command) {
+// Tries to add a command to the queue, returns true if possible
+bool CommandQueue::push(const char *command) {
   QueueLock lock(mutex);
 
-  int next = nextBufferSlot(head);
-  if (next == tail || command == "")
+  if (!command || !command[0])
     return false;
 
-  commandBuffer[head] = command;
+  int next = nextBufferSlot(head);
+  if (next == tail)
+    return false;
+
+  strncpy(commandBuffer[head], command, COMMAND_MAX_BYTES - 1);
+  commandBuffer[head][COMMAND_MAX_BYTES - 1] = 0;
   head = next;
 
   return true;
 }
 
-String CommandQueue::peekSend() {
+const char *CommandQueue::peekSend() {
   QueueLock lock(mutex);
 
-  return (sendTail == head) ? String() : commandBuffer[sendTail];
+  return (tail == head) ? NULL : commandBuffer[tail];
 }
 
-// Returns the next command to be sent, and advances to the next
-String CommandQueue::popSend() {
+// Frees the slot. The window of unacknowledged lines is PrinterLink's, and it holds its
+// own copy, so nothing here has to outlive the send.
+void CommandQueue::popSend() {
   QueueLock lock(mutex);
 
-  if (sendTail == head)
-    return String();
-
-  const String command = commandBuffer[sendTail];
-  sendTail = nextBufferSlot(sendTail);
-  
-  return command;
-}
-
-// Returns the last command sent if it was received by the printer, otherwise returns empty
-String CommandQueue::popAcknowledge() {
-  QueueLock lock(mutex);
-
-  if (tail == sendTail)
-    return String();
-
-  const String command = commandBuffer[tail];
-  tail = nextBufferSlot(tail);
-
-  return command;
+  if (tail != head)
+    tail = nextBufferSlot(tail);
 }

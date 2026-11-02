@@ -5,12 +5,16 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <esp_heap_caps.h>
 
 extern SemaphoreHandle_t tlsGate;   // Shared with the bot: one encrypted connection fits, not two
+extern volatile bool tlsWanted;
 
 #define YANDEX_HOST      "https://api.iot.yandex.net"
 #define YANDEX_TASK_STACK 10240
 #define YANDEX_TIMEOUT    15000
+#define YANDEX_BLOCK_FLOOR 20000
+#define YANDEX_GATE_WAIT  40000
 #define YANDEX_JSON_SIZE  16384
 #define YANDEX_DEVICE_JSON 8192
 
@@ -46,6 +50,7 @@ String YandexHome::token, YandexHome::deviceId, YandexHome::deviceName,
        YandexHome::devices, YandexHome::status;
 float YandexHome::power = -1;
 uint32_t YandexHome::powerAt = 0;
+UBaseType_t YandexHome::stackLowest = 0xFFFFFFFF;
 
 class Guard {
   public:
@@ -182,7 +187,19 @@ bool YandexHome::call(const String path, const String payload, String &body) {
     return false;
   }
 
-  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(30000)) != pdTRUE) {
+  // The same floor the bot keeps: a handshake started without room for its buffers
+  // fails and leaves the heap worse than it found it.
+  const size_t block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (block < YANDEX_BLOCK_FLOOR || ESP.getFreeHeap() < 80000) {
+    Guard guard(mutex);
+    status = "waiting for memory, block " + String(block);
+    return false;
+  }
+
+  tlsWanted = true;
+  const bool admitted = tlsGate && xSemaphoreTake(tlsGate, pdMS_TO_TICKS(YANDEX_GATE_WAIT)) == pdTRUE;
+  tlsWanted = false;
+  if (!admitted) {
     Guard guard(mutex);
     status = "the other connection is busy";
     return false;
@@ -193,8 +210,10 @@ bool YandexHome::call(const String path, const String payload, String &body) {
   client.setTimeout(YANDEX_TIMEOUT / 1000);
 
   HTTPClient http;
+  http.setReuse(false);   // So end() really closes it before the gate goes to the next one
   http.setTimeout(YANDEX_TIMEOUT);
   if (!http.begin(client, YANDEX_HOST + path)) {
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
     xSemaphoreGive(tlsGate);
     Guard guard(mutex);
     status = "cannot open connection";
@@ -212,7 +231,8 @@ bool YandexHome::call(const String path, const String payload, String &body) {
 
   if (code > 0)
     body = http.getString();
-  http.end();                     // The client closes itself when it goes out of scope
+  http.end();
+  client.stop();   // Frees the encryption buffers before the gate lets the next one in
   xSemaphoreGive(tlsGate);
 
   Guard guard(mutex);
@@ -293,19 +313,31 @@ void YandexHome::fetchPower() {
   if (!call("/v1.0/devices/" + id, "", body))
     return;
 
-  DynamicJsonDocument document(YANDEX_DEVICE_JSON);
-  if (deserializeJson(document, body)) {
-    Guard guard(mutex);
-    status = "cannot parse the device";
-    return;
+  // One number is wanted out of this answer, and parsing the whole of it asks for a
+  // few kilobytes of unbroken heap every minute of every print, which is exactly the
+  // heap the encryption needs. The number is picked out of the text instead, and the
+  // parser is only woken when the text does not read the way it usually does.
+  float watts = -1;
+  const int said = body.indexOf("\"instance\":\"power\"");
+  if (said >= 0) {
+    const int value = body.indexOf("\"value\":", said);
+    if (value >= 0 && value - said < 64)
+      watts = body.substring(value + 8, value + 28).toFloat();
   }
 
-  float watts = -1;
-  for (JsonObject property : document["properties"].as<JsonArray>()) {
-    JsonObject state = property["state"];
-    if (state["instance"] == "power" && !state["value"].isNull()) {
-      watts = state["value"].as<float>();
-      break;
+  if (watts < 0) {
+    DynamicJsonDocument document(YANDEX_DEVICE_JSON);
+    if (deserializeJson(document, body)) {
+      Guard guard(mutex);
+      status = "cannot parse the device";
+      return;
+    }
+    for (JsonObject property : document["properties"].as<JsonArray>()) {
+      JsonObject state = property["state"];
+      if (state["instance"] == "power" && !state["value"].isNull()) {
+        watts = state["value"].as<float>();
+        break;
+      }
     }
   }
 
@@ -330,8 +362,18 @@ void YandexHome::run(void *argument) {
     else if (what == PowerDraw)
       fetchPower();
 
+    {
+      const UBaseType_t left = uxTaskGetStackHighWaterMark(NULL);
+      if (left < stackLowest)
+        stackLowest = left;
+    }
+
     pending = None;
   }
+}
+
+UBaseType_t YandexHome::stackLow() {
+  return stackLowest == 0xFFFFFFFF ? 0 : stackLowest;
 }
 
 void YandexHome::loop() {

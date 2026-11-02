@@ -23,6 +23,8 @@ class YandexHome {
     static String getDevices();
     static String getStatus();
 
+    static UBaseType_t stackLow();
+
     static float getPower();          // Watts the socket reports, or -1 when it does not report any
     static uint32_t getPowerAt();     // millis() of that reading, 0 when there has never been one
 
@@ -32,6 +34,7 @@ class YandexHome {
     static volatile Request pending;
     static String token, deviceId, deviceName, devices, status;
     static float power;
+    static UBaseType_t stackLowest;
     static uint32_t powerAt;
 
     static void run(void *argument);

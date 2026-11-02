@@ -5,12 +5,14 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <esp_heap_caps.h>
 
 #include "StorageFS.h"
 
-extern void logEvent(const String text);
+extern void logEvent(const String &text);
 extern void logFlush();
 extern SemaphoreHandle_t tlsGate;   // Only one encrypted conversation fits in this heap
+extern volatile bool tlsWanted;
 
 // A crash takes the journal buffer with it, so a breadcrumb is only useful once it is
 // already on the card.
@@ -21,22 +23,33 @@ static void trail(const String text) {
 
 extern String sanitizeFilename(const String filename);
 extern bool isPrinting;
+extern volatile bool cardSendRunning;
 extern bool firmwareBegin();
 extern bool firmwareChunk(uint8_t *data, const size_t len);
 extern String firmwareEnd(const bool whole);
 extern void firmwareReboot();
+extern bool somethingIsStreaming();
 
 #define TELEGRAM_HOST    "https://api.telegram.org"
 #define TELEGRAM_STACK   16384         // The handshake checks a chain of three and needs the room
-#define TELEGRAM_WAIT    10            // Seconds Telegram holds a quiet request open
+// Every one of these opens a connection, and opening one costs sixty kilobytes of heap
+// for a second or two. Holding the quiet request open longer is the cheapest way to make
+// that window rare: the bot still answers, it just waits longer for something to answer.
+#define TELEGRAM_WAIT    25            // Seconds Telegram holds a quiet request open
 #define TELEGRAM_TIMEOUT 20000
 #define TELEGRAM_JSON    4096
 #define TELEGRAM_REPLY_GRACE 1500      // How long to let the loop answer before asking again
 #define TELEGRAM_MAX_FILE (20UL * 1024 * 1024)   // The bot API will not hand over more
-#define TELEGRAM_CHUNK   2048
+#define TELEGRAM_CHUNK   8192          // Read in one go; every call through the encryption costs
 #define TELEGRAM_SEEN_MAX 5
-#define TELEGRAM_HEAP_FLOOR 70000      // Encryption needs a big unbroken block, and failing
-                                       // to get one leaves rubbish behind every time
+// Encryption asks for two buffers of about sixteen kilobytes each. Free heap says
+// nothing about whether such a block exists, and asking when it does not is what used
+// to take the module down: the handshake fails, the failure leaves rubbish behind, the
+// next one has less to work with, and a few rounds of that end in a panic.
+#define TELEGRAM_BLOCK_FLOOR 20000
+#define TELEGRAM_HEAP_FLOOR 80000
+#define TELEGRAM_HEAP_FLOOR_PRINTING 95000
+#define TELEGRAM_COOLING 300000        // Stand off this long after a run of failures
 
 // api.telegram.org is signed under this one, which stands until 2038. Pinning it means
 // the bot token only ever leaves the module down a connection we have checked.
@@ -77,8 +90,20 @@ String TelegramBot::waitingChat, TelegramBot::waitingId, TelegramBot::waitingNam
 size_t TelegramBot::waitingSize = 0;
 int64_t TelegramBot::offset = -1;
 volatile bool TelegramBot::landing = false;
-String TelegramBot::probeUrl;
+String TelegramBot::probeUrl, TelegramBot::benchUrl, TelegramBot::benchOutcome = "not run";
+size_t TelegramBot::benchChunk = 0;
+bool TelegramBot::benchLegacy = false;
+static UBaseType_t stackLowest = 0xFFFFFFFF;
+
+// One buffer for every transfer the bot makes: a file to the card, firmware to the
+// flash, the bench. They all run on this one task and never overlap, and a second
+// buffer would be eight kilobytes the encryption cannot have.
+// Aligned, because the card controller moves this over DMA and an odd address makes
+// the driver copy every block through a bounce buffer instead.
+static uint8_t telegramBuffer[TELEGRAM_CHUNK] __attribute__((aligned(32)));
 static bool telegramPrimed = false;      // The first answer is only read for its place in the queue
+static uint32_t coolingUntil = 0;        // Nothing is attempted before this
+static uint8_t refusals = 0;             // Connections lost or refused in a row
 
 class Hold {
   public:
@@ -347,15 +372,33 @@ bool TelegramBot::call(const String path, String &body, const uint32_t timeout) 
 
   // Standing aside is the whole fix for the spiral that took the module down: a cramped
   // heap makes the handshake fail, a failed handshake leaves the heap more cramped.
-  if (ESP.getFreeHeap() < (isPrinting ? TELEGRAM_HEAP_FLOOR + 20000 : TELEGRAM_HEAP_FLOOR)) {
+  if (somethingIsStreaming()) {
     Hold hold(mutex);
-    status = "waiting for memory";
+    status = "waiting for a long answer to go out";
     return false;
   }
 
+  const size_t room = ESP.getFreeHeap();
+  const size_t block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (block < TELEGRAM_BLOCK_FLOOR ||
+      room < (isPrinting ? TELEGRAM_HEAP_FLOOR_PRINTING : TELEGRAM_HEAP_FLOOR)) {
+    Hold hold(mutex);
+    status = "waiting for memory, heap " + String(room) + " block " + String(block);
+    return false;
+  }
+
+  // Trying again and again through a bad patch is how the rubbish piles up. After a run
+  // of failures the bot keeps quiet for a while and lets whatever took the memory finish.
+  if (coolingUntil && (int32_t)(millis() - coolingUntil) < 0) {
+    Hold hold(mutex);
+    status = "standing off after a run of failures";
+    return false;
+  }
+  coolingUntil = 0;
+
   // The socket's own task talks over the same kind of connection, and two of them at
   // once will not fit. Whoever gets here second waits.
-  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(30000)) != pdTRUE) {
+  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(50)) != pdTRUE) {
     Hold hold(mutex);
     status = "the other connection is busy";
     return false;
@@ -369,6 +412,7 @@ bool TelegramBot::call(const String path, String &body, const uint32_t timeout) 
   http.setReuse(false);
   http.setTimeout(timeout);
   if (!http.begin(client, String(TELEGRAM_HOST) + "/bot" + secret + path)) {
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
     xSemaphoreGive(tlsGate);
     Hold hold(mutex);
     status = "cannot open connection";
@@ -378,12 +422,23 @@ bool TelegramBot::call(const String path, String &body, const uint32_t timeout) 
   const int code = http.GET();
   if (code > 0)
     body = http.getString();
-  http.end();                      // The client closes itself when it goes out of scope
+  http.end();
+  client.stop();   // Frees the encryption buffers before the gate lets the next one in
   xSemaphoreGive(tlsGate);
 
-  if (code != 200)
+  if (code != 200) {
     trail("telegram: " + String(code < 0 ? HTTPClient::errorToString(code) : "HTTP " + String(code))
-          + ", heap " + String(ESP.getFreeHeap()));
+          + ", heap " + String(ESP.getFreeHeap())
+          + " block " + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    if (code < 0 && ++refusals >= 3) {
+      refusals = 0;
+      coolingUntil = millis() + TELEGRAM_COOLING;
+      trail("telegram: three refusals in a row, standing off for "
+            + String(TELEGRAM_COOLING / 60000) + " minutes");
+    }
+  }
+  else
+    refusals = 0;
 
   Hold hold(mutex);
   if (code == 401)
@@ -491,8 +546,8 @@ bool TelegramBot::poll() {
 }
 
 void TelegramBot::fetchDocument(const String chat, const String fileId, const String fileName, const size_t size) {
-  if (isPrinting) {
-    send(chat, "Busy printing, the card is in use. Try again when the print is done.");
+  if (isPrinting || cardSendRunning) {
+    send(chat, "Busy, the card is in use. Try again in a moment.");
     return;
   }
   if (size > TELEGRAM_MAX_FILE) {
@@ -565,7 +620,7 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
     return;
   }
 
-  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(30000)) != pdTRUE) {
+  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(50)) != pdTRUE) {
     if (firmware)
       firmwareEnd(false);
     send(chat, "Busy talking to the socket, try again in a moment.");
@@ -577,8 +632,10 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   client.setTimeout(TELEGRAM_TIMEOUT / 1000);
 
   HTTPClient http;
+  http.setReuse(false);   // So end() really closes it before the gate goes to the next one
   http.setTimeout(TELEGRAM_TIMEOUT);
   if (!http.begin(client, String(TELEGRAM_HOST) + "/file/bot" + secret + "/" + remote)) {
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
     xSemaphoreGive(tlsGate);
     if (firmware)
       firmwareEnd(false);
@@ -588,6 +645,7 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
 
   if (http.GET() != 200) {
     http.end();
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
     xSemaphoreGive(tlsGate);
     if (firmware)
       firmwareEnd(false);
@@ -602,38 +660,46 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
     if (!card) {
       landing = false;
       http.end();
+      client.stop();   // Frees the encryption buffers before the gate lets the next one in
       xSemaphoreGive(tlsGate);
       send(chat, "Could not create " + name + " on the card.");
       return;
     }
   }
 
-  // Aligned, because the card controller moves this over DMA and an odd address makes
-  // the driver copy every block through a bounce buffer instead.
-  static uint8_t buffer[TELEGRAM_CHUNK] __attribute__((aligned(32)));
   WiFiClient *stream = http.getStreamPtr();
   size_t written = 0;
   bool good = true;
   const uint32_t started = millis();
 
-  while (http.connected() && (size == 0 || written < size)) {
-    const size_t waiting = stream->available();
-    if (!waiting) {
-      if (millis() - started > 15UL * 60 * 1000)
+  // Not readBytes: neither client overrides it, so Stream hands it over one byte at a
+  // time, and for an encrypted one that is a trip through mbedtls per byte. When no
+  // byte is there it spins on the clock without yielding. read(buffer, length) takes a
+  // whole record in one call.
+  uint32_t quiet = millis(), breaths = 0;
+  while (size == 0 ? http.connected() : written < size) {
+    size_t want = TELEGRAM_CHUNK;
+    if (size && size - written < want)
+      want = size - written;
+    const int taken = stream->read(telegramBuffer, want);
+    if (taken <= 0) {
+      if (!http.connected() || millis() - quiet > 30000 || millis() - started > 15UL * 60 * 1000)
         break;
-      vTaskDelay(pdMS_TO_TICKS(5));
+      vTaskDelay(1);
       continue;
     }
-    const size_t taken = stream->readBytes(buffer, waiting > TELEGRAM_CHUNK ? TELEGRAM_CHUNK : waiting);
+    quiet = millis();
+    if ((++breaths & 0x0F) == 0)      // A stream that never runs dry would never yield,
+      vTaskDelay(1);                  // and the loop feeding the printer shares this priority
 
     // An image for this chip starts with 0xE9, and a gcode file sent by mistake would
     // otherwise be written over the firmware before anyone noticed.
-    if (firmware && written == 0 && (taken == 0 || buffer[0] != 0xE9)) {
+    if (firmware && written == 0 && (taken == 0 || telegramBuffer[0] != 0xE9)) {
       good = false;
       break;
     }
 
-    if (!(firmware ? firmwareChunk(buffer, taken) : card.write(buffer, taken) == taken)) {
+    if (!(firmware ? firmwareChunk(telegramBuffer, taken) : card.write(telegramBuffer, taken) == (size_t)taken)) {
       good = false;
       break;
     }
@@ -647,6 +713,7 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
   else
     card.close();
   http.end();
+  client.stop();   // Frees the encryption buffers before the gate lets the next one in
   xSemaphoreGive(tlsGate);
   landing = false;
 
@@ -682,8 +749,131 @@ void TelegramBot::fetchDocument(const String chat, const String fileId, const St
              "Send /files to see it, /print <number> to start it.");
 }
 
+// These are written from the web server's task and read from this one. A String handed
+// between two tasks without a lock frees its buffer under the other's feet, and the heap
+// does not survive it.
 void TelegramBot::probe(const String url) {
+  Hold hold(mutex);
   probeUrl = url;
+}
+
+void TelegramBot::fetchBench(const String url, const size_t chunk, const bool legacy) {
+  Hold hold(mutex);
+  benchChunk = chunk;
+  benchLegacy = legacy;
+  benchOutcome = "running";
+  benchUrl = url;
+}
+
+uint32_t TelegramBot::stackLow() {
+  return stackLowest == 0xFFFFFFFF ? 0 : stackLowest;
+}
+
+String TelegramBot::benchResult() {
+  Hold hold(mutex);
+  return benchOutcome;
+}
+
+// The same path a file from the bot takes, down to the card, against a server of our
+// own: the only way to time it without sending a real file every time.
+void TelegramBot::takeBench(const String url, const size_t chunk, const bool legacy) {
+  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(50)) != pdTRUE) {
+    { Hold hold(mutex); benchOutcome = "the other connection would not let go"; }
+    return;
+  }
+
+  const bool encrypted = url.startsWith("https://");
+  WiFiClientSecure secure;
+  WiFiClient plain;
+  secure.setInsecure();                 // Only ever our own server, for timing this path
+  secure.setTimeout(TELEGRAM_TIMEOUT / 1000);
+  plain.setTimeout(TELEGRAM_TIMEOUT / 1000);
+  WiFiClient &client = encrypted ? (WiFiClient &)secure : plain;
+
+  HTTPClient http;
+  http.setReuse(false);   // So end() really closes it before the gate goes to the next one
+  http.setTimeout(TELEGRAM_TIMEOUT);
+  if (!http.begin(client, url)) {
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
+    xSemaphoreGive(tlsGate);
+    { Hold hold(mutex); benchOutcome = "could not open the connection"; }
+    return;
+  }
+
+  const int code = http.GET();
+  if (code != 200) {
+    http.end();
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
+    xSemaphoreGive(tlsGate);
+    { Hold hold(mutex); benchOutcome = "answer " + String(code); }
+    return;
+  }
+
+  landing = true;
+  FileWrapper card = storageFS.open("/bench.tmp", "w");
+  if (!card) {
+    landing = false;
+    http.end();
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
+    xSemaphoreGive(tlsGate);
+    { Hold hold(mutex); benchOutcome = "could not create the file"; }
+    return;
+  }
+
+  const size_t want = chunk && chunk <= TELEGRAM_CHUNK ? chunk : TELEGRAM_CHUNK;
+  WiFiClient *stream = http.getStreamPtr();
+  const size_t expected = http.getSize() > 0 ? (size_t)http.getSize() : 0;
+  size_t written = 0;
+  uint32_t reads = 0, waits = 0;
+  const uint32_t started = millis();
+
+  while (expected == 0 ? http.connected() : written < expected) {
+    size_t piece = want;
+    if (expected && expected - written < piece)
+      piece = expected - written;
+    int taken;
+    if (legacy) {                      // The loop as it was: ask, sleep, then a byte at a time
+      const size_t waiting = stream->available();
+      if (!waiting) {
+        ++waits;
+        if (millis() - started > 300000)
+          break;
+        vTaskDelay(pdMS_TO_TICKS(5));
+        continue;
+      }
+      taken = stream->readBytes(telegramBuffer, waiting > want ? want : waiting);
+    }
+    else
+      taken = stream->read(telegramBuffer, piece);
+    ++reads;
+    if (taken <= 0) {
+      ++waits;
+      if (!http.connected() || millis() - started > 300000)
+        break;
+      vTaskDelay(1);
+      continue;
+    }
+    if (card.write(telegramBuffer, taken) != (size_t)taken)
+      break;
+    written += taken;
+  }
+
+  const uint32_t ms = millis() - started;
+  card.close();
+  http.end();
+  client.stop();   // Frees the encryption buffers before the gate lets the next one in
+  xSemaphoreGive(tlsGate);
+  landing = false;
+  storageFS.remove("/bench.tmp");
+
+  const String outcome = String(written) + " of " + String(expected) + " bytes in " + String(ms) + " ms, "
+                         + String(written / (float)ms, 1) + " KB/s, chunk " + String(want)
+                         + ", " + String(reads) + " reads, " + String(waits) + " waits";
+  {
+    Hold hold(mutex);
+    benchOutcome = outcome;
+  }
+  trail("https bench: " + outcome);
 }
 
 // The firmware path on its own, so it can be walked against a server of our own instead
@@ -697,7 +887,7 @@ void TelegramBot::takeFirmware(const String url, const String chat) {
   }
   trail("ota: flash open, heap " + String(ESP.getFreeHeap()));
 
-  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(30000)) != pdTRUE) {
+  if (!tlsGate || xSemaphoreTake(tlsGate, pdMS_TO_TICKS(50)) != pdTRUE) {
     firmwareEnd(false);
     trail("ota: the other connection would not let go");
     return;
@@ -711,8 +901,10 @@ void TelegramBot::takeFirmware(const String url, const String chat) {
   client.setTimeout(TELEGRAM_TIMEOUT / 1000);
 
   HTTPClient http;
+  http.setReuse(false);   // So end() really closes it before the gate goes to the next one
   http.setTimeout(TELEGRAM_TIMEOUT);
   if (!http.begin(client, url)) {
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
     xSemaphoreGive(tlsGate);
     firmwareEnd(false);
     trail("ota: could not open the connection");
@@ -727,13 +919,13 @@ void TelegramBot::takeFirmware(const String url, const String chat) {
 
   if (code != 200) {
     http.end();
+    client.stop();   // Frees the encryption buffers before the gate lets the next one in
     xSemaphoreGive(tlsGate);
     firmwareEnd(false);
     trail("ota: refused");
     return;
   }
 
-  static uint8_t buffer[TELEGRAM_CHUNK] __attribute__((aligned(32)));
   WiFiClient *stream = http.getStreamPtr();
   const size_t expected = length > 0 ? (size_t)length : 0;
   size_t written = 0;
@@ -757,13 +949,15 @@ void TelegramBot::takeFirmware(const String url, const String chat) {
     }
     quiet = millis();
 
-    const size_t taken = stream->readBytes(buffer, waiting > TELEGRAM_CHUNK ? TELEGRAM_CHUNK : waiting);
-    if (written == 0 && (taken == 0 || buffer[0] != 0xE9)) {
+    const int taken = stream->read(telegramBuffer, TELEGRAM_CHUNK);
+    if (taken <= 0)
+      continue;
+    if (written == 0 && telegramBuffer[0] != 0xE9) {
       trail("ota: that is not an image for this chip");
       good = false;
       break;
     }
-    if (!firmwareChunk(buffer, taken)) {
+    if (!firmwareChunk(telegramBuffer, taken)) {
       trail("ota: the flash refused a block at " + String(written));
       good = false;
       break;
@@ -776,6 +970,7 @@ void TelegramBot::takeFirmware(const String url, const String chat) {
   const bool whole = good && expected && written == expected;
   const String trouble = firmwareEnd(whole);
   http.end();
+  client.stop();   // Frees the encryption buffers before the gate lets the next one in
   xSemaphoreGive(tlsGate);
 
   const uint32_t seconds = (millis() - started) / 1000;
@@ -805,6 +1000,11 @@ void TelegramBot::run(void *argument) {
   int failures = 0;
 
   for (;;) {
+    if (somethingIsStreaming() || tlsWanted) {
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+
     if (!hasToken() || WiFi.status() != WL_CONNECTED) {
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
@@ -820,13 +1020,34 @@ void TelegramBot::run(void *argument) {
     else if (failures < 6)
       failures++;
 
+    {
+      const UBaseType_t left = uxTaskGetStackHighWaterMark(NULL);
+      if (left < stackLowest)
+        stackLowest = left;
+    }
+
     vTaskDelay(pdMS_TO_TICKS(failures ? 1000 << (failures - 1) : 50));
 
-    if (probeUrl != "") {
-      const String url = probeUrl;
+    String waiting;
+    {
+      Hold hold(mutex);
+      waiting = probeUrl;
       probeUrl = "";
-      takeFirmware(url, "");
     }
+    if (waiting != "")
+      takeFirmware(waiting, "");
+
+    size_t chunk = 0;
+    bool legacy = false;
+    {
+      Hold hold(mutex);
+      waiting = benchUrl;
+      benchUrl = "";
+      chunk = benchChunk;
+      legacy = benchLegacy;
+    }
+    if (waiting != "")
+      takeBench(waiting, chunk, legacy);
 
     if (waitingId != "") {
       const String chat = waitingChat, id = waitingId, name = waitingName;
