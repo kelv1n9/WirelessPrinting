@@ -784,7 +784,7 @@ void setup() {
 
   // What a slicer speaks. Only the two calls Orca actually makes are here.
   route("/api/version", HTTP_GET, []() {
-    server.send(200, "application/json", "{\"api\":\"0.1\",\"server\":\"1.3.10\",\"text\":\"KP3S module\"}");
+    server.send(200, "application/json", "{\"api\":\"0.1\",\"server\":\"1.3.10\",\"text\":\"OctoPrint (KP3S module)\"}");
   });
 
   route("/api/files/local", HTTP_POST, []() {
@@ -794,10 +794,13 @@ void setup() {
       server.send(500, "application/json", "{\"error\":\"" + why + "\"}");
       return;
     }
+    // The module's card is a place to pass through, not a place to keep things, so
+    // an upload goes on to the printer's card either way. print only says whether to
+    // start it when it lands.
     const String wanted = server.arg("print");
     const bool andPrint = wanted == "true" || wanted == "1";
-    String said = "stored";
-    if (andPrint && !startChore(lastUpload, true))
+    String said = andPrint ? "printing" : "sending";
+    if (!startChore(lastUpload, andPrint))
       said = choreTrouble.length() ? choreTrouble : "the printer is busy";
     server.send(201, "application/json",
       "{\"done\":true,\"name\":\"" + lastUpload + "\",\"said\":\"" + said + "\"}");

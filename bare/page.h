@@ -233,7 +233,8 @@ upload and reflash. <a href="/auth">Set one</a>.</p>
     <table><tbody id="ptab"><tr><td class="dim">asking the printer</td></tr></tbody></table>
     <div class="foot">
       <div class="row">
-        <button class="p" id="bpick">Upload and print</button>
+        <button class="p" id="bpickp">Upload and print</button>
+        <button id="bpick">Upload</button>
         <input type="file" id="file" accept=".gcode,.gco,.g" hidden>
         <button id="bpcard">Refresh</button>
       </div>
@@ -535,11 +536,15 @@ $('bpower').onclick = () => confirm('Cut mains to the printer? This module loses
 $('bprint').onclick = () => job('start');
 $('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel');
 $('brestart').onclick = () => confirm('Restart the module? The printer keeps running.') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
-$('bpick').onclick = () => {
+let uploadThenPrint = false;
+function pick(andPrint){
   if (busy) { toast('a transfer is running, upload when it finishes'); return; }
   if (conPrinting) { toast('a print is running, the wire is not free'); return; }
+  uploadThenPrint = andPrint;
   $('file').click();
-};
+}
+$('bpick').onclick = () => pick(false);
+$('bpickp').onclick = () => pick(true);
 
 $('bfw').onclick = () => $('fwfile').click();
 $('fwfile').onchange = e => { if (e.target.files[0]) flash(e.target.files[0]); e.target.value = ''; };
@@ -568,11 +573,12 @@ function upload(f){
   x.upload.onprogress = e => { if (e.lengthComputable) p.value = e.loaded * 100 / e.total; };
   x.onloadend = () => {
     p.classList.add('hide');
-    toast(x.status === 201 ? 'uploaded, going to the printer' : ('upload failed: ' + (x.responseText || x.status)));
+    toast(x.status === 201 ? 'uploaded, going to the printer card' : ('upload failed: ' + (x.responseText || x.status)));
     loadFiles();
     pollTransfer().catch(()=>{});
   };
-  form.append('print', 'true');
+  if (uploadThenPrint)
+    form.append('print', 'true');
   x.open('POST', '/api/files/local');
   x.send(form);
 }

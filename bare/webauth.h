@@ -19,7 +19,10 @@
 #include <Preferences.h>
 #include <WebServer.h>
 
-#define WEBAUTH_REALM    "WirelessPrinting"
+// No comma and no colon in here. The challenge header separates its parameters with
+// commas, and although a quoted value may hold one, Safari splits on them anyway and
+// falls back to basic. The hint about the user name goes in the body instead.
+#define WEBAUTH_REALM    "KP3S"
 #define WEBAUTH_USER     "print"
 #define WEBAUTH_KEY_LEN  32
 
@@ -56,7 +59,10 @@ static bool webAuthAllows() {
 static bool webAuthLets() {
   if (webAuthAllows())
     return true;
-  server.requestAuthentication(DIGEST_AUTH, WEBAUTH_REALM);
+  server.requestAuthentication(DIGEST_AUTH, WEBAUTH_REALM,
+    F("<!doctype html><meta charset=utf-8><title>KP3S</title>"
+      "<p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. "
+      "Reload the page to try again.</p>"));
   return false;
 }
 
