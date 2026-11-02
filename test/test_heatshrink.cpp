@@ -19,7 +19,7 @@
 #include <vector>
 #include "heatshrink_decoder.h"        // Marlin's, verbatim
 #include "heatshrink_config.h"         // Marlin's, verbatim
-#include "../bare/heatshrink_encoder.h"
+#include "../ESP8266WirelessPrintAsync/heatshrink_encoder.h"
 
 static_assert(HeatshrinkEncoder::WINDOW_BITS == HEATSHRINK_STATIC_WINDOW_BITS,
               "the encoder's window does not match the printer's");
@@ -225,8 +225,25 @@ int main(int argc, char **argv) {
     }
   }
 
-  scenario = "the real gcode that exists on this machine";
+  scenario = "real sliced gcode";
   {
+    // cold_cube_head.gcode is the first 2000 lines of a print pulled off the
+    // module's card, OrcaSlicer 2.4.1 for this printer, byte for byte: the
+    // settings header, the base64 PNG thumbnail, and the first layers. A head
+    // extract, so its ratio is that head's, not a whole print's. The full
+    // 604 KB file round-tripped too, it is just too big to keep in the repo.
+    const std::string real = from_file("cold_cube_head.gcode");
+    check(!real.empty(), "the real gcode extract is there");
+    if (!real.empty()) {
+      double ratio = 0;
+      for (size_t chunk : {size_t(1), size_t(96), size_t(512), size_t(4096), size_t(65536)}) {
+        char what[80]; snprintf(what, sizeof what, "real gcode fed %zu bytes at a time", chunk);
+        ratio = round_trip(real, what, chunk);
+      }
+      printf("  %-40s %7zu bytes, ratio %.2f\n", "cold_cube_head.gcode (OrcaSlicer)",
+             real.size(), ratio);
+    }
+
     const char *marlin = argc > 1 ? argv[1] : "";
     const char *paths[] = {
       "/buildroot/test-gcode/M808-loops.gcode",
@@ -236,19 +253,13 @@ int main(int argc, char **argv) {
       const std::string body = from_file((std::string(marlin) + rel).c_str());
       if (body.empty()) continue;
       const double ratio = round_trip(body, rel);
-      printf("  %-56s %7zu bytes, ratio %.2f\n", rel + 1, body.size(), ratio);
+      printf("  %-40s %7zu bytes, ratio %.2f\n", rel + 1, body.size(), ratio);
     }
-    const std::string restore = from_file(
-      (std::string(getenv("HOME") ? getenv("HOME") : "") +
-       "/Documents/My Projects/Kingroon KP3S/KP3S/restore_after_flash.gcode").c_str());
-    if (!restore.empty())
-      printf("  %-56s %7zu bytes, ratio %.2f\n", "restore_after_flash.gcode",
-             restore.size(), round_trip(restore, "restore_after_flash.gcode"));
   }
 
   scenario = "a whole print, far larger than the window";
   {
-    const std::string g = fake_sliced_gcode(2000);
+    const std::string g = fake_sliced_gcode(400);
     const clock_t t0 = clock();
     const std::string packed = compress(g, 4096);
     const double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;

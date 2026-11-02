@@ -18,6 +18,7 @@
 #include <stdio.h>
 
 #include "PrinterLink.h"          // LinkIo, the one thing that touches the wire
+#include "heatshrink_encoder.h"
 
 #define BINARY_TOKEN        0xB5AD
 #define BINARY_HEADER_BYTES 8
@@ -30,6 +31,7 @@
 #define BINARY_ACK_WAIT     2000  // Marlin's own packet wait is 500 ms, leave it room
 #define BINARY_OPEN_WAIT    15000
 #define BINARY_CLOSE_WAIT   30000
+#define BINARY_ASK_WAIT     1500  // For the version line, after the query is acknowledged
 #define BINARY_MAX_RESENDS  40    // Over a whole image, not per packet
 
 enum BinaryProtocol : uint8_t { BinaryControl = 0, BinaryFile = 1 };
@@ -38,9 +40,18 @@ enum BinaryFileType : uint8_t { BinaryQuery = 0, BinaryOpen = 1, BinaryShut = 2,
                                 BinaryWrite = 3, BinaryAbort = 4 };
 
 enum BinaryPhase : uint8_t {
-  BinaryIdle, BinarySwitching, BinarySyncing, BinaryOpening,
+  BinaryIdle, BinarySwitching, BinarySyncing, BinaryAsking, BinaryOpening,
   BinaryWriting, BinaryShutting, BinaryAborting, BinaryDone, BinaryFailed
 };
+
+// The window and lookahead are compile time constants on both sides and the stream
+// carries no header, so a disagreement writes a silently wrong file rather than
+// failing. These are what this encoder emits; anything else and compression is off.
+#define BINARY_WINDOW_BITS    8
+#define BINARY_LOOKAHEAD_BITS 4
+
+#define BINARY_PACK_SLICE  256    // fed to the encoder at a time
+#define BINARY_PACK_ROOM   1024   // compressed bytes held back, waiting for a packet
 
 // Where the bytes come from. Separate so a test can hand over memory and the firmware
 // can hand over a file on the card without either knowing about the other.
@@ -60,6 +71,11 @@ public:
   uint16_t theirPayload = BINARY_MAX_PAYLOAD;
   char theirVersion[16];
 
+  // What it said about compression when asked, and what came of it
+  char theirCompression[24];
+  bool packing;             // true once the open packet has claimed a compressed stream
+  uint32_t sent;            // bytes actually put on the wire, against written
+
   void begin(LinkIo *link) {
     io = link;
     phase = BinaryIdle;
@@ -67,12 +83,21 @@ public:
 
   bool running() const { return phase != BinaryIdle && phase != BinaryDone && phase != BinaryFailed; }
 
-  bool start(ByteSource *from, const char *name, const uint32_t now) {
+  // Compression is asked for, not assumed: the printer is questioned first and the
+  // stream stays plain unless its answer matches this encoder exactly.
+  bool start(ByteSource *from, const char *name, const uint32_t now, const bool pack = true) {
     if (running() || !io || !from || !name || !*name)
       return false;
 
     source = from;
     stopping = false;
+    wanted = pack;
+    packing = false;
+    sent = 0;
+    theirCompression[0] = 0;
+    packer.reset();
+    packHead = packTail = 0;
+    drained = false;
     total = from->size();
     written = packets = resends = 0;
     trouble = NULL;
@@ -111,6 +136,14 @@ public:
     if (!running() || (int32_t)(now - waitUntil) < 0)
       return;
 
+    // The packet was taken but no version line came back. Repeating it would be
+    // read as a duplicate and dropped, so go on with the stream uncompressed.
+    if (phase == BinaryAsking && asked) {
+      packing = false;
+      openFile();
+      return;
+    }
+
     // Marlin asks again on its own after 500 ms of silence, so a wait this long means
     // the answer itself went missing rather than the packet.
     if (++resends > BINARY_MAX_RESENDS) {
@@ -130,6 +163,12 @@ private:
   char target[BINARY_NAME_BYTES];
 
   uint8_t sync;
+  bool wanted = true;
+  bool asked = false;
+  HeatshrinkEncoder packer;
+  uint8_t packed[BINARY_PACK_ROOM];
+  uint16_t packHead, packTail;         // compressed bytes live in packed[packTail..packHead)
+  bool drained;                        // the source is spent and the encoder flushed
   uint8_t packet[BINARY_PACKET_ROOM];
   uint16_t held;                       // length of the packet last sent, for a repeat
   bool atEnd;
@@ -204,6 +243,13 @@ private:
   void handshake() {
     sendAscii("M28B1");
     phase = BinarySwitching;
+    waitUntil = nowish + BINARY_ACK_WAIT;
+  }
+
+  void askQuery() {
+    phase = BinaryAsking;
+    asked = false;
+    put(BinaryFile, BinaryQuery, NULL, 0);
     waitUntil = nowish + BINARY_ACK_WAIT;
   }
 
@@ -289,6 +335,22 @@ private:
       fail("the printer gave up on the stream");
       return;
     }
+    if (!strncmp(line, "PFT:version", 11)) {
+      if (phase != BinaryAsking)
+        return;
+      const char *said = strstr(line, ":compression:");
+      if (said) {
+        said += 13;
+        snprintf(theirCompression, sizeof theirCompression, "%s", said);
+        unsigned window = 0, lookahead = 0;
+        packing = wanted
+               && sscanf(said, "heatshrink,%u,%u", &window, &lookahead) == 2
+               && window == BINARY_WINDOW_BITS
+               && lookahead == BINARY_LOOKAHEAD_BITS;
+      }
+      openFile();
+      return;
+    }
     if (!strncmp(line, "PFT:busy", 8)) {
       fail("the printer already has a transfer open");
       return;
@@ -323,7 +385,14 @@ private:
       case BinarySyncing:
         if (!wasSync)
           return;                          // Only ss ends the handshake
-        openFile();
+        askQuery();
+        break;
+
+      case BinaryAsking:
+        // Marlin acknowledges the packet before it answers it, so the ok says
+        // nothing yet. Give the answer a moment of its own.
+        asked = true;
+        waitUntil = nowish + BINARY_ASK_WAIT;
         break;
 
       case BinaryOpening:
@@ -371,7 +440,7 @@ private:
     uint8_t body[BINARY_MAX_PAYLOAD];
     size_t at = 0;
     body[at++] = 0;                        // dummy transfer off, we mean it
-    body[at++] = 0;                        // compression off: Marlin ships only a decoder
+    body[at++] = packing ? 1 : 0;          // what the printer agreed to, nothing assumed
     const size_t room = sizeof(body) - at - 1;
     size_t len = strlen(target);
     if (len > room)
@@ -385,9 +454,62 @@ private:
     waitUntil = nowish + BINARY_OPEN_WAIT;
   }
 
+  void closeUp() {
+    atEnd = true;
+    phase = BinaryShutting;
+    put(BinaryFile, BinaryShut, NULL, 0);
+    waitUntil = nowish + BINARY_CLOSE_WAIT;
+  }
+
+  // Keeps at least one packet of compressed bytes ready, or marks the stream spent.
+  bool fillPacked() {
+    if (drained || (uint16_t)(packHead - packTail) >= BINARY_MAX_PAYLOAD)
+      return true;
+
+    if (packTail) {
+      memmove(packed, packed + packTail, (size_t)(packHead - packTail));
+      packHead -= packTail;
+      packTail = 0;
+    }
+
+    while (BINARY_PACK_ROOM - packHead >= HeatshrinkEncoder::max_output(BINARY_PACK_SLICE)) {
+      uint8_t slice[BINARY_PACK_SLICE];
+      const int got = source->next(slice, sizeof slice);
+      if (got < 0)
+        return false;
+      if (got == 0) {
+        drained = true;
+        packHead += packer.finish(packed + packHead, BINARY_PACK_ROOM - packHead);
+        break;
+      }
+      written += got;
+      packHead += packer.encode(slice, (size_t)got, packed + packHead, BINARY_PACK_ROOM - packHead);
+    }
+    return true;
+  }
+
   void writeMore() {
-    uint8_t body[BINARY_MAX_PAYLOAD];
     const size_t room = theirPayload < BINARY_MAX_PAYLOAD ? theirPayload : BINARY_MAX_PAYLOAD;
+
+    if (packing) {
+      if (!fillPacked()) {
+        fail("the file could not be read");
+        return;
+      }
+      const uint16_t have = packHead - packTail;
+      if (!have) {
+        closeUp();
+        return;
+      }
+      const uint16_t take = have < room ? have : (uint16_t)room;
+      sent += take;
+      put(BinaryFile, BinaryWrite, packed + packTail, take);
+      packTail += take;
+      waitUntil = nowish + BINARY_ACK_WAIT;
+      return;
+    }
+
+    uint8_t body[BINARY_MAX_PAYLOAD];
     const int got = source->next(body, room);
 
     if (got < 0) {
@@ -395,14 +517,12 @@ private:
       return;
     }
     if (got == 0) {
-      atEnd = true;
-      phase = BinaryShutting;
-      put(BinaryFile, BinaryShut, NULL, 0);
-      waitUntil = nowish + BINARY_CLOSE_WAIT;
+      closeUp();
       return;
     }
 
     written += got;
+    sent += got;
     put(BinaryFile, BinaryWrite, body, (uint16_t)got);
     waitUntil = nowish + BINARY_ACK_WAIT;
   }

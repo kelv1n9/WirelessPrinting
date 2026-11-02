@@ -50,6 +50,13 @@ struct CardBytes : ByteSource {
   uint32_t size() const { return held; }
 };
 
+// A firmware image packs to nothing and the plain path is the one proven byte for
+// byte on this printer, so only gcode is offered for compression.
+static bool worthPacking(const char *name) {
+  const char *dot = strrchr(name, '.');
+  return !dot || strcasecmp(dot, ".bin") != 0;
+}
+
 static SerialIo serialIo;
 static CardBytes sendBytes;
 static BinaryTransfer sender;
@@ -457,6 +464,9 @@ void setup() {
       "written  " + String(sender.written) + " of " + String(sender.total) + "\n" +
       "packets  " + String(sender.packets) + ", resends " + String(sender.resends) + "\n" +
       "payload  " + String(sender.theirPayload) + ", their version " + sender.theirVersion + "\n" +
+      "packing  " + String(sender.packing ? "on" : "off") +
+        ", printer says " + (sender.theirCompression[0] ? sender.theirCompression : "nothing yet") +
+        ", on the wire " + String(sender.sent) + "\n" +
       "took     " + String(sender.finishedAt > sender.startedAt
                            ? sender.finishedAt - sender.startedAt : 0) + "ms\n" +
       "trouble  " + String(sender.trouble ? sender.trouble : "none") + "\n");
@@ -485,7 +495,7 @@ void loop() {
 
   if (sendAsked) {
     sendAsked = false;
-    sender.start(&sendBytes, sendName, millis());
+    sender.start(&sendBytes, sendName, millis(), worthPacking(sendName));
   }
   if (!sender.running())
     drain();                     // The one reader, whenever the sender does not own the wire

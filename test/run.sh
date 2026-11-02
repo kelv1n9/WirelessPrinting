@@ -5,6 +5,18 @@ CXX=/Library/Developer/CommandLineTools/usr/bin/clang++
 FLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
 cd "$(dirname "$0")"
 fail=0
+MARLIN="$HOME/Documents/My Projects/Kingroon KP3S/KP3S/Marlin-2.1.2"
+HS="$MARLIN/Marlin/src/libs/heatshrink"
+STAGE=/tmp/hs_marlin
+if [ -f "$HS/heatshrink_decoder.cpp" ]; then
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE/Marlin/src/libs/heatshrink" "$STAGE/Marlin/src/inc"
+  cp "$HS/heatshrink_decoder.cpp" "$HS/heatshrink_decoder.h" \
+     "$HS/heatshrink_common.h" "$HS/heatshrink_config.h" "$STAGE/Marlin/src/libs/heatshrink/"
+  echo '#pragma once
+#define ENABLED(V) 1' > "$STAGE/Marlin/src/inc/MarlinConfigPre.h"
+fi
+
 for t in test_boot_guard test_web_auth test_command_queue test_printer_link test_card_transfer test_binary_transfer test_printercard; do
   printf '\n=== %s ===\n' "$t"
   $CXX $FLAGS -I stubs -o "/tmp/$t" "$t.cpp"
@@ -13,21 +25,20 @@ done
 # Both our sender and our fake printer were written from one reading of Marlin's binary
 # protocol, so they would agree with each other even if the reading were wrong. This asks
 # Marlin's own reference sender instead. Skipped when the Marlin tree is not beside us.
-MARLIN="$HOME/Documents/My Projects/Kingroon KP3S/KP3S/Marlin-2.1.2"
 
 # Same reason, for the compressor: our encoder is judged by Marlin's own decoder,
 # copied out of their tree untouched. Only the config system is stubbed, so that
 # the decoder compiles on the host without dragging in a board and a HAL.
-HS="$MARLIN/Marlin/src/libs/heatshrink"
 if [ -f "$HS/heatshrink_decoder.cpp" ]; then
+  # The whole transfer again, this time with a printer that really decompresses.
+  printf '\n=== test_binary_transfer, compressed, against Marlin own decoder ===\n'
+  $CXX $FLAGS -Wno-unknown-pragmas -I stubs -DMARLIN_SIM_HEATSHRINK \
+    -I "$STAGE/Marlin/src/libs/heatshrink" \
+    -o /tmp/test_binary_transfer_packed test_binary_transfer.cpp \
+    "$STAGE/Marlin/src/libs/heatshrink/heatshrink_decoder.cpp"
+  /tmp/test_binary_transfer_packed || fail=1
+
   printf '\n=== heatshrink, against Marlin own decoder ===\n'
-  STAGE=/tmp/hs_marlin
-  rm -rf "$STAGE"
-  mkdir -p "$STAGE/Marlin/src/libs/heatshrink" "$STAGE/Marlin/src/inc"
-  cp "$HS/heatshrink_decoder.cpp" "$HS/heatshrink_decoder.h" \
-     "$HS/heatshrink_common.h" "$HS/heatshrink_config.h" "$STAGE/Marlin/src/libs/heatshrink/"
-  echo '#pragma once
-#define ENABLED(V) 1' > "$STAGE/Marlin/src/inc/MarlinConfigPre.h"
   $CXX $FLAGS -Wno-unknown-pragmas -I stubs -I "$STAGE/Marlin/src/libs/heatshrink" \
     -o /tmp/test_heatshrink test_heatshrink.cpp "$STAGE/Marlin/src/libs/heatshrink/heatshrink_decoder.cpp"
   /tmp/test_heatshrink "$MARLIN" || fail=1

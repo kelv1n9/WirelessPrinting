@@ -61,8 +61,8 @@ while at < len(stream):
     if (protocol, kind) == (1, 1):
         if body[:1] != b"\x00":
             failures.append("the open packet asks for a dummy transfer, which writes nothing")
-        if body[1:2] != b"\x00":
-            failures.append("the open packet asks for compression, and Marlin ships only a decoder")
+        if body[1:2] not in (b"\x00", b"\x01"):
+            failures.append(f"the compression byte of the open packet is {body[1]}, not a flag")
         if not body.endswith(b"\x00"):
             failures.append("the filename in the open packet has no terminator")
     if (protocol, kind) == (1, 3) and size > 96:
@@ -71,9 +71,10 @@ while at < len(stream):
     packets += 1
     at = end
 
-# The order their copy() goes in: sync, open, writes, close, and out of binary mode
-if order[:2] != [(0, 1), (1, 1)]:
-    failures.append(f"the conversation does not open with a sync and an open: {order[:2]}")
+# The order their copy() goes in: sync, query, open, writes, close, out of binary mode.
+# The query is what tells us whether the printer can decompress at all.
+if order[:3] != [(0, 1), (1, 0), (1, 1)]:
+    failures.append(f"the conversation does not open with a sync, a query and an open: {order[:3]}")
 if order[-2:] != [(1, 2), (0, 2)]:
     failures.append(f"the conversation does not end by closing the file and the mode: {order[-2:]}")
 if not any(step == (1, 3) for step in order):

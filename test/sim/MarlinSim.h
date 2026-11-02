@@ -13,6 +13,12 @@
 #include <string>
 #include <vector>
 
+// Built with Marlin's own decoder beside it, the fake printer unpacks a compressed
+// stream the way the real one does. Without it, it answers that it cannot.
+#ifdef MARLIN_SIM_HEATSHRINK
+  #include "heatshrink_decoder.h"
+#endif
+
 struct MarlinSim {
   // Knobs. The defaults are the printer as it stands today.
   size_t rxBufferSize = 64;         // libmaple USART_RX_BUF_SIZE, not Marlin's RX_BUFFER_SIZE
@@ -40,6 +46,7 @@ struct MarlinSim {
   uint32_t binaryResendsAsked = 0;
   bool binaryMode = false;          // M28 B1 puts the port here, a control packet takes it back
   bool binaryOpen = false;          // A file is open for binary writing
+  bool binaryPacked = false;        // The open packet asked for a compressed stream
   std::string binaryFile;
   std::vector<std::string> seen;    // Commands that made it through, in order
   std::map<std::string, std::string> card;
@@ -342,7 +349,13 @@ private:
     }
     switch (type) {
       case 0:                                  // query
+#ifdef MARLIN_SIM_HEATSHRINK
+        say("PFT:version:0.1.0:compression:heatshrink,"
+            + std::to_string(HEATSHRINK_STATIC_WINDOW_BITS) + ","
+            + std::to_string(HEATSHRINK_STATIC_LOOKAHEAD_BITS));
+#else
         say("PFT:version:0.1.0:compression:none");
+#endif
         break;
       case 1: {                                // open
         if (binaryOpen) { say("PFT:busy"); break; }
@@ -350,6 +363,12 @@ private:
         if (binData.size() < 3 || binData.back() != '\0') { say("PFT:fail"); break; }
         if (!cardPresent || !sdWrite) { say("PFT:fail"); break; }
         binaryFileName(binData);
+        binaryPacked = (binData[1] & 1) != 0;
+#ifdef MARLIN_SIM_HEATSHRINK
+        heatshrink_decoder_reset(&hsd);
+#else
+        if (binaryPacked) { say("PFT:fail"); break; }
+#endif
         binaryOpen = true;
         card[binaryFile].clear();
         alias[binaryFile] = dosAlias(binaryFile);
@@ -363,6 +382,7 @@ private:
         break;
       case 3:                                  // write
         if (!binaryOpen) { say("PFT:invalid"); break; }
+        if (binaryPacked) { unpackInto(card[binaryFile], binData); break; }
         card[binaryFile] += binData;
         cardFree -= binData.size();
         break;
@@ -376,6 +396,30 @@ private:
         break;
     }
   }
+
+#ifdef MARLIN_SIM_HEATSHRINK
+  heatshrink_decoder hsd;
+
+  // Driven exactly as binary_stream.h drives it: sink what fits, then poll dry.
+  void unpackInto(std::string &into, const std::string &from) {
+    size_t done = 0;
+    while (done < from.size()) {
+      size_t took = 0;
+      heatshrink_decoder_sink(&hsd, (uint8_t *)from.data() + done, from.size() - done, &took);
+      done += took;
+      HSD_poll_res res;
+      do {
+        uint8_t out[512];
+        size_t made = 0;
+        res = heatshrink_decoder_poll(&hsd, out, sizeof out, &made);
+        into.append((const char *)out, made);
+        cardFree -= made;
+      } while (res == HSDR_POLL_MORE);
+    }
+  }
+#else
+  void unpackInto(std::string &, const std::string &) {}
+#endif
 
   void binaryFileName(const std::string &body) {
     binaryFile.clear();

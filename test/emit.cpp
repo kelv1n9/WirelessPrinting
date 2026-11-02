@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 300; i++) body += (char)((i * 7) & 0xFF);
   MemorySource from(body);
 
-  move.start(&from, "Robin_nano35.bin", wire.clock);
+  move.start(&from, "Robin_nano.bin", wire.clock);
   for (uint32_t i = 0; i < 400000 && move.running(); i++) {
     sim.tick(wire.clock);
     move.service(wire.clock);
