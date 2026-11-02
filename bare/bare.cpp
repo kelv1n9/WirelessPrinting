@@ -9,6 +9,7 @@
 #include <SD_MMC.h>
 
 #include "../ESP8266WirelessPrintAsync/BinaryTransfer.h"
+#include "../ESP8266WirelessPrintAsync/BootGuard.h"
 
 #define JOIN_WAIT_MS   90000
 #define PORTAL_NAME    "KP3S-setup"
@@ -167,6 +168,7 @@ static void startPortal() {
 
 void setup() {
   Serial.begin(115200);
+  bootGuardBegin();                 // First, so everything after it is allowed to be broken
 
   WiFi.persistent(true);
   WiFi.mode(WIFI_STA);
@@ -192,7 +194,8 @@ void setup() {
       "\",\"uptime\":" + String(millis() / 1000) +
       ",\"heap\":" + String(ESP.getFreeHeap()) +
       ",\"block\":" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)) +
-      ",\"card\":" + String(cardUp ? "true" : "false") + "}");
+      ",\"card\":" + String(cardUp ? "true" : "false") +
+      ",\"guard\":\"" + bootGuardReport() + "\"}");
   });
 
   Printer.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
@@ -387,6 +390,7 @@ void setup() {
     server.sendHeader("Connection", "close");
     server.send(good ? 200 : 500, "text/plain", good ? "OK, rebooting\n" : "failed\n");
     if (good) {
+      bootGuardArm();
       delay(300);
       ESP.restart();
     }
@@ -397,6 +401,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  bootGuardWatch(WiFi.status() == WL_CONNECTED);
 
   if (portal)
     return;
