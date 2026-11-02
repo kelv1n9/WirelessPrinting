@@ -2,7 +2,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
-#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
 #include <esp_heap_caps.h>
@@ -13,6 +12,7 @@
 #include "page.h"
 #include "printercard.h"
 #include "gcodemeta.h"
+#include "webauth.h"
 #include "../ESP8266WirelessPrintAsync/YandexHome.h"
 
 // The encrypted connection is the only one, but YandexHome asks for the gate the same
@@ -398,8 +398,6 @@ static int metaFanAt(const char *target, const uint32_t count, const uint32_t by
   return speed;
 }
 
-static WebServer server(80);
-
 // One body for both upload routes: the module's own and the one a slicer speaks.
 static void takeUpload() {
   static File into;
@@ -675,13 +673,12 @@ void setup() {
     return;
   }
 
-  MDNS.begin("kp3s");
-  MDNS.addService("http", "tcp", 80);
+  webAuthBegin();
 
-  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", PAGE_HTML); });
+  route("/", HTTP_GET, []() { server.send_P(200, "text/html", PAGE_HTML); });
   // Everything the page draws, in the shape it has always expected. What this build
   // cannot know is said as nothing rather than guessed: the page hides those rows.
-  server.on("/api/status", HTTP_GET, []() {
+  route("/api/status", HTTP_GET, []() {
     const bool heard = heardTemp && millis() - heardTemp < 20000;
     const uint32_t ran = printing && printSince ? (millis() - printSince) / 1000 : 0;
     uint64_t freeCard = 0;
@@ -690,6 +687,7 @@ void setup() {
 
     String j = "{\"bare\":true";
     j += ",\"printing\":" + String(printing ? "true" : "false");
+    j += ",\"locked\":" + String(webAuthSet() ? "true" : "false");
     j += ",\"connected\":" + String(heard ? "true" : "false");
     j += ",\"state\":\"" + String(printing ? "printing" : (heard ? "ready" : "quiet")) + "\"";
     j += ",\"at\":" + String(printAt) + ",\"of\":" + String(printOf);
@@ -757,7 +755,7 @@ void setup() {
   cardUp = SD_MMC.begin("/sdcard", true);          // 1 bit mode, which leaves gpio13 for the printer
 
   // One line in, whatever the printer says back out. Enough to ask a printer what it is.
-  server.on("/gcode", HTTP_GET, []() {
+  route("/gcode", HTTP_GET, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
@@ -774,7 +772,7 @@ void setup() {
 
   sender.begin(&serialIo);
 
-  server.on("/upload", HTTP_POST, []() {
+  route("/upload", HTTP_POST, []() {
     if (sendTrouble != "") {
       const String why = sendTrouble;
       sendTrouble = "";
@@ -785,11 +783,11 @@ void setup() {
   }, takeUpload);
 
   // What a slicer speaks. Only the two calls Orca actually makes are here.
-  server.on("/api/version", HTTP_GET, []() {
+  route("/api/version", HTTP_GET, []() {
     server.send(200, "application/json", "{\"api\":\"0.1\",\"server\":\"1.3.10\",\"text\":\"KP3S module\"}");
   });
 
-  server.on("/api/files/local", HTTP_POST, []() {
+  route("/api/files/local", HTTP_POST, []() {
     if (sendTrouble != "") {
       const String why = sendTrouble;
       sendTrouble = "";
@@ -806,7 +804,7 @@ void setup() {
   }, takeUpload);
 
 
-  server.on("/files", HTTP_GET, []() {
+  route("/files", HTTP_GET, []() {
     if (!cardUp) {
       server.send(503, "text/plain", "the module has no card\n");
       return;
@@ -822,7 +820,7 @@ void setup() {
     server.send(200, "text/plain", out == "" ? "nothing on the card\n" : out);
   });
 
-  server.on("/download", HTTP_GET, []() {
+  route("/download", HTTP_GET, []() {
     if (!cardUp) {
       server.send(503, "text/plain", "the module has no card\n");
       return;
@@ -842,7 +840,7 @@ void setup() {
   });
 
   // The rest of what the page asks for, in the shapes it has always used.
-  server.on("/api/files", HTTP_GET, []() {
+  route("/api/files", HTTP_GET, []() {
     uint64_t freeCard = 0;
     String j = "{\"files\":[";
     if (cardUp) {
@@ -868,12 +866,12 @@ void setup() {
 
   // Choosing a file is remembered here and acted on when the print is asked for: the
   // printer cannot hold a selection for a file that is not on its card yet.
-  server.on("/select", HTTP_POST, []() {
+  route("/select", HTTP_POST, []() {
     snprintf(selected, sizeof selected, "%s", server.arg("name").c_str());
     server.send(200, "text/plain", "selected\n");
   });
 
-  server.on("/delete", HTTP_POST, []() {
+  route("/delete", HTTP_POST, []() {
     if (!cardUp) {
       server.send(503, "text/plain", "the module has no card\n");
       return;
@@ -885,7 +883,7 @@ void setup() {
     server.send(200, "text/plain", "gone\n");
   });
 
-  server.on("/api/rename", HTTP_POST, []() {
+  route("/api/rename", HTTP_POST, []() {
     if (!cardUp) {
       server.send(503, "text/plain", "the module has no card\n");
       return;
@@ -898,7 +896,7 @@ void setup() {
   });
 
   // start takes the selected file the whole way, since it may not be over there yet
-  server.on("/api/job", HTTP_POST, []() {
+  route("/api/job", HTTP_POST, []() {
     const String body = server.arg("plain");
     if (body.indexOf("cancel") >= 0) {
       if (sender.running()) {
@@ -919,7 +917,7 @@ void setup() {
     server.send(200, "text/plain", "taken as " + String(choreTarget) + "\n");
   });
 
-  server.on("/api/command", HTTP_POST, []() {
+  route("/api/command", HTTP_POST, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
@@ -934,7 +932,7 @@ void setup() {
 
   // The console, drained the same way the plain progress route drains it: whoever
   // asks gets the lines once, and the count says whether there were any.
-  server.on("/api/console", HTTP_GET, []() {
+  route("/api/console", HTTP_GET, []() {
     String j = "{\"seq\":" + String(saidSeq) + ",\"lines\":[";
     saidLog[saidHeld] = 0;
     bool first = true;
@@ -958,7 +956,7 @@ void setup() {
 
   // The picture was decoded out of the file as it was uploaded, so this is a plain
   // read of a small file. It never changes once written, so it is worth caching hard.
-  server.on("/thumbnail", HTTP_GET, []() {
+  route("/thumbnail", HTTP_GET, []() {
     if (!cardUp) {
       server.send(503, "text/plain", "the module has no card\n");
       return;
@@ -982,7 +980,56 @@ void setup() {
 
   // The socket. The token goes in here and never comes back out: this server has no
   // password, and a token that can be read is a token that is gone.
-  server.on("/yandex", HTTP_GET, []() {
+  route("/auth", HTTP_GET, []() {
+    String out =
+      "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+      "<title>password</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
+      "input,button{font:inherit;padding:.4rem .6rem}form{margin:1rem 0}code{word-break:break-all}</style>"
+      "<h1>Who may talk to this module</h1><p><a href=\"/\">back to the printer</a></p>";
+    if (!webAuthSet())
+      out += "<p><b>No password is set.</b> Anyone on this network can print, upload and "
+             "reflash. Nothing will reach the module from outside the house until this "
+             "is set.</p>";
+    else
+      out += "<p>A password is set. The user name is <code>" WEBAUTH_USER "</code>.</p>";
+    out += "<form method=post action=/auth/password>"
+           "<input name=pass type=password size=24 placeholder=\"new password\" "
+           "minlength=8 required><button>Save</button></form>";
+    if (webAuthSet()) {
+      out += "<form method=post action=/auth/forget><button>Remove the password</button></form>";
+      out += "<h2>Key for the slicer</h2><p>Orca cannot do passwords. Paste this as the "
+             "API key:</p><p><code>" + webAuthKey() + "</code></p>"
+             "<form method=post action=/auth/key><button>Make a new one</button></form>";
+    }
+    else
+      out += "<p>The key for the slicer is shown once a password is set.</p>";
+    server.send(200, "text/html", out);
+  });
+
+  route("/auth/password", HTTP_POST, []() {
+    const String given = server.arg("pass");
+    if (given.length() < 8) {
+      server.send(400, "text/plain", "that is too short\n");
+      return;
+    }
+    webAuthSetPassword(given);        // straight into NVS, never logged and never shown
+    server.sendHeader("Location", "/auth");
+    server.send(303, "text/plain", "saved\n");
+  });
+
+  route("/auth/forget", HTTP_POST, []() {
+    webAuthForget();
+    server.sendHeader("Location", "/auth");
+    server.send(303, "text/plain", "gone\n");
+  });
+
+  route("/auth/key", HTTP_POST, []() {
+    webAuthNewKey();
+    server.sendHeader("Location", "/auth");
+    server.send(303, "text/plain", "made\n");
+  });
+
+  route("/yandex", HTTP_GET, []() {
     String out =
       "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
       "<title>socket</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
@@ -1020,7 +1067,7 @@ void setup() {
     server.send(200, "text/html", out);
   });
 
-  server.on("/yandex/token", HTTP_POST, []() {
+  route("/yandex/token", HTTP_POST, []() {
     const String given = server.arg("token");
     if (given.length() < 20) {
       server.send(400, "text/plain", "that is too short to be a token\n");
@@ -1031,20 +1078,20 @@ void setup() {
     server.send(303, "text/plain", "saved\n");
   });
 
-  server.on("/yandex/forget", HTTP_POST, []() {
+  route("/yandex/forget", HTTP_POST, []() {
     yandexHome.forgetToken();
     server.sendHeader("Location", "/yandex");
     server.send(303, "text/plain", "forgotten\n");
   });
 
-  server.on("/yandex/devices", HTTP_POST, []() {
+  route("/yandex/devices", HTTP_POST, []() {
     yandexHome.request(YandexHome::DeviceList);
     delay(1200);                        // long enough that the page usually shows the answer
     server.sendHeader("Location", "/yandex");
     server.send(303, "text/plain", "asking\n");
   });
 
-  server.on("/yandex/device", HTTP_POST, []() {
+  route("/yandex/device", HTTP_POST, []() {
     const String id = server.arg("id");
     String name = id;
     const String found = yandexHome.getDevices();
@@ -1058,7 +1105,7 @@ void setup() {
     server.send(303, "text/plain", "chosen\n");
   });
 
-  server.on("/yandex/auto", HTTP_POST, []() {
+  route("/yandex/auto", HTTP_POST, []() {
     autoPowerOff = server.arg("on") == "1";
     if (!autoPowerOff)
       powerArmed = false;
@@ -1069,7 +1116,7 @@ void setup() {
     server.send(200, "text/plain", autoPowerOff ? "will switch off after a print\n" : "will stay on\n");
   });
 
-  server.on("/yandex/power", HTTP_POST, []() {
+  route("/yandex/power", HTTP_POST, []() {
     if (!yandexHome.request(YandexHome::PowerDraw)) {
       server.send(409, "text/plain", "the socket is busy\n");
       return;
@@ -1077,7 +1124,7 @@ void setup() {
     server.send(200, "text/plain", "asking\n");
   });
 
-  server.on("/yandex/off", HTTP_POST, []() {
+  route("/yandex/off", HTTP_POST, []() {
     if (!yandexHome.request(YandexHome::PowerOff)) {
       server.send(409, "text/plain", "the socket is busy\n");
       return;
@@ -1085,7 +1132,7 @@ void setup() {
     server.send(200, "text/plain", "switching off\n");
   });
 
-  server.on("/yandex/on", HTTP_POST, []() {
+  route("/yandex/on", HTTP_POST, []() {
     if (!yandexHome.request(YandexHome::PowerOn)) {
       server.send(409, "text/plain", "the socket is busy\n");
       return;
@@ -1093,7 +1140,7 @@ void setup() {
     server.send(200, "text/plain", "switching on\n");
   });
 
-  server.on("/restart", HTTP_POST, []() {
+  route("/restart", HTTP_POST, []() {
     if (printing) {
       server.send(409, "text/plain", "the printer is printing\n");
       return;
@@ -1103,7 +1150,7 @@ void setup() {
     ESP.restart();
   });
 
-  server.on("/printer/files", HTTP_GET, []() {
+  route("/printer/files", HTTP_GET, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
@@ -1148,7 +1195,7 @@ void setup() {
     server.send(200, "text/plain", out);
   });
 
-  server.on("/printer/send", HTTP_POST, []() {
+  route("/printer/send", HTTP_POST, []() {
     if (!startChore(server.arg("name"), server.arg("print") == "1")) {
       server.send(choreTrouble == "no such file on the module's card" ? 404 : 409,
                   "text/plain", choreTrouble + "\n");
@@ -1163,7 +1210,7 @@ void setup() {
   // the card unmounted behind it.
   // Deleting on the printer, not here. The sidecars stay: they cost a couple of
   // kilobytes and they are still right if the same file goes over again.
-  server.on("/printer/delete", HTTP_POST, []() {
+  route("/printer/delete", HTTP_POST, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
@@ -1186,7 +1233,7 @@ void setup() {
     server.send(200, "text/plain", "deleted " + name + "\n");
   });
 
-  server.on("/printer/print", HTTP_POST, []() {
+  route("/printer/print", HTTP_POST, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
@@ -1207,7 +1254,7 @@ void setup() {
     server.send(200, "text/plain", "printing " + name + "\n");
   });
 
-  server.on("/printer/cancel", HTTP_POST, []() {
+  route("/printer/cancel", HTTP_POST, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
@@ -1215,7 +1262,7 @@ void setup() {
     server.send(200, "text/plain", say("M524"));
   });
 
-  server.on("/printer/progress", HTTP_GET, []() {
+  route("/printer/progress", HTTP_GET, []() {
     String out;
     if (printOf)
       out = "SD printing byte " + String(printAt) + "/" + String(printOf) + "\n";
@@ -1228,7 +1275,7 @@ void setup() {
   });
 
   // Both ends have to move together. M575 is not saved, so a power cycle undoes a mistake.
-  server.on("/printer/baud", HTTP_POST, []() {
+  route("/printer/baud", HTTP_POST, []() {
     if (sender.running()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
@@ -1250,7 +1297,7 @@ void setup() {
     server.send(200, "text/plain", "now at " + String(rate) + ", printer says:\n" + say("M115"));
   });
 
-  server.on("/printer/send/status", HTTP_GET, []() {
+  route("/printer/send/status", HTTP_GET, []() {
     server.send(200, "text/plain",
       String("phase    ") + phaseName(sender.phase) + "\n" +
       "name     " + sendName + "\n" +
@@ -1267,7 +1314,7 @@ void setup() {
       "trouble  " + String(sender.trouble ? sender.trouble : "none") + "\n");
   });
 
-  server.on("/update", HTTP_POST, []() {
+  route("/update", HTTP_POST, []() {
     const bool good = !Update.hasError();
     server.sendHeader("Connection", "close");
     server.send(good ? 200 : 500, "text/plain", good ? "OK, rebooting\n" : "failed\n");

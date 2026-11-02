@@ -167,6 +167,8 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   #filesec tr.sel{padding:11px 10px}
   #filesec .thumbcell{display:none}
 }
+.open{margin:0;padding:.6rem 1rem;background:var(--warn);color:var(--onacc);font-weight:600}
+.open a{color:inherit}
 </style>
 
 <header>
@@ -183,6 +185,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <div class="meta">
     <span id="build"></span>
     <span><a href="/yandex">socket</a></span>
+    <span><a href="/auth">password</a></span>
   </div>
   <div class="row">
     <button id="btheme" title="day, night, or whatever the system says">auto</button>
@@ -190,6 +193,8 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     <button class="d" id="bpower">Turn printer off</button>
   </div>
 </header>
+<p class="open hide" id="unlocked">No password is set. Anyone on this network can print,
+upload and reflash. <a href="/auth">Set one</a>.</p>
 
 <main>
   <section class="wide" id="jobsec">
@@ -318,6 +323,7 @@ function spark(svg, arr){
 
 function render(d){
   $('machine').textContent = d.system.machine;
+  $('unlocked').classList.toggle('hide', d.locked !== false);
   conPrinting = d.printing;
 
   const b = $('state');
