@@ -19,6 +19,10 @@
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 #include "ESPAsyncWebServer.h"
+
+// PATCH. Room in front of the shared packet buffer for the HTTP header. Measured at
+// 176 bytes on this project's longest reply; anything past this falls back to the heap.
+#define ASYNCWEB_HEAD_ROOM 512
 #include "WebResponseImpl.h"
 #include "cbuf.h"
 
@@ -273,11 +277,27 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
     if(outLen > TCP_MSS)
       outLen = TCP_MSS;
 
-    uint8_t *buf = (uint8_t *)malloc(outLen+headLen);
+    // PATCH. This used to take a fresh block off the heap for every packet of every
+    // response, a thousand times over a single file, which is what leaves the heap free
+    // but no longer whole. Every callback in this library runs on the one async_tcp
+    // task, so a single buffer is enough and cannot be walked over by another client.
+    // The size is the most the code below can ask for: outLen is already capped at
+    // TCP_MSS, and the header goes in front of it. Anything larger still falls back to
+    // the heap rather than being refused.
+    // Taken from the heap once and never given back, rather than kept in bss, which on
+    // this board is the segment that runs out first. Asked for on the first response,
+    // while the heap is still whole.
+    static uint8_t *shared = NULL;
+    static const size_t sharedRoom = TCP_MSS + ASYNCWEB_HEAD_ROOM;
+    if (!shared)
+      shared = (uint8_t *)malloc(sharedRoom);
+    const bool borrowed = shared && (outLen + headLen) <= sharedRoom;
+    uint8_t *buf = borrowed ? shared : (uint8_t *)malloc(outLen+headLen);
     if (!buf) {
       // os_printf("_ack malloc %d failed\n", outLen+headLen);
       return 0;
     }
+    #define ASYNCWEB_RELEASE(p) do { if (!borrowed) free(p); } while (0)
 
     if(headLen){
       memcpy(buf, _head.c_str(), _head.length());
@@ -290,7 +310,7 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
       // See RFC2616 sections 2, 3.6.1.
       readLen = _fillBufferAndProcessTemplates(buf+headLen+6, outLen - 8);
       if(readLen == RESPONSE_TRY_AGAIN){
-          free(buf);
+          ASYNCWEB_RELEASE(buf);
           return 0;
       }
       outLen = sprintf((char*)buf+headLen, "%x", readLen) + headLen;
@@ -303,7 +323,7 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
     } else {
       readLen = _fillBufferAndProcessTemplates(buf+headLen, outLen);
       if(readLen == RESPONSE_TRY_AGAIN){
-          free(buf);
+          ASYNCWEB_RELEASE(buf);
           return 0;
       }
       outLen = readLen + headLen;
@@ -323,7 +343,8 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
         _sentLength += outLen - headLen;
     }
 
-    free(buf);
+    ASYNCWEB_RELEASE(buf);
+    #undef ASYNCWEB_RELEASE
 
     if((_chunked && readLen == 0) || (!_sendContentLength && outLen == 0) || (!_chunked && _sentLength == _contentLength)){
       _state = RESPONSE_WAIT_ACK;
