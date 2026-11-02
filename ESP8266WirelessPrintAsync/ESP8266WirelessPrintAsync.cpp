@@ -913,18 +913,29 @@ static void cardSendSettle() {
 
 // A module nobody can reach is as bad as one anyone can, and there is no wire to this
 // one. So the password it invented for itself is put where the owner can read it: the
-// printer's own screen, Telegram if the bot is set up, and the journal. Every boot until
-// it is changed, because a screen is easy to miss.
+// printer's own screen and Telegram if the bot is set up.
+//
+// Never the journal. That is a file on the card, it is served over plain HTTP, and it
+// outlives a fall back to an older image that has no password on it at all.
+//
+// The screen is repainted rather than written once, because everything else the module
+// says goes to the same single line, and because a screen is easy to miss.
 void handleWebAuthGreeting() {
-  static bool told;
+  static uint32_t sayAgain;
+  static bool toldOnce;
 
-  if (told || !webAuthIsFresh() || !printerConnected)
+  if (!webAuthIsFresh() || !printerConnected)
     return;
-  told = true;
+  if (toldOnce && (int32_t)(millis() - sayAgain) < 0)
+    return;
+  sayAgain = millis() + WEBAUTH_GREET_AGAIN;
 
   lcd(webAuthGreeting());
-  logEvent(webAuthGreeting());
-  telegramBot.notify(webAuthGreeting() + "\nChange it on the settings page.");
+  if (!toldOnce) {
+    toldOnce = true;
+    logEvent("a web password was invented, it is on the printer's screen");
+    telegramBot.notify(webAuthGreeting() + "\nChange it on the settings page.");
+  }
 }
 
 void handleCardSend() {

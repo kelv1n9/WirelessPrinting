@@ -21,6 +21,7 @@
 #define WEBAUTH_USER      "print"
 #define WEBAUTH_PASS_LEN  10
 #define WEBAUTH_KEY_LEN   32
+#define WEBAUTH_GREET_AGAIN 15000   // Repaint the screen this often while the password is still the invented one
 
 extern Preferences preferences;
 void logEvent(const String &text);
