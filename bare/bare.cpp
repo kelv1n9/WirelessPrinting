@@ -10,6 +10,7 @@
 
 #include "../ESP8266WirelessPrintAsync/BinaryTransfer.h"
 #include "../ESP8266WirelessPrintAsync/BootGuard.h"
+#include "page.h"
 
 #define JOIN_WAIT_MS   90000
 #define PORTAL_NAME    "KP3S-setup"
@@ -57,30 +58,97 @@ static bool sendAsked;
 static bool cardUp;
 static String sendTrouble;
 
-// Writes one line and gathers whatever comes back, up to the first ok or the wait.
-static String say(const String line) {
+#define LOG_ROOM   1200
+#define LINE_ROOM   300
+
+// One reader, and only one. Five separate places used to pull bytes off this port, so a
+// single page request during a transfer could eat the acknowledgement the transfer was
+// waiting for and sink a forty second firmware push. Everything that is not the binary
+// sender now goes through here, and everything else reads what this worked out.
+static char seenLine[LINE_ROOM];
+static size_t seenAt;
+static char saidLog[LOG_ROOM];
+static size_t saidHeld;
+static bool printing;
+static uint32_t printAt, printOf;
+
+static void remember(const char *text, const size_t len) {
+  if (len + 1 >= LOG_ROOM)
+    return;
+  if (saidHeld + len + 1 >= LOG_ROOM) {          // Make room by dropping whole lines
+    size_t drop = saidHeld + len + 2 - LOG_ROOM;
+    const char *nl = (const char *)memchr(saidLog + drop, '\n', saidHeld - drop);
+    drop = nl ? (size_t)(nl - saidLog) + 1 : saidHeld;
+    memmove(saidLog, saidLog + drop, saidHeld - drop);
+    saidHeld -= drop;
+  }
+  memcpy(saidLog + saidHeld, text, len);
+  saidHeld += len;
+  saidLog[saidHeld++] = '\n';
+}
+
+static void sawLine(const char *text, const size_t len) {
+  if (!strncmp(text, "SD printing byte ", 17)) {
+    const char *slash = strchr(text + 17, '/');
+    if (slash) {
+      printing = true;
+      printAt = strtoul(text + 17, NULL, 10);
+      printOf = strtoul(slash + 1, NULL, 10);
+    }
+    return;                      // The bulk of the traffic, and the state above says it better
+  }
+  if (!strcmp(text, "Not SD printing")) {
+    printing = false;
+    return;
+  }
+  if (!strncmp(text, "Done printing file", 18)) {
+    printing = false;
+    printAt = printOf;
+  }
+  remember(text, len);
+}
+
+static void feed(const int ch) {
+  if (ch < 0 || ch == '\r')
+    return;
+  if (ch == '\n') {
+    seenLine[seenAt] = 0;
+    if (seenAt)
+      sawLine(seenLine, seenAt);
+    seenAt = 0;
+    return;
+  }
+  if (seenAt < sizeof(seenLine) - 1)
+    seenLine[seenAt++] = (char)ch;
+}
+
+static void drain() {
   while (Printer.available())
-    Printer.read();
+    feed(Printer.read());
+}
+
+// Writes one line and gathers whatever comes back, up to the first ok or the wait. What it
+// reads still goes through the parser, so a reply is never lost to the state.
+static String say(const String line) {
+  if (sender.running())
+    return "a transfer owns the wire\n";
+
+  drain();                       // Anything already waiting belongs to the log, not to this reply
 
   Printer.println(line);
 
   String out;
   const uint32_t until = millis() + REPLY_WAIT_MS;
   while ((int32_t)(millis() - until) < 0) {
-    while (Printer.available() && out.length() < 3000)
-      out += (char)Printer.read();
+    while (Printer.available() && out.length() < 3000) {
+      const int ch = Printer.read();
+      feed(ch);
+      out += (char)ch;
+    }
     if (out.endsWith("ok\n") || out.endsWith("ok\r\n"))
       break;
     delay(5);
   }
-  return out;
-}
-
-// Whatever the printer has said on its own since this was last asked.
-static String heard() {
-  String out;
-  while (Printer.available() && out.length() < 3000)
-    out += (char)Printer.read();
   return out;
 }
 
@@ -187,10 +255,12 @@ void setup() {
   MDNS.begin("kp3s");
   MDNS.addService("http", "tcp", 80);
 
-  server.on("/", HTTP_GET, []() { server.send(200, "text/html", page()); });
+  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", PAGE_HTML); });
   server.on("/api/status", HTTP_GET, []() {
     server.send(200, "application/json",
-      "{\"bare\":true,\"printing\":false,\"slot\":\"" + slot() +
+      "{\"bare\":true,\"printing\":" + String(printing ? "true" : "false") +
+      ",\"at\":" + String(printAt) + ",\"of\":" + String(printOf) +
+      ",\"slot\":\"" + slot() +
       "\",\"uptime\":" + String(millis() / 1000) +
       ",\"heap\":" + String(ESP.getFreeHeap()) +
       ",\"block\":" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)) +
@@ -203,37 +273,18 @@ void setup() {
 
   // One line in, whatever the printer says back out. Enough to ask a printer what it is.
   server.on("/gcode", HTTP_GET, []() {
+    if (sender.running()) {
+      server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
     const String cmd = server.arg("cmd");
     if (cmd == "") {
       server.send(400, "text/plain", "cmd is empty\n");
       return;
     }
 
-    while (Printer.available())
-      Printer.read();
-
-    Printer.print(cmd);
-    Printer.print('\n');
-
-    String out;
-    const uint32_t until = millis() + REPLY_WAIT_MS;
-    while ((int32_t)(millis() - until) < 0) {
-      while (Printer.available() && out.length() < 3000)
-        out += (char)Printer.read();
-      if (out.endsWith("ok\n") || out.endsWith("ok\r\n"))
-        break;
-      delay(5);
-    }
-
+    const String out = say(cmd);
     server.send(200, "text/plain", out == "" ? "the printer said nothing\n" : out);
-  });
-
-  // Whatever has arrived on its own, for catching a printer as it starts up.
-  server.on("/printer/heard", HTTP_GET, []() {
-    String out;
-    while (Printer.available() && out.length() < 3000)
-      out += (char)Printer.read();
-    server.send(200, "text/plain", out);
   });
 
   sender.begin(&serialIo);
@@ -317,6 +368,10 @@ void setup() {
   // the printer will not notice. M21 is sent every time because a binary transfer leaves
   // the card unmounted behind it.
   server.on("/printer/print", HTTP_POST, []() {
+    if (sender.running()) {
+      server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
     const String name = server.arg("name");
     if (name == "") {
       server.send(400, "text/plain", "name is empty\n");
@@ -334,43 +389,46 @@ void setup() {
   });
 
   server.on("/printer/cancel", HTTP_POST, []() {
+    if (sender.running()) {
+      server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
     server.send(200, "text/plain", say("M524"));
   });
 
   server.on("/printer/progress", HTTP_GET, []() {
-    server.send(200, "text/plain", heard());
+    String out;
+    if (printOf)
+      out = "SD printing byte " + String(printAt) + "/" + String(printOf) + "\n";
+    if (!printing)
+      out += "Not SD printing\n";
+    saidLog[saidHeld] = 0;
+    out += saidLog;
+    saidHeld = 0;                // Lines are handed over once; the figures above are not
+    server.send(200, "text/plain", out);
   });
 
   // Both ends have to move together. M575 is not saved, so a power cycle undoes a mistake.
   server.on("/printer/baud", HTTP_POST, []() {
+    if (sender.running()) {
+      server.send(409, "text/plain", "a transfer owns the wire\n");
+      return;
+    }
     const uint32_t rate = server.arg("rate").toInt();
     if (rate < 9600) {
       server.send(400, "text/plain", "rate looks wrong\n");
       return;
     }
 
-    Printer.print("M575 B");
+    Printer.print("M575 B");     // No reply to wait for: the printer moves as the line ends
     Printer.println(rate);
     Printer.flush();
     delay(200);
     Printer.updateBaudRate(rate);
     delay(200);
+    drain();                     // Whatever the change garbled is not an answer to anything
 
-    while (Printer.available())
-      Printer.read();
-    Printer.println("M115");
-
-    String out;
-    const uint32_t until = millis() + REPLY_WAIT_MS;
-    while ((int32_t)(millis() - until) < 0) {
-      while (Printer.available() && out.length() < 1500)
-        out += (char)Printer.read();
-      if (out.endsWith("ok\n") || out.endsWith("ok\r\n") || out.indexOf("\nok") >= 0)
-        break;
-      delay(5);
-    }
-
-    server.send(200, "text/plain", "now at " + String(rate) + ", printer says:\n" + out);
+    server.send(200, "text/plain", "now at " + String(rate) + ", printer says:\n" + say("M115"));
   });
 
   server.on("/printer/send/status", HTTP_GET, []() {
@@ -410,6 +468,9 @@ void loop() {
     sendAsked = false;
     sender.start(&sendBytes, sendName, millis());
   }
+  if (!sender.running())
+    drain();                     // The one reader, whenever the sender does not own the wire
+
   if (sender.running()) {
     sender.service(millis());
     if (!sender.running())

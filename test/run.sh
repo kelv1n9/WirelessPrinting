@@ -5,7 +5,7 @@ CXX=/Library/Developer/CommandLineTools/usr/bin/clang++
 FLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
 cd "$(dirname "$0")"
 fail=0
-for t in test_boot_guard test_web_auth test_command_queue test_printer_link test_card_transfer test_binary_transfer; do
+for t in test_boot_guard test_web_auth test_command_queue test_printer_link test_card_transfer test_binary_transfer test_printercard; do
   printf '\n=== %s ===\n' "$t"
   $CXX $FLAGS -I stubs -o "/tmp/$t" "$t.cpp"
   "/tmp/$t" || fail=1
@@ -14,6 +14,27 @@ done
 # protocol, so they would agree with each other even if the reading were wrong. This asks
 # Marlin's own reference sender instead. Skipped when the Marlin tree is not beside us.
 MARLIN="$HOME/Documents/My Projects/Kingroon KP3S/KP3S/Marlin-2.1.2"
+
+# Same reason, for the compressor: our encoder is judged by Marlin's own decoder,
+# copied out of their tree untouched. Only the config system is stubbed, so that
+# the decoder compiles on the host without dragging in a board and a HAL.
+HS="$MARLIN/Marlin/src/libs/heatshrink"
+if [ -f "$HS/heatshrink_decoder.cpp" ]; then
+  printf '\n=== heatshrink, against Marlin own decoder ===\n'
+  STAGE=/tmp/hs_marlin
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE/Marlin/src/libs/heatshrink" "$STAGE/Marlin/src/inc"
+  cp "$HS/heatshrink_decoder.cpp" "$HS/heatshrink_decoder.h" \
+     "$HS/heatshrink_common.h" "$HS/heatshrink_config.h" "$STAGE/Marlin/src/libs/heatshrink/"
+  echo '#pragma once
+#define ENABLED(V) 1' > "$STAGE/Marlin/src/inc/MarlinConfigPre.h"
+  $CXX $FLAGS -Wno-unknown-pragmas -I stubs -I "$STAGE/Marlin/src/libs/heatshrink" \
+    -o /tmp/test_heatshrink test_heatshrink.cpp "$STAGE/Marlin/src/libs/heatshrink/heatshrink_decoder.cpp"
+  /tmp/test_heatshrink "$MARLIN" || fail=1
+else
+  printf '\n=== heatshrink, against Marlin own decoder: skipped, no Marlin tree ===\n'
+fi
+
 if [ -f "$MARLIN/buildroot/share/scripts/MarlinBinaryProtocol.py" ]; then
   printf '\n=== packets against Marlin itself ===\n'
   $CXX $FLAGS -I stubs -I . -o /tmp/emit_packets emit.cpp
