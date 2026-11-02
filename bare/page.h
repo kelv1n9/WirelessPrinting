@@ -234,7 +234,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
       </div>
       <div class="row">
         <progress id="uprog" class="hide" max="100" value="0"></progress>
-        <span class="dim num" id="pwait"></span>
       </div>
     </div>
     <details id="stage">
@@ -396,9 +395,8 @@ async function pollTransfer(){
   const chore = (of('as').split(', chore ')[1] || '');
   $('xfer').classList.toggle('hide', !busy);
   if (busy) $('xfer').textContent = phase + ' ' + pct + '%';
-  $('xline').textContent = !phase || phase === 'idle' ? ''
-    : (busy ? 'to the printer card, ' + pct + '% of ' + w[2] + ' bytes'
-            : 'last transfer ' + of('took') + ', ' + chore);
+  $('xline').textContent = busy ? 'to the printer card, ' + pct + '% of ' + w[2] + ' bytes'
+    : (chore.indexOf('failed') === 0 ? chore : '');
 }
 
 function renderFiles(sel){
@@ -490,9 +488,8 @@ async function printerCard(){
       cell.textContent = text.trim();
       return;
     }
-    let wait = '';
     for (const line of text.split('\n')) {
-      if (/^waiting |^next /.test(line)) { wait += (wait ? ' · ' : '') + line.trim(); continue; }
+      if (/^waiting |^next /.test(line)) continue;
       const m = line.match(/^(\S+)\s+(\d+)\s+(.*)$/);
       if (!m) continue;
       const tr = tb.insertRow();
@@ -521,7 +518,6 @@ async function printerCard(){
       cell.className = 'dim';
       cell.textContent = 'nothing on the printer card';
     }
-    $('pwait').textContent = wait;
   } finally { asking = false; }
 }
 $('bpcard').onclick = () => printerCard().catch(()=>{});
