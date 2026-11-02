@@ -12,6 +12,28 @@
 #include "../ESP8266WirelessPrintAsync/BootGuard.h"
 #include "page.h"
 #include "printercard.h"
+#include "../ESP8266WirelessPrintAsync/YandexHome.h"
+
+// The encrypted connection is the only one, but YandexHome asks for the gate the same
+// way it did when the bot shared it, so the gate exists and is never contended.
+SemaphoreHandle_t tlsGate;
+volatile bool tlsWanted;
+
+#define POWEROFF_NOZZLE   100    // the nozzle has to be below this before mains may go
+#define POWEROFF_BED      50     // and the bed below this
+#define POWEROFF_GRACE    30000  // everything has to stay that way for this long
+#define POWEROFF_RETRY    60000  // between attempts that did not get through
+#define POWEROFF_ATTEMPTS 10     // before giving up on this print
+#define POWERDRAW_EVERY   60000  // how often the socket is asked what it is drawing
+#define POWERDRAW_IDLE    300000 // and how often when nothing is printing
+
+// The module is fed by the printer and dies with it, so nothing about arming may
+// outlive a reboot: coming back up already armed would switch the mains off again.
+static bool autoPowerOff;        // the wish, kept in NVS
+static bool powerArmed;          // this print has ended and the socket may go
+static bool powerSawIdle;        // the heaters were seen off, so turning them on is a veto
+static uint32_t powerReadySince, powerRetryAt;
+static uint8_t powerTries;
 
 #define JOIN_WAIT_MS   90000
 #define PORTAL_NAME    "KP3S-setup"
@@ -161,10 +183,22 @@ static void sawLine(const char *text, const size_t len) {
     return;                      // The bulk of the traffic, and the state above says it better
   }
   if (!strcmp(text, "Not SD printing")) {
+    if (printing) {
+      powerArmed = autoPowerOff;
+      powerSawIdle = false;
+      powerReadySince = 0;
+      powerTries = 0;
+    }
     printing = false;
     return;
   }
   if (!strncmp(text, "Done printing file", 18)) {
+    if (printing) {
+      powerArmed = autoPowerOff;
+      powerSawIdle = false;
+      powerReadySince = 0;
+      powerTries = 0;
+    }
     printing = false;
     printAt = printOf;
   }
@@ -309,6 +343,60 @@ static bool startChore(const String &name, const bool andPrint) {
 // A transfer leaves the printer a moment short of reading gcode again, and anything
 // sent into that gap is swallowed as packet bytes rather than answered. So the wire is
 // not trusted until a plain command has come back with an ok of its own.
+// Only the firmware can tell a finished print from a gap between heater pulses: the
+// socket reads nine watts with the printer idle, and a threshold on that once cut a
+// print in half. So this waits for both heaters to be off and cold and to stay that
+// way, and anything that turns a heater back on takes the arming away.
+static void powerOffTick(const uint32_t now) {
+  if (!powerArmed || printing || sender.running())
+    return;
+
+  if (toolSet > 0 || bedSet > 0) {
+    if (powerSawIdle)
+      powerArmed = false;        // the heaters were off and somebody turned them back on
+    powerReadySince = 0;         // or the tail of the file is still draining out
+    return;
+  }
+  powerSawIdle = true;
+
+  if (toolNow >= POWEROFF_NOZZLE || bedNow >= POWEROFF_BED) {
+    powerReadySince = 0;
+    return;
+  }
+
+  if (!powerReadySince) {
+    powerReadySince = now;
+    powerRetryAt = now;
+    powerTries = 0;
+  }
+  if (now - powerReadySince < POWEROFF_GRACE)
+    return;
+  if (yandexHome.busy() || (int32_t)(now - powerRetryAt) < 0)
+    return;
+
+  if (powerTries >= POWEROFF_ATTEMPTS) {
+    powerArmed = false;
+    remember("gave up switching the printer off", 33);
+    return;
+  }
+  powerTries++;
+  powerRetryAt = now + POWEROFF_RETRY;
+  yandexHome.request(YandexHome::PowerOff);
+}
+
+static String powerOffState() {
+  if (!autoPowerOff)
+    return "disabled";
+  if (!powerArmed)
+    return "waiting for a print to finish";
+  if (!powerReadySince)
+    return "armed, printer still warm";
+  const uint32_t waited = millis() - powerReadySince;
+  return waited < POWEROFF_GRACE
+    ? "switching off in " + String((POWEROFF_GRACE - waited) / 1000) + "s"
+    : "switching off now, attempt " + String(powerTries);
+}
+
 static bool settleWire() {
   for (int tries = 0; tries < 6; tries++) {
     say("M105");
@@ -464,9 +552,17 @@ void setup() {
     j += ",\"layer\":0,\"layers\":0,\"z\":0";       // the gcode is not read here yet
     j += ",\"elapsed\":" + String(ran) + ",\"remaining\":-1,\"fan\":-1}";
 
-    // No socket and no meter in this build, so nothing is claimed about either
-    j += ",\"energy\":{\"watt\":-1,\"wh\":0,\"grams\":0,\"cost\":0,\"filament\":0,\"power\":0}";
-    j += ",\"socket\":{\"auto\":false,\"token\":false,\"device\":false,\"state\":\"\"}";
+    const float watt = yandexHome.getPowerAt() &&
+                       millis() - yandexHome.getPowerAt() < 2 * POWERDRAW_IDLE
+                     ? yandexHome.getPower() : -1;
+    j += ",\"energy\":{\"watt\":" + String(watt, 1) +
+         ",\"wh\":0,\"grams\":0,\"cost\":0,\"filament\":0,\"power\":0}";
+    j += ",\"socket\":{\"auto\":" + String(autoPowerOff ? "true" : "false") +
+         ",\"token\":" + String(yandexHome.hasToken() ? "true" : "false") +
+         ",\"device\":" + String(yandexHome.getDeviceId() != "" ? "true" : "false") +
+         ",\"name\":\"" + yandexHome.getDeviceName() +
+         "\",\"said\":\"" + yandexHome.getStatus() +
+         "\",\"state\":\"" + powerOffState() + "\"}";
 
     j += ",\"temperature\":{\"tool\":{\"actual\":" + String(toolNow, 1) + ",\"target\":" + String(toolSet, 1) + "}";
     j += ",\"bed\":{\"actual\":" + String(bedNow, 1) + ",\"target\":" + String(bedSet, 1) + "}}";
@@ -684,6 +780,119 @@ void setup() {
   // Nothing reads the gcode here yet, so there is no picture to give
   server.on("/thumbnail", HTTP_GET, []() { server.send(404, "text/plain", "no thumbnail\n"); });
 
+  // The socket. The token goes in here and never comes back out: this server has no
+  // password, and a token that can be read is a token that is gone.
+  server.on("/yandex", HTTP_GET, []() {
+    String out =
+      "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+      "<title>socket</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
+      "input,button,select{font:inherit;padding:.4rem .6rem}form{margin:1rem 0}code{word-break:break-all}</style>"
+      "<h1>Yandex socket</h1><p><a href=\"/\">back to the printer</a></p>";
+    out += "<p>Token: <b>" + String(yandexHome.hasToken() ? "set" : "not set") + "</b>";
+    out += ", device: <b>" + String(yandexHome.getDeviceId() == "" ? "not chosen"
+                                    : yandexHome.getDeviceName()) + "</b></p>";
+    out += "<p>Last said: " + yandexHome.getStatus() + "</p>";
+    out += "<form method=post action=/yandex/token><input name=token type=password size=40 "
+           "placeholder=\"OAuth token\" required><button>Save</button></form>";
+    out += "<form method=post action=/yandex/forget><button>Forget the token</button></form>";
+    out += "<form method=post action=/yandex/devices><button>Find the sockets</button></form>";
+
+    const String found = yandexHome.getDevices();
+    if (found != "") {
+      out += "<form method=post action=/yandex/device><select name=id>";
+      int at = 0;
+      while (at < (int)found.length()) {
+        int nl = found.indexOf('\n', at);
+        if (nl < 0)
+          nl = found.length();
+        const String row = found.substring(at, nl);
+        const int tab = row.indexOf('\t');
+        if (tab > 0)
+          out += "<option value=\"" + row.substring(0, tab) + "\">" + row.substring(tab + 1) + "</option>";
+        at = nl + 1;
+      }
+      out += "</select><button>Use this one</button></form>";
+    }
+    out += "<p>Switch off when a print finishes: <b>" + String(autoPowerOff ? "on" : "off") + "</b>, " +
+           powerOffState() + "</p>";
+    out += "<form method=post action=\"/yandex/auto?on=" + String(autoPowerOff ? "0" : "1") +
+           "\"><button>" + String(autoPowerOff ? "Turn it off" : "Turn it on") + "</button></form>";
+    server.send(200, "text/html", out);
+  });
+
+  server.on("/yandex/token", HTTP_POST, []() {
+    const String given = server.arg("token");
+    if (given.length() < 20) {
+      server.send(400, "text/plain", "that is too short to be a token\n");
+      return;
+    }
+    yandexHome.setToken(given);         // straight into NVS, never logged and never shown
+    server.sendHeader("Location", "/yandex");
+    server.send(303, "text/plain", "saved\n");
+  });
+
+  server.on("/yandex/forget", HTTP_POST, []() {
+    yandexHome.forgetToken();
+    server.sendHeader("Location", "/yandex");
+    server.send(303, "text/plain", "forgotten\n");
+  });
+
+  server.on("/yandex/devices", HTTP_POST, []() {
+    yandexHome.request(YandexHome::DeviceList);
+    delay(1200);                        // long enough that the page usually shows the answer
+    server.sendHeader("Location", "/yandex");
+    server.send(303, "text/plain", "asking\n");
+  });
+
+  server.on("/yandex/device", HTTP_POST, []() {
+    const String id = server.arg("id");
+    String name = id;
+    const String found = yandexHome.getDevices();
+    const int at = found.indexOf(id + "\t");
+    if (at >= 0) {
+      const int nl = found.indexOf('\n', at);
+      name = found.substring(at + id.length() + 1, nl < 0 ? found.length() : nl);
+    }
+    yandexHome.setDevice(id, name);
+    server.sendHeader("Location", "/yandex");
+    server.send(303, "text/plain", "chosen\n");
+  });
+
+  server.on("/yandex/auto", HTTP_POST, []() {
+    autoPowerOff = server.arg("on") == "1";
+    if (!autoPowerOff)
+      powerArmed = false;
+    Preferences settings;
+    settings.begin("yandex", false);
+    settings.putBool("autooff", autoPowerOff);
+    settings.end();
+    server.send(200, "text/plain", autoPowerOff ? "will switch off after a print\n" : "will stay on\n");
+  });
+
+  server.on("/yandex/power", HTTP_POST, []() {
+    if (!yandexHome.request(YandexHome::PowerDraw)) {
+      server.send(409, "text/plain", "the socket is busy\n");
+      return;
+    }
+    server.send(200, "text/plain", "asking\n");
+  });
+
+  server.on("/yandex/off", HTTP_POST, []() {
+    if (!yandexHome.request(YandexHome::PowerOff)) {
+      server.send(409, "text/plain", "the socket is busy\n");
+      return;
+    }
+    server.send(200, "text/plain", "switching off\n");
+  });
+
+  server.on("/yandex/on", HTTP_POST, []() {
+    if (!yandexHome.request(YandexHome::PowerOn)) {
+      server.send(409, "text/plain", "the socket is busy\n");
+      return;
+    }
+    server.send(200, "text/plain", "switching on\n");
+  });
+
   server.on("/restart", HTTP_POST, []() {
     if (printing) {
       server.send(409, "text/plain", "the printer is printing\n");
@@ -844,6 +1053,17 @@ void setup() {
     }
   }, onUpload);
 
+  // The socket lives in a task of its own: a handshake takes a second or two, and in
+  // the loop that would be a second or two with nobody reading the printer.
+  tlsGate = xSemaphoreCreateMutex();
+  {
+    Preferences settings;
+    settings.begin("yandex", true);
+    autoPowerOff = settings.getBool("autooff", false);
+    settings.end();
+  }
+  yandexHome.begin();
+
   server.begin();
 }
 
@@ -919,6 +1139,17 @@ void loop() {
         say("M155 S2");          // it reports from idle(), so the queue cannot delay it
       }
     }
+  }
+
+  powerOffTick(millis());
+
+  // What the socket is drawing, asked for rarely: every handshake is sixty kilobytes
+  // off the heap for a second, and the heap is what everything else here needs.
+  static uint32_t drawAgain;
+  if (yandexHome.hasToken() && yandexHome.getDeviceId() != "" &&
+      !sender.running() && !yandexHome.busy() && (int32_t)(millis() - drawAgain) >= 0) {
+    drawAgain = millis() + (printing ? POWERDRAW_EVERY : POWERDRAW_IDLE);
+    yandexHome.request(YandexHome::PowerDraw);
   }
 
   static uint32_t downSince;

@@ -184,13 +184,16 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <span class="badge" id="state">connecting</span>
   <span class="spacer"></span>
   <span class="badge busy hide" id="xfer"></span>
+  <span class="badge warn hide" id="soon"></span>
   <div class="meta">
     <span id="build"></span>
     <span id="guard"></span>
+    <span><a href="/yandex">socket</a></span>
   </div>
   <div class="row">
     <button id="btheme" title="day, night, or whatever the system says">auto</button>
     <button id="brestart">Restart module</button>
+    <button class="d" id="bpower">Turn printer off</button>
   </div>
 </header>
 
@@ -209,12 +212,16 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
           <div class="kv"><div class="k">Remaining</div><div class="v" id="jrem">—</div></div>
           <div class="kv"><div class="k">Finishes</div><div class="v" id="jend">—</div></div>
           <div class="kv"><div class="k">Fan</div><div class="v" id="jfan">—</div></div>
+          <div class="kv hide" id="kwatt"><div class="k">Drawing</div><div class="v" id="jwatt">—</div></div>
         </div>
         <div class="row" style="margin-top:16px">
           <button class="p" id="bprint">Print selected</button>
           <button class="d" id="bcancel">Cancel print</button>
           <span class="spacer"></span>
           <span class="dim num" id="xline"></span>
+          <label class="dim" style="font-size:13px">switch the printer off when done
+            <input type="checkbox" id="cauto" style="margin-left:6px;vertical-align:middle">
+          </label>
         </div>
       </div>
     </div>
@@ -342,6 +349,21 @@ function render(d){
   $('jrem').textContent = j.remaining >= 0 ? hhmm(j.remaining) : '—';
   $('jend').textContent = j.remaining >= 0 ? new Date(Date.now() + j.remaining*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '—';
   $('jfan').textContent = j.fan < 0 ? '—' : Math.round(j.fan/2.55) + '%';
+
+  const e = d.energy, metered = e.watt >= 0;
+  $('kwatt').classList.toggle('hide', !metered);
+  $('jwatt').textContent = metered ? e.watt.toFixed(0) + ' W' : '—';
+
+  const sock = d.socket, usable = sock.token && sock.device;
+  const auto_ = $('cauto');
+  if (document.activeElement !== auto_) auto_.checked = sock.auto;
+  auto_.disabled = !usable;
+  auto_.parentElement.title = usable ? sock.name + ' · ' + sock.state
+                                     : 'no socket set up, see the socket page';
+  const soon = $('soon'), going = sock.state.indexOf('switching off') === 0;
+  soon.classList.toggle('hide', !going);
+  if (going) soon.textContent = sock.state;
+  $('bpower').disabled = d.printing || !usable;
 
   $('bprint').disabled = d.printing || !d.connected || busy;
   $('bcancel').disabled = !d.printing;
@@ -485,6 +507,10 @@ async function printerCard(){
 }
 $('bpcard').onclick = () => printerCard().catch(()=>{});
 
+$('cauto').onchange = e => call('/yandex/auto?on=' + (e.target.checked ? 1 : 0), {method:'POST'})
+  .then(() => toast(e.target.checked ? 'will switch off after a print' : 'will stay on'));
+$('bpower').onclick = () => confirm('Cut mains to the printer? This module loses power too and cannot switch it back on.')
+  && call('/yandex/off', {method:'POST'}).then(() => toast('switching off'));
 $('bprint').onclick = () => job('start');
 $('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel');
 $('brestart').onclick = () => confirm('Restart the module? The printer keeps running.') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
