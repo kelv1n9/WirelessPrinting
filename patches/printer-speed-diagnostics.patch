@@ -1,0 +1,136 @@
+--- a/Marlin/src/feature/binary_stream.h
++++ b/Marlin/src/feature/binary_stream.h
+@@ -67,6 +67,8 @@
+     }
+     transfer_active = true;
+     data_waiting = 0;
++    writePackets = maxProcessUs = maxSdUs = 0;
++    processUs = sdUs = 0;
+     TERN_(BINARY_STREAM_COMPRESSION, heatshrink_decoder_reset(&hsd));
+     return true;
+   }
+@@ -85,7 +87,7 @@
+             data_waiting += processed_count;
+             if (data_waiting == sizeof(decode_buffer)) {
+               if (!dummy_transfer)
+-                if (card.write(decode_buffer, data_waiting) != data_waiting) {
++                if (!writeChunk(decode_buffer, data_waiting)) {
+                   return false;
+                 }
+               data_waiting = 0;
+@@ -95,7 +97,16 @@
+         return true;
+       }
+     #endif
+-    return (dummy_transfer || card.write(buffer, length) == length);
++    return (dummy_transfer || writeChunk(buffer, length));
++  }
++
++  static bool writeChunk(void *buffer, const size_t length) {
++    const uint32_t started = micros();
++    const bool good = card.write(buffer, length) == int16_t(length);
++    const uint32_t spent = micros() - started;
++    sdUs += spent;
++    if (spent > maxSdUs) maxSdUs = spent;
++    return good;
+   }
+ 
+   static bool file_close() {
+@@ -103,7 +114,7 @@
+       #if ENABLED(BINARY_STREAM_COMPRESSION)
+         // flush any buffered data
+         if (data_waiting) {
+-          if (card.write(decode_buffer, data_waiting) != data_waiting) return false;
++          if (!writeChunk(decode_buffer, data_waiting)) return false;
+           data_waiting = 0;
+         }
+       #endif
+@@ -130,8 +141,18 @@
+ 
+   static size_t data_waiting, transfer_timeout, idle_timeout;
+   static bool transfer_active, dummy_transfer, compression;
++  static uint32_t writePackets, maxProcessUs, maxSdUs;
++  static uint64_t processUs, sdUs;
+ 
+ public:
++
++  static void reportSpeed() {
++    SERIAL_ECHOLNPGM("XFER:packets:", writePackets,
++      ",process_ms:", uint32_t(processUs / 1000),
++      ",sd_ms:", uint32_t(sdUs / 1000),
++      ",max_process_us:", maxProcessUs,
++      ",max_sd_us:", maxSdUs);
++  }
+ 
+   static void idle() {
+     // If a transfer is interrupted and a file is left open, abort it after TIMEOUT ms
+@@ -181,8 +202,15 @@
+       case FileTransfer::WRITE:
+         if (!transfer_active)
+           SERIAL_ECHOLNPGM("PFT:invalid");
+-        else if (!file_write(buffer, length))
+-          SERIAL_ECHOLNPGM("PFT:ioerror");
++        else {
++          const uint32_t started = micros();
++          const bool good = file_write(buffer, length);
++          const uint32_t spent = micros() - started;
++          processUs += spent;
++          if (spent > maxProcessUs) maxProcessUs = spent;
++          writePackets++;
++          if (!good) SERIAL_ECHOLNPGM("PFT:ioerror");
++        }
+         break;
+       case FileTransfer::ABORT:
+         transfer_abort();
+--- a/Marlin/src/feature/binary_stream.cpp
++++ b/Marlin/src/feature/binary_stream.cpp
+@@ -30,6 +30,8 @@
+ char* SDFileTransferProtocol::Packet::Open::data = nullptr;
+ size_t SDFileTransferProtocol::data_waiting, SDFileTransferProtocol::transfer_timeout, SDFileTransferProtocol::idle_timeout;
+ bool SDFileTransferProtocol::transfer_active, SDFileTransferProtocol::dummy_transfer, SDFileTransferProtocol::compression;
++uint32_t SDFileTransferProtocol::writePackets, SDFileTransferProtocol::maxProcessUs, SDFileTransferProtocol::maxSdUs;
++uint64_t SDFileTransferProtocol::processUs, SDFileTransferProtocol::sdUs;
+ 
+ BinaryStream binaryStream[NUM_SERIAL];
+ 
+--- a/Marlin/src/gcode/host/M115.cpp
++++ b/Marlin/src/gcode/host/M115.cpp
+@@ -23,6 +23,11 @@
+ #include "../gcode.h"
+ #include "../../inc/MarlinConfig.h"
+ #include "../queue.h"           // for getting the command port
++
++#if ENABLED(BINARY_FILE_TRANSFER)
++  #include "../../sd/cardreader.h"
++  #include "../../feature/binary_stream.h"
++#endif
+ 
+ #if ENABLED(M115_GEOMETRY_REPORT)
+   #include "../../module/motion.h"
+@@ -99,6 +104,10 @@
+ 
+   SERIAL_EOL();
+ 
++  #if ENABLED(BINARY_FILE_TRANSFER)
++    SDFileTransferProtocol::reportSpeed();
++  #endif
++
+   #if ENABLED(EXTENDED_CAPABILITIES_REPORT)
+ 
+     // The port that sent M115
+--- a/Marlin/src/gcode/queue.cpp
++++ b/Marlin/src/gcode/queue.cpp
+@@ -412,12 +412,7 @@
+ void GCodeQueue::get_serial_commands() {
+   #if ENABLED(BINARY_FILE_TRANSFER)
+     if (card.flag.binary_mode) {
+-      /**
+-       * For binary stream file transfer, use serial_line_buffer as the working
+-       * receive buffer (which limits the packet size to MAX_CMD_SIZE).
+-       * The receive buffer also limits the packet size for reliable transmission.
+-       */
+-      static char binary_buffer[1024];
++      alignas(4) static char binary_buffer[1024];
+       binaryStream[card.transfer_port_index.index].receive(binary_buffer);
+       return;
+     }
