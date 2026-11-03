@@ -66,6 +66,8 @@ class BinaryTransfer {
 public:
   BinaryPhase phase = BinaryIdle;
   uint32_t written, total, packets, resends, startedAt, finishedAt;
+  uint32_t requested, silent, ackMs, worstAckMs;
+  char note[BINARY_REPLY_BYTES];
   const char *trouble;
 
   // What the printer said about itself when it synchronised
@@ -103,7 +105,8 @@ public:
     packHead = packTail = 0;
     drained = false;
     total = from->size();
-    written = packets = resends = 0;
+    written = packets = resends = requested = silent = ackMs = worstAckMs = 0;
+    note[0] = 0;
     trouble = NULL;
     sync = 0;
     held = 0;
@@ -171,6 +174,8 @@ public:
 
     // Marlin asks again on its own after 500 ms of silence, so a wait this long means
     // the answer itself went missing rather than the packet.
+    if (phase == BinaryWriting)
+      silent++;
     if (++resends > BINARY_MAX_RESENDS) {
       fail("the printer stopped answering");
       return;
@@ -205,6 +210,7 @@ private:
   char reply[BINARY_REPLY_BYTES];
   uint16_t tail;
   uint32_t waitUntil = 0;
+  uint32_t packetSentAt = 0;
 
   static uint16_t fletcher(uint16_t cs, const uint8_t value) {
     const uint16_t low = (((cs & 0xFF) + value) % 255);
@@ -276,12 +282,15 @@ private:
 
     held = at;
     io->write(packet, held);
+    packetSentAt = io->now();
     packets++;
   }
 
   void repeat() {
-    if (held)
+    if (held) {
       io->write(packet, held);
+      packetSentAt = io->now();
+    }
     waitUntil = nowish + BINARY_ACK_WAIT;
   }
 
@@ -326,6 +335,8 @@ private:
   }
 
   void observe(const char *line) {
+    if (strstr(line, "corrupt") || strstr(line, "overrun") || strstr(line, "timeout"))
+      snprintf(note, sizeof note, "%s", line);
     // Still in ASCII: anything that reads like an answer to M28B1 means the port is ours
     if (phase == BinarySwitching) {
       if (!strncmp(line, "Switching to Binary", 19)) {
@@ -375,6 +386,11 @@ private:
       if (recovering() && !numbered) return;
       if (numbered && (uint8_t)theirs != sync)
         return;                            // An answer to something already behind us
+      if (phase == BinaryWriting) {
+        const uint32_t waited = io->now() - packetSentAt;
+        ackMs += waited;
+        if (waited > worstAckMs) worstAckMs = waited;
+      }
       sync = (uint8_t)(sync + 1);
       if (phase == BinaryRecoverClose) {
         phase = BinaryFailed;
@@ -400,6 +416,7 @@ private:
         return;
       }
       resends++;
+      requested++;
       if (resends > BINARY_MAX_RESENDS) {
         fail("the printer kept asking for the same packet");
         return;

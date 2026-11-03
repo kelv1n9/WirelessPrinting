@@ -321,22 +321,17 @@ int main() {
     check(pick.waiting == 0, "nor counted as waiting");
   }
 
-  scenario = "firmware listing checks the exact binary name and size";
+  scenario = "firmware selection checks the exact binary name and size";
   {
-    PrinterCard card;
-    card.begin(true);
-    card.observe("Begin file list");
-    card.observe("ROBIN_~1.BIN 298524 Robin_nano.bin");
-    card.observe("End file list");
-    check(card.complete(), "firmware listing completed");
-    check(card.holds("Robin_nano.bin", 298524), "the full image is present");
-    check(!card.holds("Robin_nano.bin", 298523), "a short image is refused");
-    check(!card.holds("other.bin", 298524), "a different image is refused");
-    card.begin();
-    card.observe("Begin file list");
-    card.observe("ROBIN_~1.BIN 298524 Robin_nano.bin");
-    card.observe("End file list");
-    check(!card.holds("Robin_nano.bin", 298524), "normal gcode listing still excludes binaries");
+    const char *reply = "echo:Now fresh file: Robin_nano.bin\n"
+                        "File opened: Robin_nano.bin Size: 298524\r\n"
+                        "File selected\n"
+                        "ok P31 B31\n";
+    check(printerCardOpened(reply, "Robin_nano.bin", 298524), "the full image is selected");
+    check(!printerCardOpened(reply, "Robin_nano.bin", 298523), "a short image is refused");
+    check(!printerCardOpened(reply, "other.bin", 298524), "a different image is refused");
+    check(!printerCardOpened("File opened: Robin_nano.bin Size: 2985240\n", "Robin_nano.bin", 298524),
+          "size prefix is refused");
   }
 
   // ------------------------------------------------- more files than there are slots

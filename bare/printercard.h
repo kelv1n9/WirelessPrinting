@@ -58,8 +58,7 @@ class PrinterCard {
 public:
   // Called the moment "M20 L" goes out, and again by "Begin file list" itself, so a
   // second listing cannot be mistaken for more of the first one.
-  void begin(const bool includeBin = false) {
-    bins_ = includeBin;
+  void begin() {
     held = filling = 0;
     rejected_ = skipped_ = dropped_ = oversize_ = 0;
     listing_ = complete_ = false;
@@ -82,7 +81,7 @@ public:
       line[--n] = 0;
 
     if (!strcmp(line, "Begin file list")) {
-      begin(bins_);
+      begin();
       listing_ = true;
       return true;
     }
@@ -127,7 +126,6 @@ private:
   uint8_t held = 0, filling = 0;
   uint16_t rejected_ = 0, skipped_ = 0, dropped_ = 0, oversize_ = 0;
   bool listing_ = false, complete_ = false;
-  bool bins_ = false;
 
   // "<8.3 name> <size>" and, because we always ask with L, " <long name>" after it.
   // Anything that is not exactly that shape is thrown away whole. A listing full of
@@ -192,10 +190,7 @@ private:
     dos[dosLen] = 0;
 
     // Without the L the printer sends no long name, so the short one has to answer for it
-    const char *listed = longName ? longName : dos;
-    const char *extension = strrchr(listed, '.');
-    if (bins_ ? (!extension || !printerCardSame(extension, ".bin"))
-              : !printerCardIsGcode(listed)) {
+    if (!printerCardIsGcode(longName ? longName : dos)) {
       skipped_++;
       return;
     }
@@ -221,6 +216,25 @@ private:
     filling++;
   }
 };
+
+inline bool printerCardOpened(const char *reply, const char *name, const uint32_t size) {
+  if (!reply || !name || !*name || strlen(name) >= PRINTER_CARD_NAME_BYTES)
+    return false;
+  char expected[PRINTER_CARD_NAME_BYTES + 40];
+  snprintf(expected, sizeof expected, "File opened: %s Size: %lu", name, (unsigned long)size);
+  const size_t length = strlen(expected);
+  const char *line = reply;
+  while (*line) {
+    if (!strncmp(line, expected, length) &&
+        (line[length] == '\r' || line[length] == '\n' || line[length] == 0))
+      return true;
+    const char *end = strchr(line, '\n');
+    if (!end)
+      break;
+    line = end + 1;
+  }
+  return false;
+}
 
 inline uint16_t printerCardTag(const char *s) {
   uint32_t h = 2166136261u;

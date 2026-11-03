@@ -268,7 +268,7 @@ static void drain() {
 // reads still goes through the parser, so a reply is never lost to the state.
 // Asks the printer what is on its card and fills the index from the answer. The card is
 // released after every binary transfer, so M21 goes first every time.
-static bool askPrinterCard(const bool bins = false);
+static bool askPrinterCard();
 
 static String say(const String line) {
   if (sender.running())
@@ -608,14 +608,14 @@ static bool settleWire() {
   return false;
 }
 
-static bool askPrinterCard(const bool bins) {
+static bool askPrinterCard() {
   if (sender.running())
     return false;
   if (!settleWire())
     return false;
   say("M21");
-  printerCard.begin(bins);
-  say(bins ? "M20 F L" : "M20 L");
+  printerCard.begin();
+  say("M20 L");
   return printerCard.complete();
 }
 
@@ -1446,6 +1446,9 @@ void setup() {
       "name     " + sendName + "\n" +
       "written  " + String(sender.written) + " of " + String(sender.total) + "\n" +
       "packets  " + String(sender.packets) + ", resends " + String(sender.resends) + "\n" +
+      "retries  asked " + String(sender.requested) + ", silent " + String(sender.silent) +
+        ", ack total " + String(sender.ackMs) + "ms, worst " + String(sender.worstAckMs) + "ms\n" +
+      "note     " + String(sender.note[0] ? sender.note : "none") + "\n" +
       "payload  " + String(sender.theirPayload) + ", their version " + sender.theirVersion + "\n" +
       "as       " + String(choreTarget) + ", chore " + choreName() +
         (chore == ChoreFailed && choreTrouble.length() ? ", " + choreTrouble : "") + "\n" +
@@ -1660,7 +1663,16 @@ void loop() {
       choreTrouble = sender.trouble ? sender.trouble : "the transfer did not finish";
       chore = ChoreFailed;
     }
-    else if (!askPrinterCard(!worthPacking(choreTarget))) {
+    else if (!worthPacking(choreTarget)) {
+      const String opened = say("M23 " + String(choreTarget));
+      if (!printerCardOpened(opened.c_str(), choreTarget, was)) {
+        choreTrouble = "the firmware file is not on the printer's card at the right size";
+        chore = ChoreFailed;
+      }
+      else
+        chore = ChoreDone;
+    }
+    else if (!askPrinterCard()) {
       choreTrouble = "the printer did not answer with a listing";
       chore = ChoreFailed;
     }
