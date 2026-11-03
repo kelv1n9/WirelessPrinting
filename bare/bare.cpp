@@ -4,6 +4,7 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>
 #include <esp_heap_caps.h>
 #include <SD_MMC.h>
 
@@ -16,10 +17,10 @@
 #include "telegram.h"
 #include "../ESP8266WirelessPrintAsync/YandexHome.h"
 
-// The encrypted connection is the only one, but YandexHome asks for the gate the same
-// way it did when the bot shared it, so the gate exists and is never contended.
 SemaphoreHandle_t tlsGate;
 volatile bool tlsWanted;
+
+#include "ota.h"
 
 #define POWEROFF_NOZZLE   100    // the nozzle has to be below this before mains may go
 #define POWEROFF_BED      50     // and the bed below this
@@ -488,7 +489,7 @@ static void takeUpload() {
 
 // Takes a file on the module's card all the way to the printer, and onto it if asked.
 // Says no rather than half doing it, with the reason left in choreTrouble.
-bool somethingIsStreaming() { return sender.running(); }
+bool somethingIsStreaming() { return otaActive.load() || sender.running(); }
 
 // Said once when a print starts and once when it stops, to everyone the bot knows.
 static void tellTheBot(const String &text) {
@@ -661,23 +662,6 @@ static String page() {
          "<input type=file name=firmware required><button>Send</button></form>";
 }
 
-static void onUpload() {
-  HTTPUpload &up = server.upload();
-
-  if (up.status == UPLOAD_FILE_START) {
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN))
-      Update.printError(Serial);
-  }
-  else if (up.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(up.buf, up.currentSize) != up.currentSize)
-      Update.printError(Serial);
-  }
-  else if (up.status == UPLOAD_FILE_END) {
-    if (!Update.end(true))
-      Update.printError(Serial);
-  }
-}
-
 static void startPortal() {
   portal = true;
   WiFi.mode(WIFI_AP);
@@ -748,6 +732,7 @@ void setup() {
     j += ",\"guard\":\"" + bootGuardReport() + "\"";
 
     j += ",\"system\":{\"machine\":\"" + String(machine[0] ? machine : "KP3S") + "\"";
+    j += ",\"resetReason\":" + String((int)esp_reset_reason());
     j += ",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100);
     j += ",\"version\":\"" SKETCH_VERSION "\"}";
 
@@ -1461,7 +1446,8 @@ void setup() {
   });
 
   route("/update", HTTP_POST, []() {
-    const bool good = !Update.hasError();
+    const bool good = otaComplete;
+    otaComplete = false;
     server.sendHeader("Connection", "close");
     server.send(good ? 200 : 500, "text/plain", good ? "OK, rebooting\n" : "failed\n");
     if (good) {
