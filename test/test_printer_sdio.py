@@ -353,7 +353,7 @@ with tempfile.TemporaryDirectory(prefix='printer-sdio-test-') as temp:
 
 patch_dir = Path(__file__).resolve().parent.parent / 'patches'
 patches = [patch_dir / ('printer-' + name + '.patch') for name in [
-    'speed', 'speed-diagnostics', 'uart-diagnostics', 'sdio-diagnostics', 'rx-dma', 'sdio-batching']]
+    'speed', 'speed-diagnostics', 'uart-diagnostics', 'sdio-diagnostics', 'rx-dma', 'sdio-batching', 'rx-window']]
 paths = sorted({name for patch in patches for name in re.findall(r'^--- a/(.+)$', patch.read_text(), re.M)})
 with tempfile.TemporaryDirectory(prefix='printer-sdio-replay-') as temp:
     replay = Path(temp)
@@ -369,4 +369,4 @@ with tempfile.TemporaryDirectory(prefix='printer-sdio-replay-') as temp:
             subprocess.run(command, cwd=replay, check=True, capture_output=True, text=True)
     for name in paths:
         assert (replay / name).read_bytes() == (marlin / name).read_bytes(), name
-    print('Five baseline patches plus SDIO batching replay byte-for-byte')
+    print('Printer speed, DMA, SDIO and window patches replay byte-for-byte')

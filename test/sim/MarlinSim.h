@@ -29,6 +29,11 @@ struct MarlinSim {
   bool xonXoff = false;
   bool binary = false;              // BINARY_FILE_TRANSFER built into the firmware
   uint16_t binaryPayload = 96;      // What Marlin hands the stream: MAX_CMD_SIZE
+  uint8_t binaryWindow = 1;
+  uint32_t binaryWritePackets = 0;
+  uint32_t binaryWriteAckDropAt = 0, binaryWriteAckDropEvery = 0, binaryWriteAckCorruptEvery = 0;
+  uint32_t binaryWriteAckDrops = 0;
+  uint32_t binaryShutAckDrops = 0;
   uint32_t binaryWriteDelayMs = 0;
   size_t binaryIoErrorAfter = 0;
   uint32_t binaryCorruptEvery = 0;  // One packet byte in this many is flipped
@@ -63,6 +68,8 @@ struct MarlinSim {
     binState = BinWait; binSync = 0; binRetries = 0; binHeld = 0; binTook = 0;
     binData.clear(); binArrived = 0;
     pendingBinAck.clear(); binAckAt = nowTick = 0;
+    binWriteBusy = false;
+    binaryWritePackets = 0;
   }
 
   // A byte lands on the printer's pin
@@ -93,10 +100,11 @@ struct MarlinSim {
       return;
 
     if (binaryMode) {
-      if (!pendingBinAck.empty()) {
+      if (binWriteBusy) {
         if (now < binAckAt) return;
-        say(pendingBinAck);
+        if (!pendingBinAck.empty()) say(pendingBinAck);
         pendingBinAck.clear();
+        binWriteBusy = false;
       }
       binaryDrain(now);
       for (int i = 0; i < executePerTick && !cmdq.empty(); i++) {
@@ -313,6 +321,7 @@ private:
   uint32_t binArrived = 0, binLastByteAt = 0;
   uint32_t nowTick = 0, binAckAt = 0;
   std::string pendingBinAck;
+  bool binWriteBusy = false;
 
   static uint16_t binFletcher(uint16_t cs, const uint8_t value) {
     const uint16_t low = (uint16_t)(((cs & 0xFF) + value) % 255);
@@ -364,9 +373,10 @@ private:
 #ifdef MARLIN_SIM_HEATSHRINK
         say("PFT:version:0.1.0:compression:heatshrink,"
             + std::to_string(HEATSHRINK_STATIC_WINDOW_BITS) + ","
-            + std::to_string(HEATSHRINK_STATIC_LOOKAHEAD_BITS));
+            + std::to_string(HEATSHRINK_STATIC_LOOKAHEAD_BITS)
+            + (binaryWindow == 2 ? ":window:2" : ""));
 #else
-        say("PFT:version:0.1.0:compression:none");
+        say(std::string("PFT:version:0.1.0:compression:none") + (binaryWindow == 2 ? ":window:2" : ""));
 #endif
         break;
       case 1: {                                // open
@@ -535,6 +545,7 @@ private:
           binFinish((uint8_t)((binHeader[3] >> 4) & 0xF), (uint8_t)(binHeader[3] & 0xF));
           break;
       }
+      if (binWriteBusy) return;
     }
   }
 
@@ -551,14 +562,27 @@ private:
     binRetries = 0;
     char b[32];
     snprintf(b, sizeof b, "ok%u", (unsigned)answered);
-    if (protocol == 1 && type == 3 && binaryWriteDelayMs) {
+    if (protocol == 1 && type == 3) {
       binDispatch(protocol, type);
-      pendingBinAck = b;
-      binAckAt = nowTick + binaryWriteDelayMs;
+      ++binaryWritePackets;
+      const bool drop = binaryWriteAckDrops || binaryWritePackets == binaryWriteAckDropAt
+                     || (binaryWriteAckDropEvery && binaryWritePackets % binaryWriteAckDropEvery == 0);
+      if (binaryWriteAckDrops) --binaryWriteAckDrops;
+      if (binaryWriteAckCorruptEvery && binaryWritePackets % binaryWriteAckCorruptEvery == 0)
+        b[0] = 'x';
+      if (binaryWriteDelayMs) {
+        pendingBinAck = drop ? "" : b;
+        binAckAt = nowTick + binaryWriteDelayMs;
+        binWriteBusy = true;
+      }
+      else if (!drop)
+        say(b);
     }
     else {
       if (protocol == 0 && type == 2 && binaryCloseAckDrops)
         binaryCloseAckDrops--;
+      else if (protocol == 1 && type == 2 && binaryShutAckDrops)
+        binaryShutAckDrops--;
       else
         say(b);
       binDispatch(protocol, type);

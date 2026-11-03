@@ -31,13 +31,13 @@ constexpr int USART_CR1_RXNEIE=32, USART_CR1_PEIE=256, USART_CR3_EIE=1;
 constexpr int DMA_SIZE_8BITS=0, DMA_MINC_MODE=128, DMA_CIRC_MODE=32;
 constexpr int DMA_TRNS_CMPLT=2, DMA_TRNS_ERR=8, DMA_PRIORITY_VERY_HIGH=3;
 struct usart_reg_map { uint32_t CR1=USART_CR1_RXNEIE, CR3=USART_CR3_DMAR, DR=0; } regs;
-struct ring_buffer { uint16_t head=0,tail=0,size=1279; volatile uint8_t *buf; } rb;
+struct ring_buffer { uint16_t head=0,tail=0,size=(PrinterRxDmaCursor::capacity-1); volatile uint8_t *buf; } rb;
 struct usart_dev { usart_reg_map *regs; ring_buffer *rb; int irq_num; } uart{&regs,&rb,3};
 auto USART3=&uart;
 struct { struct { void (*handler)()=nullptr; } handlers[7]; } dma;
 auto DMA1=&dma;
 uint8_t flags=0;
-uint16_t remaining=1280;
+uint16_t remaining=PrinterRxDmaCursor::capacity;
 bool enabled=true, cross_during_sample=false;
 uint8_t dma_get_isr_bits(decltype(DMA1), int) { return flags; }
 void dma_clear_isr_bits(decltype(DMA1), int) { flags=0; }
@@ -47,7 +47,7 @@ uint16_t dma_get_count(decltype(DMA1), int) {
   if (cross_during_sample) {
     cross_during_sample=false;
     flags=DMA_ISR_TCIF;
-    remaining=1279;
+    remaining=(PrinterRxDmaCursor::capacity-1);
     return 1;
   }
   return remaining;
@@ -74,11 +74,11 @@ struct HardwareSerial {
   usart_dev *c_dev() { return dev; }
   void begin(uint32_t,uint8_t) { dev->regs->CR1=USART_CR1_RXNEIE; }
   void end() { dev->regs->CR1=0; }
-  virtual int available() { return (dev->rb->tail+1280-dev->rb->head)%1280; }
+  virtual int available() { return (dev->rb->tail+PrinterRxDmaCursor::capacity-dev->rb->head)%PrinterRxDmaCursor::capacity; }
   virtual int peek() { return available() ? dev->rb->buf[dev->rb->head] : -1; }
   virtual int read() {
     const int byte=peek();
-    if (byte>=0) dev->rb->head=(dev->rb->head+1)%1280;
+    if (byte>=0) dev->rb->head=(dev->rb->head+1)%PrinterRxDmaCursor::capacity;
     return byte;
   }
 };
@@ -95,7 +95,7 @@ int main() {
   constexpr uint16_t N=PrinterRxDmaCursor::capacity;
   uint8_t buffer[N];
   for (uint16_t tail=0; tail<N; ++tail) {
-    for (uint16_t count : {uint16_t(0), uint16_t(1), uint16_t(1034), uint16_t(1279)}) {
+    for (uint16_t count : {uint16_t(0), uint16_t(1), uint16_t(1034), uint16_t(2068), uint16_t((PrinterRxDmaCursor::capacity-1))}) {
       const uint16_t head=(tail+N-count)%N;
       for (uint16_t i=0; i<N; ++i) buffer[i]=uint8_t(i*17+tail);
       std::deque<int> expected;

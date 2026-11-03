@@ -9,6 +9,7 @@
 #include <SD_MMC.h>
 
 #include "../ESP8266WirelessPrintAsync/BinaryTransfer.h"
+#include "cardbytes.h"
 #include "../ESP8266WirelessPrintAsync/BootGuard.h"
 #include "page.h"
 #include "printercard.h"
@@ -72,27 +73,6 @@ struct SerialIo : LinkIo {
   size_t writeAscii(const uint8_t *data, size_t len) { return writePrinterAscii(data, len); }
   size_t writable() { return Printer.availableForWrite(); }
   uint32_t now() { return millis(); }
-};
-
-// The file, likewise. It lives on the module's card, so its size is not the heap's business.
-struct CardBytes : ByteSource {
-  File file;
-  uint32_t held = 0;
-
-  bool open(const char *path) {
-    file = SD_MMC.open(path);
-    held = file ? file.size() : 0;
-    return (bool)file && held > 0;
-  }
-  void shut() { if (file) file.close(); }
-
-  int next(uint8_t *out, size_t max) {
-    if (!file)
-      return -1;
-    const int took = file.read(out, max);
-    return took < 0 ? -1 : took;
-  }
-  uint32_t size() const { return held; }
 };
 
 // A firmware image packs to nothing and the plain path is the one proven byte for
@@ -521,7 +501,7 @@ static String spanWords(const int32_t seconds) {
   return String(minutes / 60) + " h " + String(minutes % 60) + " min";
 }
 
-static bool startChore(const String &name, const bool andPrint) {
+static bool startChore(const String &name, const bool andPrint, const uint8_t window = 2) {
   choreTrouble = "";
   if (sender.running()) {
     choreTrouble = "a transfer is already running";
@@ -548,6 +528,7 @@ static bool startChore(const String &name, const bool andPrint) {
   strncpy(sendName, name.c_str(), sizeof(sendName) - 1);
   sendName[sizeof(sendName) - 1] = 0;
   choreShouldPrint = andPrint;
+  sender.windowLimit = window;
   chore = ChoreSending;
   sendAsked = true;
   return true;
@@ -1341,7 +1322,12 @@ void setup() {
   });
 
   route("/printer/send", HTTP_POST, []() {
-    if (!startChore(server.arg("name"), server.arg("print") == "1")) {
+    const String window = server.arg("window");
+    if (server.hasArg("window") && window != "1" && window != "2") {
+      server.send(400, "text/plain", "window must be 1 or 2\n");
+      return;
+    }
+    if (!startChore(server.arg("name"), server.arg("print") == "1", window == "1" ? 1 : 2)) {
       server.send(choreTrouble == "no such file on the module's card" ? 404 : 409,
                   "text/plain", choreTrouble + "\n");
       return;
@@ -1452,6 +1438,7 @@ void setup() {
       "timing   prepare " + String(sender.prepareMs) + "ms, write " + String(sender.writeMs) + "ms\n" +
       "note     " + String(sender.note[0] ? sender.note : "none") + "\n" +
       "payload  " + String(sender.theirPayload) + ", their version " + sender.theirVersion + "\n" +
+      "window   " + String(sender.windowUsed) + " of " + String(sender.windowLimit) + "\n" +
       "as       " + String(choreTarget) + ", chore " + choreName() +
         (chore == ChoreFailed && choreTrouble.length() ? ", " + choreTrouble : "") + "\n" +
       "packing  " + String(sender.packing ? "on" : "off") +

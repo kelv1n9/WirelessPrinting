@@ -4,6 +4,7 @@
 // start, and the only way back is the card, by hand.
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -33,13 +34,67 @@ struct MemorySource : ByteSource {
   uint32_t size() const override { return (uint32_t)body.size(); }
 };
 
+struct PipelineWire : Wire {
+  using Wire::Wire;
+  std::deque<uint8_t> pending;
+  std::string answer;
+  unsigned peak = 0, writeCalls = 0, dropWriteAt = 0, corruptWriteAt = 0;
+  bool shutWithPending = false;
+
+  size_t write(const uint8_t *data, size_t len) override {
+    const bool frame = len >= 8 && data[0] == 0xAD && data[1] == 0xB5;
+    const bool writing = frame && data[3] == 0x13;
+    size_t took;
+    if (writing && ++writeCalls == dropWriteAt)
+      took = len;
+    else if (writing && writeCalls == corruptWriteAt) {
+      std::vector<uint8_t> damaged(data, data + len);
+      damaged.back() ^= 1;
+      took = Wire::write(damaged.data(), len);
+    }
+    else
+      took = Wire::write(data, len);
+    if (took == len && writing) {
+      if (std::find(pending.begin(), pending.end(), data[2]) == pending.end())
+        pending.push_back(data[2]);
+      if (pending.size() > peak) peak = pending.size();
+    }
+    if (took == len && frame && data[3] == 0x12 && !pending.empty())
+      shutWithPending = true;
+    return took;
+  }
+
+  int read() override {
+    const int ch = Wire::read();
+    if (ch < 0) return ch;
+    if (ch == '\n' || ch == '\r') {
+      unsigned seq;
+      char extra;
+      if (sscanf(answer.c_str(), "ok%u%c", &seq, &extra) == 1 && seq <= 255) {
+        const auto found = std::find(pending.begin(), pending.end(), uint8_t(seq));
+        if (found != pending.end()) pending.erase(pending.begin(), found + 1);
+      }
+      else if (sscanf(answer.c_str(), "ss%u", &seq) == 1 && seq <= 255 && !pending.empty()) {
+        const auto found = std::find(pending.begin(), pending.end(), uint8_t(seq));
+        if (found != pending.end()) pending.erase(pending.begin(), found);
+        else if (uint8_t(pending.back() + 1) == seq) pending.clear();
+      }
+      answer.clear();
+    }
+    else
+      answer += char(ch);
+    return ch;
+  }
+};
+
 struct Rig {
   MarlinSim sim;
-  Wire wire;
+  PipelineWire wire;
   BinaryTransfer move;
 
   explicit Rig(const uint32_t baud = 115200) : wire(sim, baud) {
     sim.binary = true;
+    wire.txRoom = 4096;
     move.begin(&wire);
   }
 
@@ -65,6 +120,16 @@ static std::string image(const size_t bytes) {
   out.reserve(bytes);
   for (size_t i = 0; i < bytes; i++)
     out += (char)((i * 7 + (i >> 8) * 13) & 0xFF);
+  return out;
+}
+
+static std::string noise(const size_t bytes) {
+  std::string out(bytes, '\0');
+  uint32_t state = 0x93471;
+  for (char &c : out) {
+    state = state * 1664525U + 1013904223U;
+    c = char(state >> 24);
+  }
   return out;
 }
 
@@ -256,6 +321,140 @@ int main() {
     check(rig.move.phase == BinaryFailed, "a read error cannot complete a transfer");
     check(!rig.sim.binaryMode && !rig.sim.binaryOpen, "the wire and file are released");
     check(!rig.sim.card.count("SOURCE.BIN"), "the partial file is removed");
+  }
+
+  for (const unsigned payload : {96U, 1024U}) {
+    for (const bool packed : {false, true}) {
+      for (unsigned fault = 0; fault < 9; ++fault) {
+        scenario = "window two retains exact bytes through wrap and faults";
+        Rig rig(2000000);
+        rig.sim.binaryWindow = 2;
+        rig.sim.binaryPayload = payload;
+        rig.sim.rxBufferSize = 2304;
+        rig.sim.binaryWriteDelayMs = 3;
+        if (fault == 1) rig.wire.dropWriteAt = 1;
+        if (fault == 2) rig.wire.dropWriteAt = 2;
+        if (fault == 3) rig.wire.corruptWriteAt = 1;
+        if (fault == 4) rig.wire.corruptWriteAt = 2;
+        if (fault == 5) rig.sim.binaryWriteAckDropAt = 1;
+        if (fault == 6) rig.sim.binaryWriteAckDrops = 2;
+        if (fault == 7) rig.sim.binaryWriteAckCorruptEvery = 37;
+        if (fault == 8) { rig.sim.stallEvery = 50; rig.sim.stallFor = 15; }
+        const auto bytes = noise(payload * 270 + 37);
+        MemorySource from(bytes);
+        const auto elapsed = rig.run(from, "WINDOW.BIN", 200000, packed);
+        if (rig.move.phase != BinaryDone)
+          printf("  payload %u packed %d fault %u phase %u trouble %s\n", payload, packed, fault,
+                 unsigned(rig.move.phase), rig.move.trouble ? rig.move.trouble : "none");
+        check(elapsed && rig.move.phase == BinaryDone, "window two finishes within its bound");
+        check(rig.move.windowUsed == 2, "QUERY enabled window two");
+        check(rig.wire.peak == 2, "exactly two WRITE sequences were outstanding at peak");
+        check(!rig.wire.shutWithPending, "all WRITE acknowledgements precede FILE CLOSE");
+        check(rig.sim.card["WINDOW.BIN"] == bytes, "no source bytes were lost or duplicated");
+        check(rig.sim.binaryWritePackets > 256, "WRITE sequence crossed modulo 256");
+        check(rig.sim.binaryWritePackets == (rig.move.sent + payload - 1) / payload,
+              "each unique WRITE was dispatched exactly once");
+        check(!rig.sim.binaryMode && !rig.sim.binaryOpen && !rig.sim.dropped, "the wire closes without overflow");
+        check(rig.move.resends <= BINARY_MAX_RESENDS, "recovery stayed bounded");
+        if (fault == 5) check(rig.move.resends == 0, "a later cumulative ACK covers the missing older ACK");
+        if (!fault) check(!rig.move.resends, "a clean window needs no recovery");
+#ifdef MARLIN_SIM_HEATSHRINK
+        check(rig.move.packing == packed, "requested packed data used Marlin's real decoder");
+#endif
+      }
+    }
+  }
+
+  for (const uint8_t cap : {uint8_t(1), uint8_t(2)}) for (const uint8_t limit : {uint8_t(1), uint8_t(2)}) {
+    scenario = "negotiated window respects both endpoints";
+    Rig rig(2000000);
+    rig.sim.binaryWindow = cap;
+    rig.sim.binaryPayload = 1024;
+    rig.sim.rxBufferSize = 2304;
+    rig.sim.binaryWriteDelayMs = 10;
+    rig.move.windowLimit = limit;
+    MemorySource from(noise(20000));
+    rig.run(from, "LIMIT.BIN", 100000, false);
+    const auto used = std::min(cap, limit);
+    check(rig.move.phase == BinaryDone && rig.move.windowUsed == used, "the agreed window is the smaller cap");
+    check(rig.wire.peak == used && rig.sim.card["LIMIT.BIN"] == from.body, "fallback preserves bytes and bound");
+  }
+
+  for (const unsigned payload : {96U, 1024U}) for (unsigned lost = 254; lost <= 257; ++lost) {
+    for (unsigned fault = 0; fault < 3; ++fault) {
+      scenario = "recovery and cumulative ACK cross the sequence wrap";
+      Rig rig(2000000);
+      rig.sim.binaryWindow = 2;
+      rig.sim.binaryPayload = payload;
+      rig.sim.rxBufferSize = 2304;
+      rig.sim.binaryWriteDelayMs = 2;
+      if (fault == 0) rig.wire.dropWriteAt = lost;
+      if (fault == 1) rig.wire.corruptWriteAt = lost;
+      if (fault == 2) rig.sim.binaryWriteAckDropAt = lost;
+      MemorySource from(noise(payload * 270 + 1));
+      rig.run(from, "WRAP.BIN", 100000, false);
+      check(rig.move.phase == BinaryDone && rig.sim.card["WRAP.BIN"] == from.body, "wrap recovery is byte exact");
+      check(rig.wire.peak == 2 && !rig.wire.shutWithPending && !rig.sim.dropped, "wrap preserves the window and close bound");
+    }
+  }
+
+  for (const unsigned length : {0U, 1U, 1024U, 1025U}) {
+    scenario = "empty and final partial windows drain before close";
+    Rig rig(2000000);
+    rig.sim.binaryWindow = 2;
+    rig.sim.binaryPayload = 1024;
+    rig.sim.rxBufferSize = 2304;
+    rig.sim.binaryWriteDelayMs = 15;
+    MemorySource from(noise(length));
+    rig.run(from, "TAIL.BIN", 100000, false);
+    check(rig.move.phase == BinaryDone && rig.sim.card["TAIL.BIN"] == from.body, "final window preserves every byte");
+    check(!rig.wire.shutWithPending && !rig.sim.binaryMode, "close waits for the last SD acknowledgement");
+  }
+
+  for (unsigned fault = 0; fault < 5; ++fault) {
+    scenario = "two pending writes are released on errors and cancellation";
+    struct Source : MemorySource {
+      using MemorySource::MemorySource;
+      bool broken = false;
+      int next(uint8_t *out, size_t max) override {
+        return broken && at >= 8192 ? -1 : MemorySource::next(out, max);
+      }
+    } from(noise(40000));
+    Rig rig(2000000);
+    rig.sim.binaryWindow = 2;
+    rig.sim.binaryPayload = 1024;
+    rig.sim.rxBufferSize = 2304;
+    rig.sim.binaryWriteDelayMs = 20;
+    if (fault == 0) from.broken = true;
+    if (fault == 1) rig.sim.binaryIoErrorAfter = 4096;
+    if (fault == 2) rig.sim.binaryCorruptEvery = 13;
+    if (fault == 3) rig.sim.binaryWriteDelayMs = 3000;
+    rig.move.start(&from, "FAIL.BIN", rig.wire.clock, fault == 0);
+    for (unsigned i = 0; i < 300000 && rig.move.running(); ++i) {
+      rig.sim.tick(rig.wire.clock);
+      rig.move.service(rig.wire.clock);
+      if (fault == 2 && rig.move.phase == BinaryRecoverSync) rig.sim.binaryCorruptEvery = 0;
+      if ((fault == 3 || fault == 4) && rig.wire.peak == 2) rig.move.stop();
+      rig.wire.advance();
+    }
+    check(rig.move.phase == BinaryFailed, "failed transfer settles within its bound");
+    check(!rig.sim.binaryMode && !rig.sim.binaryOpen, "error cleanup restores ordinary commands");
+    check(!rig.sim.card.count("FAIL.BIN"), "the failed partial file is removed");
+    check(rig.wire.peak <= 2, "cleanup did not create another WRITE sequence");
+  }
+
+  for (const bool loseExitAck : {false, true}) {
+    scenario = "FILE CLOSE ACK loss still confirms leaving binary mode";
+    Rig rig(2000000);
+    rig.sim.binaryWindow = 2;
+    rig.sim.binaryPayload = 1024;
+    rig.sim.rxBufferSize = 2304;
+    rig.sim.binaryShutAckDrops = 1;
+    rig.sim.binaryCloseAckDrops = loseExitAck;
+    MemorySource from(noise(15000));
+    rig.run(from, "CLOSE.BIN", 30000, false);
+    check(rig.move.phase == BinaryDone && !rig.sim.binaryMode, "lost FILE CLOSE ACK cannot leave packet mode active");
+    check(rig.sim.card["CLOSE.BIN"] == from.body && !rig.wire.shutWithPending, "close follows every confirmed byte");
   }
 
 #ifdef MARLIN_SIM_HEATSHRINK

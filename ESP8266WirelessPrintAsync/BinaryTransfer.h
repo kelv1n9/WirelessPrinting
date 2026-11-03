@@ -5,10 +5,6 @@
 // cannot carry one: Marlin strips the line number and everything from the asterisk and
 // appends CRLF, which mangles every packet of a binary file.
 //
-// Stop and wait, one packet in flight, exactly like the reference sender. The printer
-// answers every packet with ok<sync>, asks again with rs<sync>, and gives up with
-// fe<sync>. Nothing here is clever: the firmware of a printer is not the place.
-//
 // Entered with the ASCII line M28B1 and left with a control packet, after which the
 // printer is listening for ordinary gcode again.
 
@@ -68,6 +64,7 @@ public:
   uint32_t written, total, packets, resends, startedAt, finishedAt;
   uint32_t requested, silent, ackMs, worstAckMs;
   uint32_t prepareMs, writeMs;
+  uint8_t windowLimit = 2, windowUsed = 1;
   char note[BINARY_REPLY_BYTES];
   const char *trouble;
 
@@ -100,6 +97,9 @@ public:
     abortAcked = false;
     wanted = pack;
     packing = false;
+    windowUsed = 1;
+    writeHead = writeCount = 0;
+    writeSyncing = false;
     sent = 0;
     theirCompression[0] = 0;
     packer.reset();
@@ -140,11 +140,13 @@ public:
       return;
 
     nowish = now;
-    if (phase == BinaryWriting && packing && !fillPacked()) {
+    if (phase == BinaryWriting && packing && !stopping && !fillPacked()) {
       fail("the file could not be read");
       return;
     }
     receive();
+    if (phase == BinaryWriting && !writeSyncing)
+      writeMore();
 
     if (!running() || (int32_t)(now - waitUntil) < 0)
       return;
@@ -187,7 +189,9 @@ public:
       return;
     }
 
-    if (phase == BinarySwitching || phase == BinarySyncing)
+    if (phase == BinaryWriting)
+      syncWrites();
+    else if (phase == BinarySwitching || phase == BinarySyncing)
       handshake();          // It may never have gone into binary mode at all
     else if (phase == BinaryLeaving) {
       repeat();
@@ -222,6 +226,31 @@ private:
   uint16_t tail;
   uint32_t waitUntil = 0;
   uint32_t packetSentAt = 0;
+  struct WriteSlot {
+    uint8_t data[BINARY_PACKET_ROOM];
+    uint16_t size;
+    uint32_t sentAt;
+  } writes[2];
+  uint8_t writeHead = 0, writeCount = 0;
+  bool writeSyncing = false;
+
+  void retireWrites(uint8_t count) {
+    while (count--) {
+      const uint32_t waited = io->now() - writes[writeHead].sentAt;
+      ackMs += waited;
+      if (waited > worstAckMs) worstAckMs = waited;
+      writeHead = (writeHead + 1) % 2;
+      --writeCount;
+    }
+    if (writeCount && !writeSyncing)
+      waitUntil = writes[writeHead].sentAt + BINARY_ACK_WAIT;
+  }
+
+  void syncWrites() {
+    writeSyncing = true;
+    put(BinaryControl, BinarySync, NULL, 0);
+    waitUntil = io->now() + BINARY_ACK_WAIT;
+  }
 
   static uint16_t fletcher(uint16_t cs, const uint8_t value) {
     const uint16_t low = (((cs & 0xFF) + value) % 255);
@@ -244,6 +273,8 @@ private:
   void fail(const char *why) {
     trouble = why;
     if (spoke && !recovering()) {
+      writeCount = 0;
+      writeSyncing = false;
       phase = BinaryRecoverSync;
       recoveryTries = 0;
       abortAcked = false;
@@ -380,6 +411,29 @@ private:
       unsigned theirs = 0, room = 0;
       char version[16] = {0};
       if (sscanf(line + 2, "%u,%u,%15s", &theirs, &room, version) < 2) return;
+      if (theirs > 255) return;
+      if (phase != BinaryWriting && phase != BinarySyncing && phase != BinaryRecoverSync) return;
+      if (phase == BinaryWriting) {
+        if (!writeSyncing) return;
+        uint8_t confirmed = 0;
+        while (confirmed < writeCount && writes[(writeHead + confirmed) % 2].data[2] != theirs)
+          ++confirmed;
+        if (confirmed == writeCount && theirs != sync) {
+          fail("the printer lost the write sequence");
+          return;
+        }
+        retireWrites(confirmed);
+        writeSyncing = false;
+        for (uint8_t i = 0; i < writeCount; ++i) {
+          WriteSlot &slot = writes[(writeHead + i) % 2];
+          const uint32_t started = io->now();
+          io->write(slot.data, slot.size);
+          writeMs += io->now() - started;
+          slot.sentAt = io->now();
+        }
+        waitUntil = (writeCount ? writes[writeHead].sentAt : io->now()) + BINARY_ACK_WAIT;
+        return;
+      }
       sync = (uint8_t)theirs;
       if (room && room < BINARY_MAX_PAYLOAD)
         theirPayload = (uint16_t)room;
@@ -397,15 +451,20 @@ private:
     if (!strncmp(line, "ok", 2)) {
       if (phase == BinaryRecoverSync) return;
       unsigned theirs = 0;
-      const bool numbered = sscanf(line + 2, "%u", &theirs) == 1;
+      char extra;
+      const bool numbered = sscanf(line + 2, "%u%c", &theirs, &extra) == 1 && theirs <= 255;
+      if (phase == BinaryWriting) {
+        if (!numbered) return;
+        for (uint8_t i = 0; i < writeCount; ++i)
+          if (writes[(writeHead + i) % 2].data[2] == theirs) {
+            retireWrites(i + 1);
+            break;
+          }
+        return;
+      }
       if (recovering() && !numbered) return;
       if (numbered && (uint8_t)theirs != sync)
         return;                            // An answer to something already behind us
-      if (phase == BinaryWriting) {
-        const uint32_t waited = io->now() - packetSentAt;
-        ackMs += waited;
-        if (waited > worstAckMs) worstAckMs = waited;
-      }
       sync = (uint8_t)(sync + 1);
       if (phase == BinaryLeaving) {
         phase = BinaryDone;
@@ -427,6 +486,11 @@ private:
     }
     if (!strncmp(line, "rs", 2)) {
       if (phase == BinaryRecoverSync) return;
+      if (phase == BinaryWriting) {
+        unsigned theirs;
+        char extra;
+        if (writeSyncing || sscanf(line + 2, "%u%c", &theirs, &extra) != 1 || theirs > 255) return;
+      }
       if (recovering()) {
         if (++recoveryTries > 3) {
           phase = BinaryFailed;
@@ -441,16 +505,21 @@ private:
         fail("the printer kept asking for the same packet");
         return;
       }
-      repeat();
+      if (phase == BinaryWriting)
+        syncWrites();
+      else
+        repeat();
       return;
     }
     if (!strncmp(line, "fe", 2)) {
-      fail("the printer gave up on the stream");
+      if (!recovering()) fail("the printer gave up on the stream");
       return;
     }
     if (!strncmp(line, "PFT:version", 11)) {
       if (phase != BinaryAsking)
         return;
+      const char *cap = strstr(line, ":window:2");
+      windowUsed = windowLimit > 1 && cap && (!cap[9] || cap[9] == ':') ? 2 : 1;
       const char *said = strstr(line, ":compression:");
       if (said) {
         said += 13;
@@ -461,9 +530,11 @@ private:
                && window == BINARY_WINDOW_BITS
                && lookahead == BINARY_LOOKAHEAD_BITS;
       }
+      sync = (uint8_t)(packet[2] + 1);
       openFile();
       return;
     }
+    if (recovering() && strncmp(line, "PFT:success", 11)) return;
     if (!strncmp(line, "PFT:busy", 8)) {
       fail("the printer already has a transfer open");
       return;
@@ -513,16 +584,6 @@ private:
       case BinaryOpening:
         break;                             // Waiting on PFT:success rather than the ok
 
-      case BinaryWriting:
-        if (atEnd) {
-          phase = BinaryShutting;
-          put(BinaryFile, BinaryShut, NULL, 0);
-          waitUntil = nowish + BINARY_CLOSE_WAIT;
-          return;
-        }
-        writeMore();
-        break;
-
       case BinaryShutting:
         break;                             // Waiting on PFT:success
 
@@ -532,6 +593,8 @@ private:
   }
 
   void afterSuccess() {
+    if (phase == BinaryOpening || phase == BinaryShutting || phase == BinaryAborting || phase == BinaryRecoverAbort)
+      sync = (uint8_t)(packet[2] + 1);
     if (phase == BinaryRecoverAbort || phase == BinaryAborting) {
       phase = BinaryRecoverClose;
       recoveryTries = 0;
@@ -609,41 +672,51 @@ private:
 
   void writeMore() {
     const size_t room = theirPayload < BINARY_MAX_PAYLOAD ? theirPayload : BINARY_MAX_PAYLOAD;
-
-    if (packing) {
-      if (!fillPacked()) {
-        fail("the file could not be read");
-        return;
+    while (!stopping && !atEnd && writeCount < windowUsed) {
+      if (packing) {
+        if (!fillPacked()) {
+          fail("the file could not be read");
+          return;
+        }
+        const uint16_t have = packHead - packTail;
+        if (!have) {
+          atEnd = true;
+          break;
+        }
+        const uint16_t take = have < room ? have : (uint16_t)room;
+        sent += take;
+        put(BinaryFile, BinaryWrite, packed + packTail, take);
+        packTail += take;
       }
-      const uint16_t have = packHead - packTail;
-      if (!have) {
+      else {
+        uint8_t body[BINARY_MAX_PAYLOAD];
+        const int got = source->next(body, room);
+        if (got < 0) {
+          fail("the file could not be read");
+          return;
+        }
+        if (got == 0) {
+          atEnd = true;
+          break;
+        }
+        written += got;
+        sent += got;
+        put(BinaryFile, BinaryWrite, body, (uint16_t)got);
+      }
+      WriteSlot &slot = writes[(writeHead + writeCount) % 2];
+      memcpy(slot.data, packet, held);
+      slot.size = held;
+      slot.sentAt = packetSentAt;
+      ++writeCount;
+      ++sync;
+      waitUntil = writes[writeHead].sentAt + BINARY_ACK_WAIT;
+    }
+    if (!writeCount) {
+      if (stopping)
+        afterAck(false);
+      else if (atEnd)
         closeUp();
-        return;
-      }
-      const uint16_t take = have < room ? have : (uint16_t)room;
-      sent += take;
-      put(BinaryFile, BinaryWrite, packed + packTail, take);
-      packTail += take;
-      waitUntil = nowish + BINARY_ACK_WAIT;
-      return;
     }
-
-    uint8_t body[BINARY_MAX_PAYLOAD];
-    const int got = source->next(body, room);
-
-    if (got < 0) {
-      fail("the file could not be read");
-      return;
-    }
-    if (got == 0) {
-      closeUp();
-      return;
-    }
-
-    written += got;
-    sent += got;
-    put(BinaryFile, BinaryWrite, body, (uint16_t)got);
-    waitUntil = nowish + BINARY_ACK_WAIT;
   }
   uint32_t nowish = 0;        // service keeps this current so the states can stamp waits
 };

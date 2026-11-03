@@ -24,11 +24,6 @@
 #include <stddef.h>
 #include <string.h>
 
-#if defined(__GNUC__) && !defined(__clang__)
-  #pragma GCC push_options
-  #pragma GCC optimize("O3")
-#endif
-
 class HeatshrinkEncoder {
 public:
   static const uint8_t WINDOW_BITS = 8;
@@ -157,7 +152,3 @@ private:
     done_ = WINDOW;
   }
 };
-
-#if defined(__GNUC__) && !defined(__clang__)
-  #pragma GCC pop_options
-#endif

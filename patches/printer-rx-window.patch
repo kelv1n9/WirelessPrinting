@@ -1,0 +1,63 @@
+--- a/Marlin/src/HAL/STM32F1/MarlinSerial.h
++++ b/Marlin/src/HAL/STM32F1/MarlinSerial.h
+@@ -35,7 +35,7 @@
+ extern uint32_t printerUartDmaStarts;
+ 
+ struct PrinterRxDmaCursor {
+-  static constexpr uint16_t capacity = 1280;
++  static constexpr uint16_t capacity = 2304;
+   volatile bool active = false;
+   uint16_t head = 0;
+   uint32_t consumed = 0;
+@@ -96,7 +96,7 @@
+       endRxDma();
+       HardwareSerial::begin(baud, config);
+       if (c_dev() == USART3) {
+-        static uint8_t printer_rx[1280];
++        static uint8_t printer_rx[PrinterRxDmaCursor::capacity];
+         rb_init(c_dev()->rb, sizeof(printer_rx), printer_rx);
+       }
+       nvic_irq_set_priority(c_dev()->irq_num, UART_IRQ_PRIO);
+--- a/Marlin/Configuration_adv.h
++++ b/Marlin/Configuration_adv.h
+@@ -2404,7 +2404,7 @@
+  
+  // The ASCII buffer for serial input
+  #define MAX_CMD_SIZE 96
+- #define BUFSIZE 32
++ #define BUFSIZE 16
+  
+  // Transmission to Host Buffer Size
+  // To save 386 bytes of flash (and TX_BUFFER_SIZE+3 bytes of RAM) set to 0.
+--- a/Marlin/src/feature/binary_stream.h
++++ b/Marlin/src/feature/binary_stream.h
+@@ -177,10 +177,27 @@
+       case FileTransfer::QUERY:
+         SERIAL_ECHOPGM("PFT:version:", VERSION_MAJOR, ".", VERSION_MINOR, ".", VERSION_PATCH);
+         #if ENABLED(BINARY_STREAM_COMPRESSION)
+-          SERIAL_ECHOLNPGM(":compression:heatshrink,", HEATSHRINK_STATIC_WINDOW_BITS, ",", HEATSHRINK_STATIC_LOOKAHEAD_BITS);
++          SERIAL_ECHOPGM(":compression:heatshrink,", HEATSHRINK_STATIC_WINDOW_BITS, ",", HEATSHRINK_STATIC_LOOKAHEAD_BITS);
+         #else
+-          SERIAL_ECHOLNPGM(":compression:none");
++          SERIAL_ECHOPGM(":compression:none");
+         #endif
++        {
++          uint8_t window = 1;
++          #if defined(__STM32F1__) && MB(MKS_ROBIN_NANO)
++            const int8_t port = card.transfer_port_index.index;
++            const bool selected = (SERIAL_PORT == 3 && port == 0)
++              #ifdef SERIAL_PORT_2
++                || (SERIAL_PORT_2 == 3 && port == 1)
++              #endif
++              #ifdef SERIAL_PORT_3
++                || (SERIAL_PORT_3 == 3 && port == 2)
++              #endif
++              ;
++            if (selected && MSerial3.rxDmaActive() && PrinterRxDmaCursor::capacity >= 2068)
++              window = 2;
++          #endif
++          SERIAL_ECHOLNPGM(":window:", window);
++        }
+         break;
+       case FileTransfer::OPEN:
+         if (transfer_active)
