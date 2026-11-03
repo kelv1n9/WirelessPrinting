@@ -1,0 +1,55 @@
+--- a/Marlin/src/HAL/STM32F1/MarlinSerial.h
++++ b/Marlin/src/HAL/STM32F1/MarlinSerial.h
+@@ -31,6 +31,8 @@
+ // Increase priority of serial interrupts, to reduce overflow errors
+ #define UART_IRQ_PRIO 1
+ 
++extern volatile uint32_t printerUartOverruns, printerUartFrames, printerUartParity, printerUartFull;
++
+ struct MarlinSerial : public HardwareSerial {
+   MarlinSerial(struct usart_dev *usart_device, uint8 tx_pin, uint8 rx_pin) : HardwareSerial(usart_device, tx_pin, rx_pin) { }
+ 
+--- a/Marlin/src/HAL/STM32F1/MarlinSerial.cpp
++++ b/Marlin/src/HAL/STM32F1/MarlinSerial.cpp
+@@ -25,6 +25,8 @@
+ #include "../../inc/MarlinConfig.h"
+ #include "MarlinSerial.h"
+ #include <libmaple/usart.h>
++
++volatile uint32_t printerUartOverruns, printerUartFrames, printerUartParity, printerUartFull;
+ 
+ // Copied from ~/.platformio/packages/framework-arduinoststm32-maple/STM32F1/system/libmaple/usart_private.h
+ // Changed to handle Emergency Parser
+@@ -36,6 +38,11 @@
+   * We enable RXNEIE.
+   */
+   uint32_t srflags = regs->SR, cr1its = regs->CR1;
++  if (regs == USART3_BASE) {
++    if (srflags & USART_SR_ORE) printerUartOverruns++;
++    if (srflags & USART_SR_FE) printerUartFrames++;
++    if (srflags & USART_SR_PE) printerUartParity++;
++  }
+ 
+   if ((cr1its & USART_CR1_RXNEIE) && (srflags & USART_SR_RXNE)) {
+     if (srflags & USART_SR_FE || srflags & USART_SR_PE ) {
+@@ -44,6 +51,7 @@
+     }
+     else {
+       uint8_t c = (uint8)regs->DR;
++      if (regs == USART3_BASE && rb_is_full(rb)) printerUartFull++;
+       #ifdef USART_SAFE_INSERT
+         // If the buffer is full and the user defines USART_SAFE_INSERT,
+         // ignore new bytes.
+--- a/Marlin/src/gcode/host/M115.cpp
++++ b/Marlin/src/gcode/host/M115.cpp
+@@ -107,6 +107,10 @@
+   #if ENABLED(BINARY_FILE_TRANSFER)
+     SDFileTransferProtocol::reportSpeed();
+   #endif
++  #ifdef __STM32F1__
++    SERIAL_ECHOLNPGM("UART:overrun:", printerUartOverruns,
++      ",frame:", printerUartFrames, ",parity:", printerUartParity, ",full:", printerUartFull);
++  #endif
+ 
+   #if ENABLED(EXTENDED_CAPABILITIES_REPORT)
+ 
