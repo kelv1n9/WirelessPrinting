@@ -1653,6 +1653,7 @@ void loop() {
       chore = ChoreFailed;
     }
     else if (!worthPacking(choreTarget)) {
+      say("M21");
       const String opened = say("M23 " + String(choreTarget));
       if (!printerCardOpened(opened.c_str(), choreTarget, was)) {
         choreTrouble = "the firmware file is not on the printer's card at the right size";
