@@ -55,4 +55,6 @@ else
   printf '\n=== packets against Marlin itself: skipped, no Marlin tree ===\n'
 fi
 
+CXX="$CXX" python3 -B test_printer_rx_dma.py "$MARLIN" || fail=1
+
 exit $fail

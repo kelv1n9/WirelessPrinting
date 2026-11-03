@@ -33,6 +33,7 @@ struct MarlinSim {
   size_t binaryIoErrorAfter = 0;
   uint32_t binaryCorruptEvery = 0;  // One packet byte in this many is flipped
   uint32_t binaryDropEvery = 0;     // One packet byte in this many never arrives
+  uint32_t binaryCloseDrops = 0, binaryCloseAckDrops = 0;
   bool cardPresent = true;
   size_t cardFree = 8u * 1024 * 1024;
   int executePerTick = 8;           // Commands the main loop gets through in a millisecond
@@ -540,6 +541,11 @@ private:
   uint8_t binFooter[2] = {0};
 
   void binFinish(const uint8_t protocol, const uint8_t type) {
+    if (protocol == 0 && type == 2 && binaryCloseDrops) {
+      binaryCloseDrops--;
+      binReset();
+      return;
+    }
     const uint8_t answered = binHeader[2];
     binSync = (uint8_t)(binSync + 1);
     binRetries = 0;
@@ -551,7 +557,10 @@ private:
       binAckAt = nowTick + binaryWriteDelayMs;
     }
     else {
-      say(b);
+      if (protocol == 0 && type == 2 && binaryCloseAckDrops)
+        binaryCloseAckDrops--;
+      else
+        say(b);
       binDispatch(protocol, type);
     }
     binReset();

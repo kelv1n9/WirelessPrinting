@@ -630,6 +630,7 @@ static const char *phaseName(const BinaryPhase p) {
     case BinaryOpening:   return "opening";
     case BinaryWriting:   return "writing";
     case BinaryShutting:  return "closing";
+    case BinaryLeaving:   return "leaving binary";
     case BinaryAborting:  return "aborting";
     case BinaryRecoverSync: return "recover sync";
     case BinaryRecoverAbort: return "recover abort";

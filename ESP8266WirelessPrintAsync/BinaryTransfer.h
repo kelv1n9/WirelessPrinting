@@ -41,7 +41,7 @@ enum BinaryFileType : uint8_t { BinaryQuery = 0, BinaryOpen = 1, BinaryShut = 2,
 
 enum BinaryPhase : uint8_t {
   BinaryIdle, BinarySwitching, BinarySyncing, BinaryAsking, BinaryOpening,
-  BinaryWriting, BinaryShutting, BinaryAborting, BinaryRecoverSync,
+  BinaryWriting, BinaryShutting, BinaryLeaving, BinaryAborting, BinaryRecoverSync,
   BinaryRecoverAbort, BinaryRecoverClose, BinaryDone, BinaryFailed
 };
 
@@ -183,6 +183,11 @@ public:
 
     if (phase == BinarySwitching || phase == BinarySyncing)
       handshake();          // It may never have gone into binary mode at all
+    else if (phase == BinaryLeaving) {
+      repeat();
+      sendAscii("");
+      sendAscii("M105");
+    }
     else
       repeat();
   }
@@ -392,6 +397,11 @@ private:
         if (waited > worstAckMs) worstAckMs = waited;
       }
       sync = (uint8_t)(sync + 1);
+      if (phase == BinaryLeaving) {
+        phase = BinaryDone;
+        finishedAt = nowish;
+        return;
+      }
       if (phase == BinaryRecoverClose) {
         phase = BinaryFailed;
         finishedAt = nowish;
@@ -526,10 +536,9 @@ private:
       return;
     }
     if (phase == BinaryShutting) {
-      // Nothing answers a close: the printer simply goes back to reading gcode
+      phase = BinaryLeaving;
       put(BinaryControl, BinaryClose, NULL, 0);
-      phase = BinaryDone;
-      finishedAt = nowish;
+      waitUntil = nowish + BINARY_ACK_WAIT;
     }
   }
 

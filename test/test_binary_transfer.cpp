@@ -228,6 +228,20 @@ int main() {
     check(rig.sim.card.count("BROKEN.BIN") == 0, "the partial file was removed");
   }
 
+  for (const bool loseAck : {false, true}) {
+    scenario = loseAck ? "lost binary exit acknowledgement" : "lost binary exit packet";
+    Rig rig;
+    rig.sim.binaryCloseDrops = loseAck ? 0 : 1;
+    rig.sim.binaryCloseAckDrops = loseAck ? 1 : 0;
+    const std::string body = image(1000);
+    MemorySource from(body);
+    rig.run(from, "EXIT.BIN", 20000, false);
+    check(rig.move.phase == BinaryDone, "the completed file is confirmed");
+    check(!rig.sim.binaryMode, "ordinary commands work after completion");
+    check(rig.move.resends == 1, "the missing exit response caused a retry");
+    check(rig.sim.card["EXIT.BIN"] == body, "the completed file remains intact");
+  }
+
 #ifdef MARLIN_SIM_HEATSHRINK
   scenario = "a sliced file crosses a fast serial link without changing a byte";
   {
