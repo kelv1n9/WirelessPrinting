@@ -11,7 +11,7 @@ struct Wire : LinkIo {
   MarlinSim &sim;
   uint32_t baud;
   uint32_t clock = 0;
-  size_t txRoom = 256;              // What the module's own transmit buffer holds
+  size_t txRoom = 2048;
 
   explicit Wire(MarlinSim &printer, const uint32_t rate = 115200) : sim(printer), baud(rate) {}
 

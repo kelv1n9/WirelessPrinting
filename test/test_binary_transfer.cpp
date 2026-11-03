@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 #include "sim/MarlinSim.h"
@@ -42,8 +44,9 @@ struct Rig {
   }
 
   // Runs until the transfer settles, returning the milliseconds it took
-  uint32_t run(MemorySource &from, const char *name, const uint32_t patience = 600000) {
-    move.start(&from, name, wire.clock);
+  uint32_t run(MemorySource &from, const char *name, const uint32_t patience = 600000,
+               const bool pack = true) {
+    move.start(&from, name, wire.clock, pack);
     for (uint32_t i = 0; i < patience; i++) {
       sim.tick(wire.clock);
       move.service(wire.clock);
@@ -209,6 +212,51 @@ int main() {
     check(rig.sim.card.count("EMPTY.BIN") == 1, "and the printer has it");
     check(rig.sim.card["EMPTY.BIN"].empty(), "empty, as asked");
   }
+
+  scenario = "a printer card error closes packet mode and removes the partial file";
+  {
+    Rig rig;
+    rig.sim.binaryIoErrorAfter = 4096;
+    rig.sim.binaryWriteDelayMs = 2;
+    const std::string body = image(10000);
+    MemorySource from(body);
+    rig.run(from, "BROKEN.BIN", 200000, false);
+    check(rig.move.phase == BinaryFailed, "the sender reports failure");
+    check(rig.move.trouble && strstr(rig.move.trouble, "could not write"), "the card error is reported");
+    check(!rig.sim.binaryMode, "the printer is back in command mode");
+    check(!rig.sim.binaryOpen, "the printer closed the file");
+    check(rig.sim.card.count("BROKEN.BIN") == 0, "the partial file was removed");
+  }
+
+#ifdef MARLIN_SIM_HEATSHRINK
+  scenario = "a sliced file crosses a fast serial link without changing a byte";
+  {
+    std::ifstream file("cold_cube_head.gcode", std::ios::binary);
+    const std::string sample((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    check(!sample.empty(), "the real gcode sample is present");
+    if (!sample.empty()) {
+      std::string body;
+      body.reserve(sample.size() * 25);
+      for (int i = 0; i < 25; i++) body += sample;
+      Rig rig(2000000);
+      rig.sim.binaryPayload = 1024;
+      rig.sim.rxBufferSize = 1280;
+      rig.sim.binaryWriteDelayMs = 2;
+      rig.sim.stallEvery = 50;
+      rig.sim.stallFor = 5;
+      MemorySource from(body);
+      const uint32_t ms = rig.run(from, "FAST.GCO");
+      check(rig.move.phase == BinaryDone, "the transfer finishes");
+      check(rig.sim.card["FAST.GCO"] == body, "the printer card matches the original");
+      check(rig.sim.dropped == 0, "the UART ring did not overflow");
+      check(rig.move.resends == 0, "the printer requested no repeats");
+      const uint32_t bytesPerSecond = ms ? (uint32_t)(body.size() * 1000 / ms) : 0;
+      check(bytesPerSecond >= 200000, "the model reaches 200 kB/s");
+      printf("  sliced file: %u bytes in %u ms, %u kB/s\n",
+             (unsigned)body.size(), ms, bytesPerSecond / 1000);
+    }
+  }
+#endif
 
   printf(failures ? "\n%d checks failed\n" : "\nall checks passed\n", failures);
   return failures != 0;

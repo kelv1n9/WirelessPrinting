@@ -1,0 +1,92 @@
+--- a/Marlin/src/gcode/queue.cpp
++++ b/Marlin/src/gcode/queue.cpp
+@@ -417,7 +417,8 @@
+        * receive buffer (which limits the packet size to MAX_CMD_SIZE).
+        * The receive buffer also limits the packet size for reliable transmission.
+        */
+-      binaryStream[card.transfer_port_index.index].receive(serial_state[card.transfer_port_index.index].line_buffer);
++      static char binary_buffer[1024];
++      binaryStream[card.transfer_port_index.index].receive(binary_buffer);
+       return;
+     }
+   #endif
+--- a/Marlin/src/gcode/config/M575.cpp
++++ b/Marlin/src/gcode/config/M575.cpp
+@@ -50,7 +50,7 @@
+   }
+   switch (baud) {
+     case 2400: case 9600: case 19200: case 38400: case 57600:
+-    case 115200: case 250000: case 500000: case 1000000: {
++    case 115200: case 250000: case 500000: case 1000000: case 2000000: {
+       const int8_t port = parser.intval('P', -99);
+       const bool set1 = (port == -99 || port == 0);
+       if (set1) SERIAL_ECHO_MSG(" Serial ", AS_DIGIT(0), " baud rate set to ", baud);
+--- a/Marlin/src/HAL/STM32F1/MarlinSerial.h
++++ b/Marlin/src/HAL/STM32F1/MarlinSerial.h
+@@ -37,11 +37,15 @@
+   #ifdef UART_IRQ_PRIO
+     // Shadow the parent methods to set IRQ priority after begin()
+     void begin(uint32 baud) {
+-      MarlinSerial::begin(baud, SERIAL_8N1);
++      begin(baud, SERIAL_8N1);
+     }
+ 
+     void begin(uint32 baud, uint8_t config) {
+       HardwareSerial::begin(baud, config);
++      if (c_dev() == USART3) {
++        static uint8_t printer_rx[1280];
++        rb_init(c_dev()->rb, sizeof(printer_rx), printer_rx);
++      }
+       nvic_irq_set_priority(c_dev()->irq_num, UART_IRQ_PRIO);
+     }
+   #endif
+--- a/Marlin/src/feature/binary_stream.h
++++ b/Marlin/src/feature/binary_stream.h
+@@ -85,7 +85,7 @@
+             data_waiting += processed_count;
+             if (data_waiting == sizeof(decode_buffer)) {
+               if (!dummy_transfer)
+-                if (card.write(decode_buffer, data_waiting) < 0) {
++                if (card.write(decode_buffer, data_waiting) != data_waiting) {
+                   return false;
+                 }
+               data_waiting = 0;
+@@ -95,7 +95,7 @@
+         return true;
+       }
+     #endif
+-    return (dummy_transfer || card.write(buffer, length) >= 0);
++    return (dummy_transfer || card.write(buffer, length) == length);
+   }
+ 
+   static bool file_close() {
+@@ -103,7 +103,7 @@
+       #if ENABLED(BINARY_STREAM_COMPRESSION)
+         // flush any buffered data
+         if (data_waiting) {
+-          if (card.write(decode_buffer, data_waiting) < 0) return false;
++          if (card.write(decode_buffer, data_waiting) != data_waiting) return false;
+           data_waiting = 0;
+         }
+       #endif
+@@ -388,15 +388,18 @@
+             }
+           }
+           break;
+-        case StreamState::PACKET_PROCESS:
++        case StreamState::PACKET_PROCESS: {
+           sync++;
+           packet_retries = 0;
+           bytes_received += packet.header.size;
+ 
+-          SERIAL_ECHOLNPGM("ok", packet.header.sync); // transmit valid packet received
++          const bool delayed_ack = static_cast<Protocol>(packet.header.protocol()) == Protocol::FILE_TRANSFER && packet.header.type() == 3;
++          if (!delayed_ack) SERIAL_ECHOLNPGM("ok", packet.header.sync);
+           dispatch();
++          if (delayed_ack) SERIAL_ECHOLNPGM("ok", packet.header.sync);
+           stream_state = StreamState::PACKET_RESET;
+           break;
++        }
+         case StreamState::PACKET_RESEND:
+           if (packet_retries < MAX_RETRIES || MAX_RETRIES == 0) {
+             packet_retries++;

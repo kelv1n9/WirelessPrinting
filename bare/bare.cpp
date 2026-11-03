@@ -599,17 +599,11 @@ static String powerOffState() {
 // line as packet bytes. It will stay there for good, so after the plain asking fails
 // it is handed the one packet that gets it out and asked again.
 static bool settleWire() {
-  for (int round = 0; round < 2; round++) {
-    for (int tries = 0; tries < 6; tries++) {
-      say("M105");
-      if (sawOk)
-        return true;
-      delay(100);
-    }
-    if (!round) {
-      BinaryTransfer::binaryRescue(&serialIo);
-      remember("the printer answered nothing, so it was let out of packet mode", 58);
-    }
+  for (int tries = 0; tries < 3; tries++) {
+    say("M105");
+    if (sawOk)
+      return true;
+    delay(100);
   }
   return false;
 }
@@ -635,6 +629,9 @@ static const char *phaseName(const BinaryPhase p) {
     case BinaryWriting:   return "writing";
     case BinaryShutting:  return "closing";
     case BinaryAborting:  return "aborting";
+    case BinaryRecoverSync: return "recover sync";
+    case BinaryRecoverAbort: return "recover abort";
+    case BinaryRecoverClose: return "recover close";
     case BinaryDone:      return "done";
     case BinaryFailed:    return "failed";
   }

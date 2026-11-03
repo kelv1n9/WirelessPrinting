@@ -29,6 +29,8 @@ struct MarlinSim {
   bool xonXoff = false;
   bool binary = false;              // BINARY_FILE_TRANSFER built into the firmware
   uint16_t binaryPayload = 96;      // What Marlin hands the stream: MAX_CMD_SIZE
+  uint32_t binaryWriteDelayMs = 0;
+  size_t binaryIoErrorAfter = 0;
   uint32_t binaryCorruptEvery = 0;  // One packet byte in this many is flipped
   uint32_t binaryDropEvery = 0;     // One packet byte in this many never arrives
   bool cardPresent = true;
@@ -59,6 +61,7 @@ struct MarlinSim {
     binaryMode = binaryOpen = false; binaryFile.clear(); binaryResendsAsked = 0;
     binState = BinWait; binSync = 0; binRetries = 0; binHeld = 0; binTook = 0;
     binData.clear(); binArrived = 0;
+    pendingBinAck.clear(); binAckAt = nowTick = 0;
   }
 
   // A byte lands on the printer's pin
@@ -82,12 +85,18 @@ struct MarlinSim {
   }
 
   void tick(const uint32_t now) {
+    nowTick = now;
     if (stallEvery && now >= stallUntil && now % stallEvery == 0)
       stallUntil = now + stallFor;
     if (now < stallUntil)
       return;
 
     if (binaryMode) {
+      if (!pendingBinAck.empty()) {
+        if (now < binAckAt) return;
+        say(pendingBinAck);
+        pendingBinAck.clear();
+      }
       binaryDrain(now);
       for (int i = 0; i < executePerTick && !cmdq.empty(); i++) {
         const std::string cmd = cmdq.front();
@@ -301,6 +310,8 @@ private:
   uint16_t binChecksum = 0, binHeaderChecksum = 0;
   std::string binData;
   uint32_t binArrived = 0, binLastByteAt = 0;
+  uint32_t nowTick = 0, binAckAt = 0;
+  std::string pendingBinAck;
 
   static uint16_t binFletcher(uint16_t cs, const uint8_t value) {
     const uint16_t low = (uint16_t)(((cs & 0xFF) + value) % 255);
@@ -382,6 +393,10 @@ private:
         break;
       case 3:                                  // write
         if (!binaryOpen) { say("PFT:invalid"); break; }
+        if (binaryIoErrorAfter && card[binaryFile].size() + binData.size() > binaryIoErrorAfter) {
+          say("PFT:ioerror");
+          break;
+        }
         if (binaryPacked) { unpackInto(card[binaryFile], binData); break; }
         card[binaryFile] += binData;
         cardFree -= binData.size();
@@ -530,8 +545,15 @@ private:
     binRetries = 0;
     char b[32];
     snprintf(b, sizeof b, "ok%u", (unsigned)answered);
-    say(b);
-    binDispatch(protocol, type);
+    if (protocol == 1 && type == 3 && binaryWriteDelayMs) {
+      binDispatch(protocol, type);
+      pendingBinAck = b;
+      binAckAt = nowTick + binaryWriteDelayMs;
+    }
+    else {
+      say(b);
+      binDispatch(protocol, type);
+    }
     binReset();
   }
 };

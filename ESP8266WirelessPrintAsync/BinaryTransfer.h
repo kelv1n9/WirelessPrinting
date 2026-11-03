@@ -23,7 +23,7 @@
 #define BINARY_TOKEN        0xB5AD
 #define BINARY_HEADER_BYTES 8
 #define BINARY_FOOTER_BYTES 2
-#define BINARY_MAX_PAYLOAD  96    // Marlin hands the stream its line buffer, MAX_CMD_SIZE
+#define BINARY_MAX_PAYLOAD  1024
 #define BINARY_PACKET_ROOM  (BINARY_HEADER_BYTES + BINARY_MAX_PAYLOAD + BINARY_FOOTER_BYTES)
 #define BINARY_REPLY_BYTES  96
 #define BINARY_NAME_BYTES   64
@@ -41,7 +41,8 @@ enum BinaryFileType : uint8_t { BinaryQuery = 0, BinaryOpen = 1, BinaryShut = 2,
 
 enum BinaryPhase : uint8_t {
   BinaryIdle, BinarySwitching, BinarySyncing, BinaryAsking, BinaryOpening,
-  BinaryWriting, BinaryShutting, BinaryAborting, BinaryDone, BinaryFailed
+  BinaryWriting, BinaryShutting, BinaryAborting, BinaryRecoverSync,
+  BinaryRecoverAbort, BinaryRecoverClose, BinaryDone, BinaryFailed
 };
 
 // The window and lookahead are compile time constants on both sides and the stream
@@ -51,7 +52,7 @@ enum BinaryPhase : uint8_t {
 #define BINARY_LOOKAHEAD_BITS 4
 
 #define BINARY_PACK_SLICE  256    // fed to the encoder at a time
-#define BINARY_PACK_ROOM   1024   // compressed bytes held back, waiting for a packet
+#define BINARY_PACK_ROOM   2048
 
 // Where the bytes come from. Separate so a test can hand over memory and the firmware
 // can hand over a file on the card without either knowing about the other.
@@ -81,19 +82,6 @@ public:
     phase = BinaryIdle;
   }
 
-  // Puts a printer that is stuck in packet mode back to reading gcode, from nothing:
-  // no transfer in progress, no idea what sync number it is expecting. SYNC is the one
-  // packet Marlin takes whatever the number says (binary_stream.h: "The SYNC control
-  // packet is a special case"), so it is the way back in. ABORT throws away whatever
-  // file was left half written, and CLOSE returns the printer to ASCII.
-  static void binaryRescue(LinkIo *link) {
-    if (!link)
-      return;
-    bare(link, 0, BinaryControl, BinarySync);
-    bare(link, 1, BinaryFile, BinaryAbort);
-    bare(link, 2, BinaryControl, BinaryClose);
-  }
-
   bool running() const { return phase != BinaryIdle && phase != BinaryDone && phase != BinaryFailed; }
 
   // Compression is asked for, not assumed: the printer is questioned first and the
@@ -105,6 +93,8 @@ public:
     source = from;
     stopping = false;
     spoke = false;
+    recoveryTries = 0;
+    abortAcked = false;
     wanted = pack;
     packing = false;
     sent = 0;
@@ -150,6 +140,27 @@ public:
     if (!running() || (int32_t)(now - waitUntil) < 0)
       return;
 
+    if (recovering()) {
+      if (phase == BinaryRecoverAbort && abortAcked) {
+        phase = BinaryRecoverClose;
+        recoveryTries = 0;
+        put(BinaryControl, BinaryClose, NULL, 0);
+        waitUntil = now + BINARY_ACK_WAIT;
+        return;
+      }
+      if (++recoveryTries > 3) {
+        phase = BinaryFailed;
+        finishedAt = now;
+        return;
+      }
+      if (phase == BinaryRecoverSync)
+        put(BinaryControl, BinarySync, NULL, 0);
+      else
+        repeat();
+      waitUntil = now + BINARY_ACK_WAIT;
+      return;
+    }
+
     // The packet was taken but no version line came back. Repeating it would be
     // read as a duplicate and dropped, so go on with the stream uncompressed.
     if (phase == BinaryAsking && asked) {
@@ -188,6 +199,8 @@ private:
   bool atEnd;
   bool stopping = false;
   bool spoke = false;            // the printer has answered a packet, so it is in packet mode
+  uint8_t recoveryTries = 0;
+  bool abortAcked = false;
 
   char reply[BINARY_REPLY_BYTES];
   uint16_t tail;
@@ -213,9 +226,22 @@ private:
   // bytes. So the printer is always told, even when there is nobody left to listen.
   void fail(const char *why) {
     trouble = why;
-    if (spoke)
-      binaryRescue(io);
-    phase = BinaryFailed;
+    if (spoke && !recovering()) {
+      phase = BinaryRecoverSync;
+      recoveryTries = 0;
+      abortAcked = false;
+      held = 0;
+      put(BinaryControl, BinarySync, NULL, 0);
+      waitUntil = nowish + BINARY_ACK_WAIT;
+    }
+    else {
+      phase = BinaryFailed;
+      finishedAt = nowish;
+    }
+  }
+
+  bool recovering() const {
+    return phase == BinaryRecoverSync || phase == BinaryRecoverAbort || phase == BinaryRecoverClose;
   }
 
   void sendAscii(const char *line) {
@@ -227,21 +253,6 @@ private:
 
   // Lays a packet into the buffer and puts it on the wire. The token is not part of
   // either checksum, and the header checksum is part of the payload one.
-  // The same empty packet as put(), but owned by nobody, for the rescue above
-  static void bare(LinkIo *link, const uint8_t number, const uint8_t protocol, const uint8_t type) {
-    uint8_t one[BINARY_HEADER_BYTES];
-    one[0] = BINARY_TOKEN & 0xFF;
-    one[1] = (BINARY_TOKEN >> 8) & 0xFF;
-    one[2] = number;
-    one[3] = (uint8_t)(((protocol & 0xF) << 4) | (type & 0xF));
-    one[4] = 0;
-    one[5] = 0;
-    const uint16_t sum = fletcherOver(one + 2, 4);
-    one[6] = sum & 0xFF;
-    one[7] = (sum >> 8) & 0xFF;
-    link->write(one, BINARY_HEADER_BYTES);
-  }
-
   void put(const uint8_t protocol, const uint8_t type, const uint8_t *data, const uint16_t count) {
     packet[0] = BINARY_TOKEN & 0xFF;
     packet[1] = (BINARY_TOKEN >> 8) & 0xFF;
@@ -342,24 +353,52 @@ private:
       // ss<sync>,<payload>,<version>
       unsigned theirs = 0, room = 0;
       char version[16] = {0};
-      if (sscanf(line + 2, "%u,%u,%15s", &theirs, &room, version) >= 2) {
-        sync = (uint8_t)theirs;
-        if (room && room < BINARY_MAX_PAYLOAD)
-          theirPayload = (uint16_t)room;
-        snprintf(theirVersion, sizeof theirVersion, "%s", version);
+      if (sscanf(line + 2, "%u,%u,%15s", &theirs, &room, version) < 2) return;
+      sync = (uint8_t)theirs;
+      if (room && room < BINARY_MAX_PAYLOAD)
+        theirPayload = (uint16_t)room;
+      snprintf(theirVersion, sizeof theirVersion, "%s", version);
+      if (phase == BinaryRecoverSync) {
+        phase = BinaryRecoverAbort;
+        recoveryTries = 0;
+        put(BinaryFile, BinaryAbort, NULL, 0);
+        waitUntil = nowish + BINARY_ACK_WAIT;
+        return;
       }
       afterAck(true);
       return;
     }
     if (!strncmp(line, "ok", 2)) {
+      if (phase == BinaryRecoverSync) return;
       unsigned theirs = 0;
-      if (sscanf(line + 2, "%u", &theirs) == 1 && (uint8_t)theirs != sync)
+      const bool numbered = sscanf(line + 2, "%u", &theirs) == 1;
+      if (recovering() && !numbered) return;
+      if (numbered && (uint8_t)theirs != sync)
         return;                            // An answer to something already behind us
       sync = (uint8_t)(sync + 1);
+      if (phase == BinaryRecoverClose) {
+        phase = BinaryFailed;
+        finishedAt = nowish;
+        return;
+      }
+      if (phase == BinaryRecoverAbort) {
+        abortAcked = true;
+        waitUntil = nowish + BINARY_ACK_WAIT;
+        return;
+      }
       afterAck(false);
       return;
     }
     if (!strncmp(line, "rs", 2)) {
+      if (phase == BinaryRecoverSync) return;
+      if (recovering()) {
+        if (++recoveryTries > 3) {
+          phase = BinaryFailed;
+          finishedAt = nowish;
+        }
+        else repeat();
+        return;
+      }
       resends++;
       if (resends > BINARY_MAX_RESENDS) {
         fail("the printer kept asking for the same packet");
@@ -457,10 +496,11 @@ private:
   }
 
   void afterSuccess() {
-    if (phase == BinaryAborting) {
+    if (phase == BinaryRecoverAbort || phase == BinaryAborting) {
+      phase = BinaryRecoverClose;
+      recoveryTries = 0;
       put(BinaryControl, BinaryClose, NULL, 0);
-      phase = BinaryFailed;
-      finishedAt = nowish;
+      waitUntil = nowish + BINARY_ACK_WAIT;
       return;
     }
     if (phase == BinaryOpening) {
