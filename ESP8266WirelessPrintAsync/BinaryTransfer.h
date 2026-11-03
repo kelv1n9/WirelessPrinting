@@ -67,6 +67,7 @@ public:
   BinaryPhase phase = BinaryIdle;
   uint32_t written, total, packets, resends, startedAt, finishedAt;
   uint32_t requested, silent, ackMs, worstAckMs;
+  uint32_t prepareMs, writeMs;
   char note[BINARY_REPLY_BYTES];
   const char *trouble;
 
@@ -106,6 +107,7 @@ public:
     drained = false;
     total = from->size();
     written = packets = resends = requested = silent = ackMs = worstAckMs = 0;
+    prepareMs = writeMs = 0;
     note[0] = 0;
     trouble = NULL;
     sync = 0;
@@ -138,6 +140,10 @@ public:
       return;
 
     nowish = now;
+    if (phase == BinaryWriting && packing && !fillPacked()) {
+      fail("the file could not be read");
+      return;
+    }
     receive();
 
     if (!running() || (int32_t)(now - waitUntil) < 0)
@@ -258,8 +264,8 @@ private:
   void sendAscii(const char *line) {
     if (!io)
       return;
-    io->write((const uint8_t *)line, strlen(line));
-    io->write((const uint8_t *)"\n", 1);
+    io->writeAscii((const uint8_t *)line, strlen(line));
+    io->writeAscii((const uint8_t *)"\n", 1);
   }
 
   // Lays a packet into the buffer and puts it on the wire. The token is not part of
@@ -286,14 +292,18 @@ private:
     }
 
     held = at;
+    const uint32_t started = io->now();
     io->write(packet, held);
+    writeMs += io->now() - started;
     packetSentAt = io->now();
     packets++;
   }
 
   void repeat() {
     if (held) {
+      const uint32_t started = io->now();
       io->write(packet, held);
+      writeMs += io->now() - started;
       packetSentAt = io->now();
     }
     waitUntil = nowish + BINARY_ACK_WAIT;
@@ -431,8 +441,7 @@ private:
         fail("the printer kept asking for the same packet");
         return;
       }
-      if (held)
-        io->write(packet, held);
+      repeat();
       return;
     }
     if (!strncmp(line, "fe", 2)) {
@@ -578,11 +587,14 @@ private:
       packTail = 0;
     }
 
+    const uint32_t started = io->now();
     while (BINARY_PACK_ROOM - packHead >= HeatshrinkEncoder::max_output(BINARY_PACK_SLICE)) {
       uint8_t slice[BINARY_PACK_SLICE];
       const int got = source->next(slice, sizeof slice);
-      if (got < 0)
+      if (got < 0) {
+        prepareMs += io->now() - started;
         return false;
+      }
       if (got == 0) {
         drained = true;
         packHead += packer.finish(packed + packHead, BINARY_PACK_ROOM - packHead);
@@ -591,6 +603,7 @@ private:
       written += got;
       packHead += packer.encode(slice, (size_t)got, packed + packHead, BINARY_PACK_ROOM - packHead);
     }
+    prepareMs += io->now() - started;
     return true;
   }
 

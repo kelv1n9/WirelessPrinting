@@ -27,6 +27,7 @@ struct LinkIo {
   virtual ~LinkIo() {}
   virtual int read() = 0;                                   // -1 when nothing has arrived
   virtual size_t write(const uint8_t *data, size_t len) = 0;
+  virtual size_t writeAscii(const uint8_t *data, size_t len) { return write(data, len); }
   virtual size_t writable() = 0;
   virtual uint32_t now() = 0;
 };

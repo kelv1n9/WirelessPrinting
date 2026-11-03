@@ -52,10 +52,24 @@ static uint8_t powerTries;
 static HardwareSerial Printer(1);
 static size_t printerRxRoom;
 
+static size_t writePrinterAscii(const uint8_t *data, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    Printer.write(data[i]);
+    delayMicroseconds(100);
+  }
+  return len;
+}
+
+static void printerLine(const String &line) {
+  writePrinterAscii((const uint8_t *)line.c_str(), line.length());
+  writePrinterAscii((const uint8_t *)"\n", 1);
+}
+
 // The wire, as BinaryTransfer wants to see it.
 struct SerialIo : LinkIo {
   int read() { return Printer.available() ? Printer.read() : -1; }
   size_t write(const uint8_t *data, size_t len) { return Printer.write(data, len); }
+  size_t writeAscii(const uint8_t *data, size_t len) { return writePrinterAscii(data, len); }
   size_t writable() { return Printer.availableForWrite(); }
   uint32_t now() { return millis(); }
 };
@@ -279,7 +293,7 @@ static String say(const String line) {
   drain();                       // Anything already waiting belongs to the log, not to this reply
 
   sawOk = false;
-  Printer.println(line);
+  printerLine(line);
 
   String out;
   const uint32_t until = millis() + REPLY_WAIT_MS;
@@ -1417,8 +1431,7 @@ void setup() {
       return;
     }
 
-    Printer.print("M575 B");     // No reply to wait for: the printer moves as the line ends
-    Printer.println(rate);
+    printerLine("M575 B" + String(rate));
     Printer.flush();
     delay(200);
     Printer.updateBaudRate(rate);
@@ -1436,6 +1449,7 @@ void setup() {
       "packets  " + String(sender.packets) + ", resends " + String(sender.resends) + "\n" +
       "retries  asked " + String(sender.requested) + ", silent " + String(sender.silent) +
         ", ack total " + String(sender.ackMs) + "ms, worst " + String(sender.worstAckMs) + "ms\n" +
+      "timing   prepare " + String(sender.prepareMs) + "ms, write " + String(sender.writeMs) + "ms\n" +
       "note     " + String(sender.note[0] ? sender.note : "none") + "\n" +
       "payload  " + String(sender.theirPayload) + ", their version " + sender.theirVersion + "\n" +
       "as       " + String(choreTarget) + ", chore " + choreName() +
@@ -1695,7 +1709,7 @@ void loop() {
     if (printing) {
       // A printer that rebooted mid print has its autoreport off and nobody to turn it
       // back on. Asked for without waiting, because a wait here would stall the web.
-      Printer.println("M155 S2");
+      printerLine("M155 S2");
     }
     else {
       const String said = say("M115");

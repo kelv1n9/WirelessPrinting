@@ -242,6 +242,22 @@ int main() {
     check(rig.sim.card["EXIT.BIN"] == body, "the completed file remains intact");
   }
 
+  scenario = "source failure while preparing ahead closes the partial file";
+  {
+    struct BrokenSource : MemorySource {
+      using MemorySource::MemorySource;
+      int next(uint8_t *out, size_t max) override {
+        return at >= 8192 ? -1 : MemorySource::next(out, max);
+      }
+    } from(image(30000));
+    Rig rig;
+    rig.sim.binaryWriteDelayMs = 10;
+    rig.run(from, "SOURCE.BIN", 100000);
+    check(rig.move.phase == BinaryFailed, "a read error cannot complete a transfer");
+    check(!rig.sim.binaryMode && !rig.sim.binaryOpen, "the wire and file are released");
+    check(!rig.sim.card.count("SOURCE.BIN"), "the partial file is removed");
+  }
+
 #ifdef MARLIN_SIM_HEATSHRINK
   scenario = "a sliced file crosses a fast serial link without changing a byte";
   {
