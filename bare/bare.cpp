@@ -50,6 +50,7 @@ static uint8_t powerTries;
 #define REPLY_WAIT_MS  4000
 
 static HardwareSerial Printer(1);
+static size_t printerRxRoom;
 
 // The wire, as BinaryTransfer wants to see it.
 struct SerialIo : LinkIo {
@@ -780,12 +781,13 @@ void setup() {
 
     j += ",\"storage\":{\"free\":" + String((uint32_t)(freeCard / 1024)) +
          ",\"selected\":\"" + String(selected) + "\"}";
-    j += ",\"link\":{\"mangled\":0}";
+    j += ",\"link\":{\"mangled\":0,\"rxBuffer\":" + String(printerRxRoom) + "}";
     j += "}";
     server.send(200, "application/json", j);
   });
 
   Printer.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
+  printerRxRoom = Printer.setRxBufferSize(2048);
   mountCard();
 
   // One line in, whatever the printer says back out. Enough to ask a printer what it is.
