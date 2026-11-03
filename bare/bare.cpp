@@ -16,6 +16,8 @@
 #include "gcodemeta.h"
 #include "webauth.h"
 #include "telegram.h"
+#include "relay.h"
+bool relayCarriesTelegram();
 #include "../ESP8266WirelessPrintAsync/YandexHome.h"
 
 SemaphoreHandle_t tlsGate;
@@ -48,6 +50,7 @@ static uint8_t powerTries;
 #define PRINTER_RX     13      // gpio14 is taken by the SD_MMC clock
 #define PRINTER_TX     16      // not gpio12, a strapping pin that stops the board booting
 #define PRINTER_BAUD   115200  // What Marlin boots at here; M575 moves it afterwards
+#define PRINTER_FAST   2000000 // What a transfer runs at; measured 164 KB/s with no repeats
 #define REPLY_WAIT_MS  4000
 
 static HardwareSerial Printer(1);
@@ -156,6 +159,8 @@ bool isPrinting;                 // what the bot calls it, kept in step with pri
 bool somethingIsStreaming();     // the binary sender owns the wire, so the bot waits
 
 static PrinterCard printerCard;
+static PrinterCard printerListing;
+static bool listingRequested;
 static bool sawOk;               // a whole line of it, not the tail of "echo:SD card ok"
 
 static float toolNow = 0, toolSet = 0, bedNow = 0, bedSet = 0;
@@ -195,7 +200,7 @@ static void sawLine(const char *text, const size_t len) {
   }
   if (hadTemps)
     return;                      // the bare autoreport, kept out of the log
-  if (printerCard.observe(text))
+  if (listingRequested && printerListing.observe(text))
     return;                      // a listing line belongs to the index and nowhere else
   if (!strncmp(text, "SD printing byte ", 17)) {
     const char *slash = strchr(text + 17, '/');
@@ -232,11 +237,26 @@ static void sawLine(const char *text, const size_t len) {
     heardTemp = 0;               // its autoreport is off again, and so is what it knew
     machine[0] = 0;
     printing = false;
+    selected[0] = 0;
+    printAt = printOf = printSince = 0;
+    printerCard.begin();
   }
   if (!strncmp(text, "File opened: ", 13)) {
     const char *end = strstr(text + 13, " Size:");
     const size_t room = end ? (size_t)(end - (text + 13)) : strlen(text + 13);
-    snprintf(selected, sizeof selected, "%.*s", (int)room, text + 13);
+    selected[0] = 0;
+    printAt = printOf = printSince = 0;
+    if (room && room < sizeof selected) {
+      char opened[PRINTER_CARD_NAME_BYTES];
+      memcpy(opened, text + 13, room);
+      opened[room] = 0;
+      const PrinterCardEntry *entry = printerCard.find(opened);
+      printOf = end ? strtoul(end + 6, nullptr, 10) : 0;
+      if (!entry || entry->size == printOf)
+        printerCardResolve(printerCard, opened, selected, sizeof selected);
+      else
+        snprintf(selected, sizeof selected, "%s", opened);
+    }
   }
   remember(text, len);
 }
@@ -308,6 +328,12 @@ static String metaPath(const char *target, const char *suffix) {
   return String(META_DIR "/") + target + suffix;
 }
 
+static String metaReadPath(const char *name, const char *suffix) {
+  char target[PRINTER_CARD_NAME_BYTES];
+  return printerCardResolve(printerCard, name, target, sizeof target)
+    ? metaPath(target, suffix) : String();
+}
+
 struct MetaOut : GcodeMetaSink {
   File into;
   File fans;
@@ -354,21 +380,28 @@ static char metaTarget[PRINTER_CARD_NAME_BYTES];
 static bool metaWanted;
 
 static bool metaHead(const char *target, GcodeMetaHead &head) {
-  File one = SD_MMC.open(metaPath(target, ".hdr"));
+  File one = SD_MMC.open(metaReadPath(target, ".hdr"));
   if (!one)
     return false;
   const bool good = one.read((uint8_t *)&head, sizeof head) == (int)sizeof head &&
                     head.magic == GCODEMETA_MAGIC;
   one.close();
-  return good;
+  char canonical[PRINTER_CARD_NAME_BYTES];
+  if (!good || !printerCardResolve(printerCard, target, canonical, sizeof canonical))
+    return false;
+  const PrinterCardEntry *entry = printerCard.find(canonical);
+  char current[PRINTER_CARD_NAME_BYTES];
+  const bool active = printerCardResolve(printerCard, selected, current, sizeof current) &&
+                      printerCardSame(current, canonical);
+  return (!entry || entry->size == head.size) && (!active || !printOf || printOf == head.size);
 }
 
 // The table is on the card, not in memory: a tall print has thousands of rows and the
 // answer needs a dozen of them. Seeking beats reading the lot.
 static uint32_t metaLayerAt(const char *target, const uint32_t count, const uint32_t byte,
                             uint16_t *z100, uint16_t *minutes) {
-  File table = SD_MMC.open(metaPath(target, ".idx"));
-  if (!table)
+  File table = SD_MMC.open(metaReadPath(target, ".idx"));
+  if (!table || table.size() != (uint64_t)count * sizeof(GcodeMetaLayer))
     return 0;
   uint32_t low = 0, high = count;
   GcodeMetaLayer one;
@@ -376,7 +409,7 @@ static uint32_t metaLayerAt(const char *target, const uint32_t count, const uint
     const uint32_t mid = low + (high - low) / 2;
     table.seek(mid * sizeof one);
     if (table.read((uint8_t *)&one, sizeof one) != (int)sizeof one)
-      break;
+      return 0;
     if (one.at <= byte)
       low = mid + 1;
     else
@@ -388,14 +421,16 @@ static uint32_t metaLayerAt(const char *target, const uint32_t count, const uint
       if (z100) *z100 = one.z100;
       if (minutes) *minutes = one.minutes;
     }
+    else
+      return 0;
   }
   table.close();
   return low;
 }
 
 static int metaFanAt(const char *target, const uint32_t count, const uint32_t byte) {
-  File table = SD_MMC.open(metaPath(target, ".fan"));
-  if (!table)
+  File table = SD_MMC.open(metaReadPath(target, ".fan"));
+  if (!table || table.size() != (uint64_t)count * sizeof(GcodeMetaFan))
     return -1;
   uint32_t low = 0, high = count;
   GcodeMetaFan one;
@@ -403,7 +438,7 @@ static int metaFanAt(const char *target, const uint32_t count, const uint32_t by
     const uint32_t mid = low + (high - low) / 2;
     table.seek(mid * sizeof one);
     if (table.read((uint8_t *)&one, sizeof one) != (int)sizeof one)
-      break;
+      return -1;
     if (one.at <= byte)
       low = mid + 1;
     else
@@ -414,6 +449,8 @@ static int metaFanAt(const char *target, const uint32_t count, const uint32_t by
     table.seek((low - 1) * sizeof one);
     if (table.read((uint8_t *)&one, sizeof one) == (int)sizeof one)
       speed = one.speed;
+    else
+      return -1;
   }
   table.close();
   return speed;
@@ -426,6 +463,7 @@ static void takeUpload() {
   HTTPUpload &up = server.upload();
 
   if (up.status == UPLOAD_FILE_START) {
+    metaWanted = false;
     sendTrouble = "";
     lastUpload = up.filename;
     if (!cardUp) {
@@ -444,6 +482,8 @@ static void takeUpload() {
                  printerCardTarget(up.filename.c_str(), metaTarget, sizeof metaTarget);
     if (metaWanted) {
       SD_MMC.mkdir(META_DIR);
+      SD_MMC.remove(metaPath(metaTarget, ".hdr"));
+      SD_MMC.remove(metaPath(metaTarget, ".png"));
       metaOut.into = SD_MMC.open(metaPath(metaTarget, ".idx"), FILE_WRITE);
       metaOut.fans = SD_MMC.open(metaPath(metaTarget, ".fan"), FILE_WRITE);
       metaOut.tmp = metaPath(metaTarget, ".new");
@@ -464,15 +504,23 @@ static void takeUpload() {
     }
   }
   else if (up.status == UPLOAD_FILE_END && into) {
-    const uint32_t size = into.size();
+    into.flush();
     into.close();
+    File stored = SD_MMC.open("/" + lastUpload);
+    const uint32_t size = stored ? stored.size() : 0;
+    if (!stored || size != up.totalSize)
+      sendTrouble = "the stored upload size does not match";
+    stored.close();
     if (metaWanted) {
       metaScan.finish(size);
+      metaOut.picture.close();
       if (metaOut.into)
         metaOut.into.close();
       if (metaOut.fans)
         metaOut.fans.close();
-      File head = SD_MMC.open(metaPath(metaTarget, ".hdr"), FILE_WRITE);
+      File head;
+      if (sendTrouble == "" && size == up.totalSize)
+        head = SD_MMC.open(metaPath(metaTarget, ".hdr"), FILE_WRITE);
       if (head) {
         head.write((const uint8_t *)&metaScan.head, sizeof metaScan.head);
         head.close();
@@ -480,15 +528,38 @@ static void takeUpload() {
       metaWanted = false;
     }
   }
+  else if (up.status == UPLOAD_FILE_ABORTED) {
+    into.close();
+    metaOut.into.close();
+    metaOut.fans.close();
+    metaOut.picture.close();
+    metaWanted = false;
+    sendTrouble = "upload aborted";
+  }
 }
 
 // Takes a file on the module's card all the way to the printer, and onto it if asked.
 // Says no rather than half doing it, with the reason left in choreTrouble.
 bool somethingIsStreaming() { return otaActive.load() || sender.running(); }
 
+// The printer's buzzer, for the two things worth hearing from across the room: a file
+// that reached the printer's card whole, and the module coming back on new firmware.
+// Kept behind a setting because test runs go by the dozen in a lived in room.
+static bool soundOn = true;
+
+static void chirp(const int times) {
+  if (!soundOn || printing || sender.running())
+    return;
+  for (int i = 0; i < times; i++) {
+    Printer.println("M300 S2000 P90");
+    if (i + 1 < times)
+      Printer.println("M300 S0 P70");
+  }
+}
+
 // Said once when a print starts and once when it stops, to everyone the bot knows.
 static void tellTheBot(const String &text) {
-  if (telegramBot.hasToken())
+  if (telegramBot.hasToken() || relayCarriesTelegram())
     telegramBot.notify(text);
 }
 
@@ -595,7 +666,25 @@ static String powerOffState() {
 // printer still in packet mode from a transfer that broke off, reading every gcode
 // line as packet bytes. It will stay there for good, so after the plain asking fails
 // it is handed the one packet that gets it out and asked again.
-static bool settleWire() {
+static uint32_t linkRate = PRINTER_BAUD;
+
+// An empty packet, owned by no transfer, for letting a printer out of packet mode when
+// the transfer that put it there died with the module. SYNC is the one packet Marlin
+// takes whatever its number, so it is the way back in; ABORT drops the half file and
+// CLOSE returns it to gcode.
+static void loosePacket(const uint8_t number, const uint8_t protocol, const uint8_t type) {
+  uint8_t one[8] = {0xAD, 0xB5, number, (uint8_t)((protocol << 4) | type), 0, 0, 0, 0};
+  uint16_t low = 0, high = 0;
+  for (int i = 2; i < 6; i++) {
+    low = (low + one[i]) % 255;
+    high = (high + low) % 255;
+  }
+  one[6] = low;
+  one[7] = high;
+  Printer.write(one, sizeof one);
+}
+
+static bool askedBack() {
   for (int tries = 0; tries < 3; tries++) {
     say("M105");
     if (sawOk)
@@ -605,15 +694,94 @@ static bool settleWire() {
   return false;
 }
 
+// A printer that answers nothing is seldom busy. Either a transfer that died with the
+// module left it reading packets, or it is still at the fast rate from before the
+// module rebooted. Both are tried before giving up, and the rate that answers is kept.
+static bool settleWire() {
+  uint32_t rates[2];
+  rates[0] = linkRate;
+  rates[1] = linkRate == PRINTER_BAUD ? PRINTER_FAST : PRINTER_BAUD;
+  for (const uint32_t rate : rates) {
+    if (rate != linkRate) {
+      Printer.updateBaudRate(rate);
+      delay(50);
+      drain();
+    }
+    if (askedBack()) {
+      linkRate = rate;
+      return true;
+    }
+    // A reboot can land in the middle of a 1 KB packet, and Marlin then waits for its
+    // tail, taking anything sent as part of it. It gives up after 500 ms with nothing
+    // arriving (PACKET_MAX_WAIT in binary_stream.h), and every byte restarts that wait,
+    // so the line is left quiet for longer than that before the way out goes down it.
+    const uint32_t quiet = millis();
+    while (millis() - quiet < 700) {
+      drain();
+      delay(10);
+    }
+    loosePacket(0, 0, 1);
+    loosePacket(1, 1, 4);
+    loosePacket(2, 0, 2);
+    delay(150);
+    drain();
+    if (askedBack()) {
+      linkRate = rate;
+      return true;
+    }
+  }
+  Printer.updateBaudRate(linkRate);
+  delay(50);
+  drain();
+  return false;
+}
+
+// Both ends move together. M575 is not saved, so a power cycle undoes a mistake.
+static bool moveLink(const uint32_t rate) {
+  if (rate == linkRate)
+    return true;
+  printerLine("M575 B" + String(rate));
+  Printer.flush();
+  delay(200);
+  Printer.updateBaudRate(rate);
+  linkRate = rate;
+  delay(200);
+  drain();
+  return askedBack();
+}
+
 static bool askPrinterCard() {
-  if (sender.running())
+  if (sender.running() || sendAsked || printing)
     return false;
   if (!settleWire())
     return false;
+  if (printing)
+    return false;
   say("M21");
-  printerCard.begin();
+  if (printing)
+    return false;
+  printerListing.begin();
+  listingRequested = true;
   say("M20 L");
-  return printerCard.complete();
+  listingRequested = false;
+  if (!printerListing.complete() || printerListing.rejected() || printerListing.dropped())
+    return false;
+  printerCard = printerListing;
+  return true;
+}
+
+static String openPrinterFile(const char *name) {
+  if (printing || sender.running() || sendAsked)
+    return "the printer is busy\n";
+  char canonical[PRINTER_CARD_NAME_BYTES];
+  if (!printerCardResolve(printerCard, name, canonical, sizeof canonical))
+    return "the filename is empty or ambiguous\n";
+  const PrinterCardEntry *entry = printerCard.find(canonical);
+  if (!entry)
+    return "the file is not in the printer listing\n";
+  if (printerCard.find(entry->dos) != entry)
+    return "the printer listing has an ambiguous DOS alias\n";
+  return say("M23 " + String(entry->dos));
 }
 
 static const char *phaseName(const BinaryPhase p) {
@@ -902,7 +1070,12 @@ void setup() {
   // Choosing a file is remembered here and acted on when the print is asked for: the
   // printer cannot hold a selection for a file that is not on its card yet.
   route("/select", HTTP_POST, []() {
+    if (printing || sender.running() || sendAsked) {
+      server.send(409, "text/plain", "the printer is busy\n");
+      return;
+    }
     snprintf(selected, sizeof selected, "%s", server.arg("name").c_str());
+    printAt = printOf = printSince = 0;
     server.send(200, "text/plain", "selected\n");
   });
 
@@ -997,10 +1170,16 @@ void setup() {
       return;
     }
     const String asked = server.arg("name");
-    char target[PRINTER_CARD_NAME_BYTES];
-    String path = metaPath(asked.c_str(), ".png");
-    if (!SD_MMC.exists(path) && printerCardTarget(asked.c_str(), target, sizeof target))
-      path = metaPath(target, ".png");
+    GcodeMetaHead head;
+    if (!metaHead(asked.c_str(), head) || !head.thumbLen) {
+      server.sendHeader("Cache-Control", "no-cache");
+      server.send(404, "text/plain", "no picture for that one\n");
+      return;
+    }
+    const uint32_t claimed = strtoul(server.arg("s").c_str(), nullptr, 10);
+    server.sendHeader("Cache-Control", claimed && claimed == head.size
+                      ? "public, max-age=604800, immutable" : "no-cache");
+    const String path = metaReadPath(asked.c_str(), ".png");
 
     File one = SD_MMC.open(path);
     if (!one || one.isDirectory() || !one.size()) {
@@ -1008,7 +1187,6 @@ void setup() {
       server.send(404, "text/plain", "no picture for that one\n");
       return;
     }
-    server.sendHeader("Cache-Control", "public, max-age=604800, immutable");
     server.streamFile(one, "image/png");
     one.close();
   });
@@ -1104,6 +1282,52 @@ void setup() {
     }
     server.send(mountCard() ? 200 : 503, "text/plain",
                 cardUp ? "mounted\n" : "the card would not come up\n");
+  });
+
+  route("/sound", HTTP_POST, []() {
+    soundOn = server.arg("on") != "0";
+    Preferences keep;
+    keep.begin("sound", false);
+    keep.putBool("on", soundOn);
+    keep.end();
+    server.send(200, "text/plain", soundOn ? "sound on\n" : "sound off\n");
+  });
+
+  route("/relay", HTTP_GET, []() {
+    String out =
+      "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+      "<title>remote</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
+      "input,button{font:inherit;padding:.4rem .6rem}form{margin:1rem 0}code{word-break:break-all}</style>"
+      "<h1>Remote access</h1><p><a href=\"/\">back to the printer</a></p>";
+    out += "<p>State: <b>" + relayState() + "</b></p>";
+    if (!webAuthSet())
+      out += "<p>Set a <a href=/auth>password</a> first. The relay will not start without one.</p>";
+    out += "<form method=post action=/relay/set>"
+           "<p><input name=url size=48 placeholder=\"wss://kp3s.NAME.workers.dev/.device\" value=\"" +
+           relayUrl() + "\"></p><p><input name=key type=password size=48 placeholder=\"" +
+           String(relayConfigured() ? "device key is set, leave empty to keep it" : "device key") +
+           "\"></p><button>Save</button></form>";
+    if (relayConfigured())
+      out += "<form method=post action=/relay/forget><button>Forget the relay</button></form>";
+    server.send(200, "text/html", out);
+  });
+
+  route("/relay/set", HTTP_POST, []() {
+    const String u = server.arg("url"), k = server.arg("key");
+    if (!(u.startsWith("wss://") || u.startsWith("ws://")) || (k != "" && k.length() < 24) ||
+        (k == "" && !relayConfigured())) {
+      server.send(400, "text/plain", "the address must start with wss:// and the key must be at least 24 characters\n");
+      return;
+    }
+    relaySet(u, k);                   // the key goes straight into NVS and is never shown
+    server.sendHeader("Location", "/relay");
+    server.send(303, "text/plain", "saved\n");
+  });
+
+  route("/relay/forget", HTTP_POST, []() {
+    relayForget();
+    server.sendHeader("Location", "/relay");
+    server.send(303, "text/plain", "gone\n");
   });
 
   route("/auth", HTTP_GET, []() {
@@ -1277,47 +1501,19 @@ void setup() {
   });
 
   route("/printer/files", HTTP_GET, []() {
-    if (sender.running()) {
-      server.send(409, "text/plain", "a transfer owns the wire\n");
+    const bool fresh = askPrinterCard();
+    if (!fresh && !printerCard.complete()) {
+      server.send(503, "text/plain", "no cached printer list; refresh when the printer is idle\n");
       return;
     }
-    // M20 waits behind every move already queued, so during a print the answer
-    // would arrive long after the wait and read as an empty card.
-    if (printing) {
-      server.send(409, "text/plain", "the printer is printing, a listing would not come back\n");
-      return;
-    }
-    if (!askPrinterCard()) {
-      server.send(502, "text/plain", "the printer did not finish a listing\n");
-      return;
-    }
-    String out;
+    String out = fresh ? "" : "cached: last complete printer listing; refresh when idle\n";
     for (uint8_t i = 0; i < printerCard.count(); i++) {
       const PrinterCardEntry &e = printerCard.at(i);
       out += String(e.dos) + "  " + String(e.size) + "  " + (e.name[0] ? e.name : e.dos) + "\n";
     }
     if (!printerCard.count())
-      out = "nothing on the printer's card\n";
+      out += "nothing on the printer's card\n";
 
-    // What is on our card and not on theirs, worked out afresh rather than remembered
-    if (cardUp) {
-      PrinterCardPick pick;
-      pick.begin();
-      File dir = SD_MMC.open("/");
-      for (File one = dir.openNextFile(); one; one = dir.openNextFile()) {
-        if (!one.isDirectory()) {
-          const char *bare = one.name();
-          if (*bare == '/')             // the core hands roots back with a slash on the front
-            bare++;
-          pick.consider(printerCard, bare, one.size());
-        }
-        one.close();
-      }
-      dir.close();
-      out += "\nwaiting  " + String(pick.waiting) + "\n";
-      if (pick.found)
-        out += "next     " + String(pick.source) + " as " + String(pick.target) + "\n";
-    }
     server.send(200, "text/plain", out);
   });
 
@@ -1369,13 +1565,20 @@ void setup() {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
     }
+    if (printing || sendAsked) {
+      server.send(409, "text/plain", "the printer is busy\n");
+      return;
+    }
     const String name = server.arg("name");
     if (name == "") {
       server.send(400, "text/plain", "name is empty\n");
       return;
     }
-    say("M21");
-    const String opened = say("M23 " + name);
+    if (!askPrinterCard()) {
+      server.send(502, "text/plain", "the printer did not finish a listing\n");
+      return;
+    }
+    const String opened = openPrinterFile(name.c_str());
     if (opened.indexOf("File opened") < 0) {
       server.send(404, "text/plain", "the printer would not open it:\n" + opened);
       return;
@@ -1417,13 +1620,7 @@ void setup() {
       return;
     }
 
-    printerLine("M575 B" + String(rate));
-    Printer.flush();
-    delay(200);
-    Printer.updateBaudRate(rate);
-    delay(200);
-    drain();                     // Whatever the change garbled is not an answer to anything
-
+    moveLink(rate);
     server.send(200, "text/plain", "now at " + String(rate) + ", printer says:\n" + say("M115"));
   });
 
@@ -1436,6 +1633,7 @@ void setup() {
       "retries  asked " + String(sender.requested) + ", silent " + String(sender.silent) +
         ", ack total " + String(sender.ackMs) + "ms, worst " + String(sender.worstAckMs) + "ms\n" +
       "timing   prepare " + String(sender.prepareMs) + "ms, write " + String(sender.writeMs) + "ms\n" +
+      "read     SD " + String(sendBytes.readMs) + "ms\n" +
       "note     " + String(sender.note[0] ? sender.note : "none") + "\n" +
       "payload  " + String(sender.theirPayload) + ", their version " + sender.theirVersion + "\n" +
       "window   " + String(sender.windowUsed) + " of " + String(sender.windowLimit) + "\n" +
@@ -1472,6 +1670,13 @@ void setup() {
   }
   yandexHome.begin();
   telegramBot.begin();
+  relayBegin();
+  {
+    Preferences keep;
+    keep.begin("sound", true);
+    soundOn = keep.getBool("on", true);
+    keep.end();
+  }
 
   server.begin();
 }
@@ -1492,7 +1697,12 @@ static void handleTelegram() {
     if (addressed > 0)
       verb = verb.substring(0, addressed);
 
-    if (verb == "/start" || verb == "/help") {
+    if (verb == "/__document") {
+      telegramBot.send(chat, "This build does not take files over the bot yet. Send it through the "
+                             "web page or the slicer.");
+    }
+
+    else if (verb == "/start" || verb == "/help") {
       telegramBot.send(chat,
         String(machine[0] ? machine : "KP3S") + "\n\n"
         "/status - what the printer is doing\n"
@@ -1515,8 +1725,10 @@ static void handleTelegram() {
           out += "Done       " + String(printAt * 100.0 / printOf, 1) + " %\n";
           if (cardUp && metaHead(selected, meta) && meta.found) {
             const uint32_t at = metaLayerAt(selected, meta.found, printAt, &z100, &left);
-            out += "Layer      " + String(at) + " of " + String(meta.found) +
-                   ", " + String(z100 / 100.0, 2) + " mm\n";
+            out += "Layer      " + (at ? String(at) : String("unknown")) + " of " + String(meta.found);
+            if (z100)
+              out += ", " + String(z100 / 100.0, 2) + " mm";
+            out += "\n";
             out += "Left       " + spanWords(left ? (int32_t)left * 60 : -1) + "\n";
           }
           out += "Elapsed    " + spanWords(printSince ? (int32_t)((millis() - printSince) / 1000) : -1) + "\n";
@@ -1531,16 +1743,13 @@ static void handleTelegram() {
     }
 
     else if (verb == "/files") {
-      if (printing)
-        telegramBot.send(chat, "The printer is printing and will not answer a listing until it stops.");
-      else if (sender.running())
-        telegramBot.send(chat, "A transfer owns the wire, ask again in a moment.");
-      else if (!askPrinterCard())
-        telegramBot.send(chat, "The printer did not finish a listing.");
+      const bool fresh = askPrinterCard();
+      if (!fresh && !printerCard.complete())
+        telegramBot.send(chat, "No cached printer list. Ask again when the printer is idle.");
       else if (!printerCard.count())
-        telegramBot.send(chat, "Nothing on the printer's card.");
+        telegramBot.send(chat, fresh ? "Nothing on the printer's card." : "Cached listing: nothing on the printer's card. Refresh when idle.");
       else {
-        String out = "On the printer's card:\n";
+        String out = fresh ? "On the printer's card:\n" : "Cached printer listing (refresh when idle):\n";
         for (uint8_t i = 0; i < printerCard.count(); i++) {
           const PrinterCardEntry &e = printerCard.at(i);
           out += String(i + 1) + ". " + String(e.name[0] ? e.name : e.dos) +
@@ -1564,8 +1773,7 @@ static void handleTelegram() {
       else {
         const PrinterCardEntry &e = printerCard.at(which - 1);
         const String name = e.name[0] ? e.name : e.dos;
-        say("M21");
-        const String opened = say("M23 " + name);
+        const String opened = openPrinterFile(name.c_str());
         if (opened.indexOf("File opened") < 0)
           telegramBot.send(chat, "The printer would not open " + name + ".");
         else {
@@ -1635,6 +1843,8 @@ void loop() {
 
   if (sendAsked) {
     sendAsked = false;
+    if (!printing && !moveLink(PRINTER_FAST))
+      moveLink(PRINTER_BAUD);          // the fast rate did not answer, so the plain one carries it
     sender.start(&sendBytes, choreTarget, millis(), worthPacking(choreTarget));
   }
   if (!sender.running())
@@ -1660,8 +1870,10 @@ void loop() {
         choreTrouble = "the firmware file is not on the printer's card at the right size";
         chore = ChoreFailed;
       }
-      else
+      else {
         chore = ChoreDone;
+        chirp(2);
+      }
     }
     else if (!askPrinterCard()) {
       choreTrouble = "the printer did not answer with a listing";
@@ -1671,19 +1883,39 @@ void loop() {
       choreTrouble = "the file is not on the printer's card at the right size";
       chore = ChoreFailed;
     }
-    else if (!choreShouldPrint)
+    else if (!choreShouldPrint) {
       chore = ChoreDone;
+      chirp(2);
+    }
     else {
-      const String opened = say("M23 " + String(choreTarget));
+      const String opened = openPrinterFile(choreTarget);
       if (opened.indexOf("File opened") < 0) {
         choreTrouble = "the printer would not open it";
         chore = ChoreFailed;
       }
       else {
+        chirp(2);
         say("M27 S3");
         say("M24");
         chore = ChoreDone;
       }
+    }
+  }
+
+  static uint32_t busySince;
+  if (printing || sender.running() || sendAsked || chore == ChoreSending)
+    busySince = millis();
+  else if (linkRate != PRINTER_BAUD && millis() - busySince > 10000)
+    moveLink(PRINTER_BAUD);
+
+  static uint32_t slowTick;
+  if ((int32_t)(millis() - slowTick) >= 0) {
+    slowTick = millis() + 2000;
+    relayTick(webAuthSet());
+    static bool toldFlash;
+    if (!toldFlash && heardTemp && bootGuardReport().startsWith("confirmed")) {
+      toldFlash = true;
+      chirp(3);
     }
   }
 
@@ -1698,7 +1930,7 @@ void loop() {
       // back on. Asked for without waiting, because a wait here would stall the web.
       printerLine("M155 S2");
     }
-    else {
+    else if (settleWire()) {
       const String said = say("M115");
       const int at = said.indexOf("MACHINE_TYPE:");
       if (at >= 0) {

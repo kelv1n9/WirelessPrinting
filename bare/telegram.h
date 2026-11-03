@@ -33,6 +33,7 @@ class TelegramBot {
     static bool nextCommand(String &chat, String &text);
     static void send(const String chat, const String text);
     static void notify(const String text);      // To everyone allowed
+    static void fromRelay(const String chat, const String text);   // A message the Worker took in
 
   private:
     struct Message {

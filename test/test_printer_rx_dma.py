@@ -8,6 +8,8 @@ import tempfile
 marlin = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('/Users/elvin/Documents/My Projects/Kingroon KP3S/KP3S/Marlin-2.1.2')
 header = (marlin / 'Marlin/src/HAL/STM32F1/MarlinSerial.h').read_text()
 source = (marlin / 'Marlin/src/HAL/STM32F1/MarlinSerial.cpp').read_text()
+protocol = (marlin / 'Marlin/src/feature/binary_stream.h').read_text().split('class BinaryStream {', 1)[1]
+idle_body = protocol.split('  void idle() {', 1)[1].split('\n  }', 1)[0]
 cursor = header.split('struct PrinterRxDmaCursor {', 1)[1].split('\n};', 1)[0]
 serial = header.split('struct MarlinSerial : public HardwareSerial {', 1)[1].split('\n};', 1)[0]
 driver = source.split('static PrinterRxDmaCursor printerRxDma;', 1)[1].split('\n// Copied from ', 1)[0]
@@ -38,12 +40,14 @@ struct { struct { void (*handler)()=nullptr; } handlers[7]; } dma;
 auto DMA1=&dma;
 uint8_t flags=0;
 uint16_t remaining=PrinterRxDmaCursor::capacity;
+unsigned dma_count_reads=0;
 bool enabled=true, cross_during_sample=false;
 uint8_t dma_get_isr_bits(decltype(DMA1), int) { return flags; }
 void dma_clear_isr_bits(decltype(DMA1), int) { flags=0; }
 void dma_disable(decltype(DMA1), int) { enabled=false; }
 bool dma_is_enabled(decltype(DMA1), int) { return enabled; }
 uint16_t dma_get_count(decltype(DMA1), int) {
+  ++dma_count_reads;
   if (cross_during_sample) {
     cross_during_sample=false;
     flags=DMA_ISR_TCIF;
@@ -90,6 +94,16 @@ MSerialT MSerial3(USART3,0,0);
 volatile uint32_t printerUartFull=0;
 uint32_t printerUartDmaStarts=0;
 static PrinterRxDmaCursor printerRxDma;DRIVER
+uint32_t millis() { return 600; }
+#define ELAPSED(a,b) (int32_t((a)-(b))>=0)
+void bs_restore_serial() { MSerial3.endRxDma(); }
+unsigned protocol_idle_calls=0;
+struct SDFileTransferProtocol { static void idle() { ++protocol_idle_calls; } };
+struct IdleProbe {
+  struct { uint32_t timeout=500; } packet;
+  void idle() {IDLE_BODY
+  }
+};
 int main() {
   assert(!printerRxDma.active && printerRxDmaCr1==0 && printerRxDmaCr3==0);
   constexpr uint16_t N=PrinterRxDmaCursor::capacity;
@@ -196,9 +210,31 @@ int main() {
   usart_dev other_dev{&other_regs,&other_rb,1};
   MarlinSerial other(&other_dev,0,0);
   assert(!other.beginRxDma() && (other_regs.CR1 & USART_CR1_RXNEIE));
+  for (unsigned count : {1034U,2068U}) {
+    rb_init(&rb,N,buffer);
+    assert(MSerial3.beginRxDma());
+    for (unsigned i=0;i<count;++i) buffer[i]=uint8_t(i);
+    remaining=N-count;
+    const unsigned before=dma_count_reads;
+    for (unsigned i=0;i<count;++i) assert(MSerial3.read()==uint8_t(i));
+    assert(MSerial3.read()==-1 && dma_count_reads-before<=2);
+    MSerial3.endRxDma();
+  }
+  rb_init(&rb,N,buffer);
+  assert(MSerial3.beginRxDma());
+  for (unsigned i=0;i<2068;++i) buffer[i]=uint8_t(i);
+  remaining=N-1034;
+  for (unsigned i=0;i<500;++i) assert(MSerial3.read()==uint8_t(i));
+  remaining=N-2068;
+  for (unsigned i=500;i<2068;++i) assert(MSerial3.read()==uint8_t(i));
+  assert(MSerial3.read()==-1);
+  IdleProbe idle_probe;
+  idle_probe.idle();
+  assert(printerRxDma.active && protocol_idle_calls==1);
+  MSerial3.endRxDma();
   std::puts("RX DMA: FIFO transitions, 1034-byte packets, wrap, overflow, uint32 wrap, pending TC, sample race, DMA error passed");
 }
-'''.replace('CURSOR', cursor).replace('SERIAL\n', serial+'\n').replace('DRIVER', driver)
+'''.replace('CURSOR', cursor).replace('SERIAL\n', serial+'\n').replace('DRIVER', driver).replace('IDLE_BODY', idle_body)
 with tempfile.TemporaryDirectory(prefix='printer-rx-dma-check-') as tmp:
     cpp = Path(tmp) / 'check.cpp'
     exe = Path(tmp) / 'check'

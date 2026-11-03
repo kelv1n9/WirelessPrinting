@@ -353,7 +353,7 @@ with tempfile.TemporaryDirectory(prefix='printer-sdio-test-') as temp:
 
 patch_dir = Path(__file__).resolve().parent.parent / 'patches'
 patches = [patch_dir / ('printer-' + name + '.patch') for name in [
-    'speed', 'speed-diagnostics', 'uart-diagnostics', 'sdio-diagnostics', 'rx-dma', 'sdio-batching', 'rx-window']]
+    'speed', 'speed-diagnostics', 'uart-diagnostics', 'sdio-diagnostics', 'rx-dma', 'sdio-batching', 'rx-window', 'rx-read']]
 paths = sorted({name for patch in patches for name in re.findall(r'^--- a/(.+)$', patch.read_text(), re.M)})
 with tempfile.TemporaryDirectory(prefix='printer-sdio-replay-') as temp:
     replay = Path(temp)

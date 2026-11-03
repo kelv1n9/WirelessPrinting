@@ -17,11 +17,35 @@ if [ -f "$HS/heatshrink_decoder.cpp" ]; then
 #define ENABLED(V) 1' > "$STAGE/Marlin/src/inc/MarlinConfigPre.h"
 fi
 
+RUN=$(mktemp -d "${TMPDIR:-/tmp}/kp3s-tests.XXXXXX")
+trap 'rm -rf "$RUN"' EXIT
+pids=""
+batch=""
+wait_batch() {
+  for pid in $pids; do
+    wait "$pid" || fail=1
+  done
+  for name in $batch; do
+    printf '\n=== %s ===\n' "$name"
+    cat "$RUN/$name.log"
+  done
+  pids=""
+  batch=""
+}
+count=0
 for t in test_ota test_cardbytes test_boot_guard test_web_auth test_command_queue test_printer_link test_card_transfer test_binary_transfer test_printercard test_gcodemeta; do
-  printf '\n=== %s ===\n' "$t"
-  $CXX $FLAGS -I stubs -o "/tmp/$t" "$t.cpp"
-  "/tmp/$t" || fail=1
+  (
+    $CXX $FLAGS -I stubs -o "$RUN/$t" "$t.cpp" && "$RUN/$t"
+  ) > "$RUN/$t.log" 2>&1 &
+  pids="$pids $!"
+  batch="$batch $t"
+  count=$((count + 1))
+  if [ "$count" -eq 4 ]; then
+    wait_batch
+    count=0
+  fi
 done
+wait_batch
 # Both our sender and our fake printer were written from one reading of Marlin's binary
 # protocol, so they would agree with each other even if the reading were wrong. This asks
 # Marlin's own reference sender instead. Skipped when the Marlin tree is not beside us.
@@ -59,5 +83,8 @@ CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_printer_rx_dma.py "$MARLIN" || fail
 CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_printer_crc.py "$MARLIN" || fail=1
 CXX="$CXX" python3 -B test_printer_sdio.py "$MARLIN" || fail=1
 CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_transfer_completion.py || fail=1
+
+CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_ui_metadata.py || fail=1
+node test_page_ui.js || fail=1
 
 exit $fail

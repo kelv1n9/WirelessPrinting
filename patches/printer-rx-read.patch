@@ -1,0 +1,81 @@
+--- a/Marlin/src/HAL/STM32F1/MarlinSerial.cpp
++++ b/Marlin/src/HAL/STM32F1/MarlinSerial.cpp
+@@ -31,6 +31,7 @@
+ uint32_t printerUartDmaStarts;
+ 
+ static PrinterRxDmaCursor printerRxDma;
++static uint16_t printerRxDmaReadable;
+ static volatile uint32_t printerRxDmaProduced;
+ static volatile bool printerRxDmaError;
+ static uint32_t printerRxDmaCr1, printerRxDmaCr3;
+@@ -77,6 +78,7 @@
+     regs->CR3 &= ~USART_CR3_EIE;
+     printerRxDma.begin(rb->buf, rb->head, rb->tail);
+     printerRxDmaProduced = 0;
++    printerRxDmaReadable = 0;
+     printerRxDmaError = false;
+     dma_setup_transfer(DMA1, DMA_CH3, &regs->DR, DMA_SIZE_8BITS, rb->buf, DMA_SIZE_8BITS,
+                        DMA_MINC_MODE | DMA_CIRC_MODE | DMA_TRNS_CMPLT | DMA_TRNS_ERR);
+@@ -103,6 +105,7 @@
+   uint16_t tail;
+   const uint32_t produced = printer_rx_dma_position(tail);
+   if (printerRxDma.end(produced, tail)) ++printerUartFull;
++  printerRxDmaReadable = 0;
+   c_dev()->rb->head = printerRxDma.head;
+   c_dev()->rb->tail = tail;
+   dma_detach_interrupt(DMA1, DMA_CH3);
+@@ -124,6 +127,7 @@
+     endRxDma();
+     return HardwareSerial::available();
+   }
++  printerRxDmaReadable = pending;
+   return pending;
+ }
+ 
+@@ -134,9 +138,11 @@
+ 
+ int MarlinSerial::read() {
+   if (!rxDmaActive()) return HardwareSerial::read();
+-  const int pending = available();
++  if (!printerRxDmaReadable || printerRxDmaError) available();
+   if (!rxDmaActive()) return HardwareSerial::read();
+-  return printerRxDma.read(c_dev()->rb->buf, printerRxDma.consumed + pending);
++  const int byte = printerRxDma.read(c_dev()->rb->buf, printerRxDma.consumed + printerRxDmaReadable);
++  if (byte >= 0) --printerRxDmaReadable;
++  return byte;
+ }
+ 
+ // Copied from ~/.platformio/packages/framework-arduinoststm32-maple/STM32F1/system/libmaple/usart_private.h
+--- a/Marlin/src/feature/binary_stream.h
++++ b/Marlin/src/feature/binary_stream.h
+@@ -30,10 +30,6 @@
+   static __attribute__((aligned(sizeof(size_t)))) uint8_t decode_buffer[1024] = {};
+   static heatshrink_decoder hsd;
+ #endif
+-
+-inline bool bs_serial_data_available(const serial_index_t index) {
+-  return SERIAL_IMPL.available(index);
+-}
+ 
+ inline int bs_read_serial(const serial_index_t index) {
+   return SERIAL_IMPL.read(index);
+@@ -327,8 +323,9 @@
+       stream_state = StreamState::PACKET_TIMEOUT;
+       return false;
+     }
+-    if (!bs_serial_data_available(card.transfer_port_index)) return false;
+-    data = bs_read_serial(card.transfer_port_index);
++    const int byte = bs_read_serial(card.transfer_port_index);
++    if (byte < 0) return false;
++    data = uint8_t(byte);
+     packet.timeout = millis() + PACKET_MAX_WAIT;
+     return true;
+   }
+@@ -506,7 +503,6 @@
+   }
+ 
+   void idle() {
+-    if (ELAPSED(millis(), packet.timeout)) bs_restore_serial();
+     // Some Protocols may need periodic updates without new data
+     SDFileTransferProtocol::idle();
+   }

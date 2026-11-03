@@ -153,7 +153,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   #filesec tr.sel td{background:transparent}
   #filesec tr.sel{background:var(--sel);border-radius:9px;padding-left:52px}
 
-  #bprint,#bcancel{flex:1;white-space:nowrap;padding:10px 6px}
+  #bcancel{flex:1;white-space:nowrap;padding:10px 6px}
   #jobsec label{width:100%;text-align:left}
   #conlog{height:190px}
   button{padding:9px 14px}
@@ -187,6 +187,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     <span><a href="/yandex">socket</a></span>
     <span><a href="/auth">password</a></span>
     <span><a href="/telegram">bot</a></span>
+    <span><a href="/relay">remote</a></span>
   </div>
   <div class="row">
     <button id="btheme" title="day, night, or whatever the system says">auto</button>
@@ -217,7 +218,6 @@ upload and reflash. <a href="/auth">Set one</a>.</p>
           <div class="kv hide" id="kgram"><div class="k">Filament</div><div class="v" id="jgram">—</div></div>
         </div>
         <div class="row" style="margin-top:16px">
-          <button class="p" id="bprint">Print selected</button>
           <button class="d" id="bcancel">Cancel print</button>
           <span class="spacer"></span>
           <span class="dim num" id="xline"></span>
@@ -231,6 +231,7 @@ upload and reflash. <a href="/auth">Set one</a>.</p>
 
   <section id="filesec">
     <h2>On the printer</h2>
+    <p class="dim" id="pnote" role="status"></p>
     <table><tbody id="ptab"><tr><td class="dim">asking the printer</td></tr></tbody></table>
     <div class="foot">
       <div class="row">
@@ -243,11 +244,6 @@ upload and reflash. <a href="/auth">Set one</a>.</p>
         <progress id="uprog" class="hide" max="100" value="0"></progress>
       </div>
     </div>
-    <details id="stage">
-      <summary class="dim" style="cursor:pointer;margin-top:14px;font-size:13px">Module card, on the way through</summary>
-      <table><tbody id="ftab"></tbody></table>
-      <div class="foot"><span class="dim num" id="space"></span></div>
-    </details>
   </section>
 
   <div class="side">
@@ -299,7 +295,6 @@ upload and reflash. <a href="/auth">Set one</a>.</p>
 <script>
 const $ = id => document.getElementById(id);
 const hist = {n:[], b:[]};
-let files = [], seen = null;
 
 const hhmm = s => { s = Math.max(0, Math.round(s));
   const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
@@ -343,7 +338,7 @@ function render(d){
   $('jname').textContent = j.file;
   $('jpct').textContent = j.completion.toFixed(1);
   $('jbar').style.width = j.completion + '%';
-  $('jlayer').textContent = j.layers ? j.layer + ' / ' + j.layers : (j.layer || '—');
+  $('jlayer').textContent = j.layers ? (j.layer || '—') + ' / ' + j.layers : (j.layer || '—');
   $('jz').textContent = j.z ? j.z.toFixed(2) + ' mm' : '—';
   $('jel').textContent = d.printing ? hhmm(j.elapsed) : '—';
   $('jrem').textContent = j.remaining >= 0 ? hhmm(j.remaining) : '—';
@@ -365,7 +360,7 @@ function render(d){
   if (going) soon.textContent = sock.state;
   $('bpower').disabled = d.printing || !usable;
 
-  $('bprint').disabled = d.printing || !d.connected || busy;
+  $('ptab').querySelectorAll('button').forEach(b => b.disabled = d.printing || busy);
   $('bcancel').disabled = !d.printing;
 
   const t = d.temperature;
@@ -378,12 +373,12 @@ function render(d){
   if (hist.n.length > 120) { hist.n.shift(); hist.b.shift(); }
   spark($('sn'), hist.n); spark($('sb'), hist.b);
 
-  $('space').textContent = kib(+d.storage.free * 1024) + ' free';
-  const mark = d.storage.selected + '|' + d.printing;
-  if (seen !== null && seen !== mark) loadFiles().catch(()=>{});
-  seen = mark;
-  const th = $('jthumb'), want = j.file && j.file !== '—' ? '/thumbnail?name=' + encodeURIComponent(j.file) : '';
-  if (th.dataset.src !== want) { th.dataset.src = want; th.className = 'thumb'; th.src = want; }
+  const th = $('jthumb'), want = j.file && j.file !== '—' ? '/thumbnail?name=' + encodeURIComponent(j.file) + (d.of ? '&s=' + d.of : '') : '';
+  if (th.dataset.src !== want || th.dataset.printing !== String(d.printing)) {
+    th.dataset.src = want; th.dataset.printing = String(d.printing);
+    th.className = want ? 'thumb' : 'thumb noimg';
+    if (want) th.src = want; else th.removeAttribute('src');
+  }
   $('kgram').classList.toggle('hide', !(d.energy.grams > 0));
   $('jgram').textContent = d.energy.grams.toFixed(1) + ' g';
   $('brestart').disabled = d.printing;
@@ -391,6 +386,8 @@ function render(d){
 
 // What the wire is doing, kept apart from the job because a transfer is not a print.
 let busy = false;
+// Through the Cloudflare relay every poll is a request against the free day's allowance.
+const remote = !/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.|127\.|localhost)/.test(location.hostname);
 
 async function pollTransfer(){
   const t = await (await fetch('/printer/send/status')).text();
@@ -407,60 +404,11 @@ async function pollTransfer(){
     : (chore.indexOf('failed') === 0 ? chore : '');
 }
 
-function renderFiles(sel){
-  const tb = $('ftab');
-  tb.textContent = '';
-  if (!files.length) { tb.insertRow().insertCell().innerHTML = '<span class="dim">card is empty</span>'; return; }
-  for (const f of files) {
-    const tr = tb.insertRow();
-    tr.className = 'pick' + (f.name === sel ? ' sel' : '');
-    tr.onclick = () => act('/select?name=' + encodeURIComponent(f.name));
-    const n = tr.insertCell(); n.className = 'nm';
-    n.textContent = f.name;
-    const z = document.createElement('span');
-    z.className = 'dim num'; z.style.marginLeft = '8px'; z.textContent = kib(f.size);
-    n.append(z);
-    const a = tr.insertCell(); a.className = 'acts';
-    a.onclick = e => e.stopPropagation();
-    const box = document.createElement('div'); box.className = 'row';
-    box.append(btn('Send and print', 'p', () => act('/select?name=' + encodeURIComponent(f.name)).then(() => job('start'))),
-               btn('Send', '', () => act('/select?name=' + encodeURIComponent(f.name)).then(() => sendOnly(f.name))),
-               btn('Rename', '', () => rename(f.name)),
-               btn('Delete', 'd', () => confirm('Delete ' + f.name + '?') && act('/delete?name=' + encodeURIComponent(f.name))));
-    a.append(box);
-  }
-}
-
 function btn(text, cls, fn){ const b = document.createElement('button'); b.textContent = text; if (cls) b.className = cls; b.onclick = fn; return b; }
 
-// The extension is put back by the firmware, so dropping it here is harmless.
-async function rename(from){
-  const to = prompt('New name for ' + from, from);
-  if (to === null || to.trim() === '' || to === from) return;
-  await call('/api/rename', {method: 'POST', body: new URLSearchParams({from, to})});
-  await loadFiles();
-  toast('renamed');
-}
-
-async function act(url){ await call(url, {method:'POST'}); await loadFiles(); }
 async function job(cmd){
   await call('/api/job', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({command: cmd})});
   toast(cmd === 'start' ? 'print started' : 'cancelling');
-}
-
-async function loadFiles(){
-  const d = await (await fetch('/api/files')).json();
-  files = d.files;
-  const s = await (await fetch('/api/status')).json();
-  seen = s.storage.selected + '|' + s.printing;
-  renderFiles(s.storage.selected);
-  $('space').textContent = kib(+d.free * 1024) + ' free';
-}
-
-async function sendOnly(name){
-  await call('/printer/send?name=' + encodeURIComponent(name), {method:'POST'});
-  toast('on its way to the printer card');
-  pollTransfer().catch(()=>{});
 }
 
 // Three settings rather than two: what the system says is a choice worth keeping.
@@ -480,7 +428,7 @@ $('btheme').onclick = () => {
 
 // The printer's card is asked for on purpose: it costs the wire two commands, and
 // during a print those would wait behind every move already queued.
-let asking = false;
+let asking = false, havePrinterList = false;
 
 async function printerCard(){
   if (asking) return;
@@ -488,23 +436,28 @@ async function printerCard(){
   try {
     const r = await fetch('/printer/files');
     const text = await r.text();
+    if (!r.ok) throw new Error(text.trim() || ('HTTP ' + r.status));
+    const lines = text.split('\n').filter(l => l.trim());
+    const note = lines.find(l => l.startsWith('cached:')) || '';
+    const entries = [];
+    for (const line of lines) {
+      if (line === note || line === "nothing on the printer's card") continue;
+      const m = line.match(/^(\S+)\s+(\d+)\s+(.*)$/);
+      if (!m) throw new Error('Incomplete printer listing; previous list kept');
+      entries.push(m);
+    }
+    if (!entries.length && !lines.includes("nothing on the printer's card"))
+      throw new Error('Incomplete printer listing; previous list kept');
     const tb = $('ptab');
     tb.textContent = '';
-    if (!r.ok) {
-      const cell = tb.insertRow().insertCell();
-      cell.className = 'dim';
-      cell.textContent = text.trim();
-      return;
-    }
-    for (const line of text.split('\n')) {
-      if (/^waiting |^next /.test(line)) continue;
-      const m = line.match(/^(\S+)\s+(\d+)\s+(.*)$/);
-      if (!m) continue;
+    $('pnote').textContent = note;
+    havePrinterList = true;
+    for (const m of entries) {
       const tr = tb.insertRow();
       const img = document.createElement('img');
       img.className = 'tmini'; img.loading = 'lazy'; img.alt = '';
       img.onerror = () => img.classList.add('noimg');
-      img.src = '/thumbnail?name=' + encodeURIComponent(m[3]);
+      img.src = '/thumbnail?name=' + encodeURIComponent(m[3]) + '&s=' + m[2];
       const t = tr.insertCell(); t.className = 'thumbcell'; t.append(img);
       const n = tr.insertCell(); n.className = 'nm';
       n.textContent = m[3];
@@ -514,11 +467,12 @@ async function printerCard(){
       const a = tr.insertCell(); a.className = 'acts';
       const box = document.createElement('div'); box.className = 'row';
       box.append(btn('Print', 'p', () => confirm('Print ' + m[3] + '?') &&
-        call('/printer/print?name=' + encodeURIComponent(m[3]), {method:'POST'})
+        call('/printer/print?name=' + encodeURIComponent(m[1]), {method:'POST'})
           .then(() => { toast('printing'); })),
         btn('Delete', 'd', () => confirm('Delete ' + m[3] + ' from the printer card?') &&
-          call('/printer/delete?name=' + encodeURIComponent(m[3]), {method:'POST'})
+          call('/printer/delete?name=' + encodeURIComponent(m[1]), {method:'POST'})
             .then(() => { toast('deleted'); printerCard().catch(()=>{}); })));
+      box.querySelectorAll('button').forEach(b => b.disabled = conPrinting || busy);
       a.append(box);
     }
     if (!tb.rows.length) {
@@ -526,6 +480,9 @@ async function printerCard(){
       cell.className = 'dim';
       cell.textContent = 'nothing on the printer card';
     }
+  } catch (e) {
+    $('pnote').textContent = e.message || 'Printer list unavailable; previous list kept';
+    if (!havePrinterList) $('ptab').textContent = '';
   } finally { asking = false; }
 }
 $('bpcard').onclick = () => printerCard().catch(()=>{});
@@ -534,7 +491,6 @@ $('cauto').onchange = e => call('/yandex/auto?on=' + (e.target.checked ? 1 : 0),
   .then(() => toast(e.target.checked ? 'will switch off after a print' : 'will stay on'));
 $('bpower').onclick = () => confirm('Cut mains to the printer? This module loses power too and cannot switch it back on.')
   && call('/yandex/off', {method:'POST'}).then(() => toast('switching off'));
-$('bprint').onclick = () => job('start');
 $('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel');
 $('brestart').onclick = () => confirm('Restart the module? The printer keeps running.') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
 let uploadThenPrint = false;
@@ -575,7 +531,6 @@ function upload(f){
   x.onloadend = () => {
     p.classList.add('hide');
     toast(x.status === 201 ? 'uploaded, going to the printer card' : ('upload failed: ' + (x.responseText || x.status)));
-    loadFiles();
     pollTransfer().catch(()=>{});
   };
   if (uploadThenPrint)
@@ -662,10 +617,9 @@ $('conform').onsubmit = async e => {
     catch (e) { $('state').textContent = 'offline'; $('state').className = 'badge bad'; }
     pollConsole().catch(()=>{});
     pollTransfer().catch(()=>{});
-    await new Promise(r => setTimeout(r, busy ? 900 : 1500));
+    await new Promise(r => setTimeout(r, remote ? 5000 : busy ? 900 : 1500));
   }
 })();
-loadFiles().catch(()=>{});
 printerCard().catch(()=>{});
 </script>
 )PAGE";

@@ -106,6 +106,22 @@ public:
   uint8_t count() const { return held; }
   const PrinterCardEntry &at(const uint8_t i) const { return slot[i]; }
 
+  const PrinterCardEntry *find(const char *name, bool *ambiguous = nullptr) const {
+    if (ambiguous) *ambiguous = false;
+    if (!name || !complete_)
+      return nullptr;
+    const PrinterCardEntry *found = nullptr;
+    for (uint8_t i = 0; i < held; i++)
+      if (printerCardSame(name, slot[i].dos) || printerCardSame(name, slot[i].name)) {
+        if (found) {
+          if (ambiguous) *ambiguous = true;
+          return nullptr;
+        }
+        found = &slot[i];
+      }
+    return found;
+  }
+
   uint16_t rejected() const { return rejected_; }   // lines that did not parse
   uint16_t skipped() const  { return skipped_; }    // parsed, but not a gcode file in the root
   uint16_t dropped() const  { return dropped_; }    // good entries past the last slot
@@ -334,6 +350,31 @@ inline bool printerCardTarget(const char *moduleName, char *out, const size_t ma
   memcpy(out + at, name + len - extLen, extLen);
   at += extLen;
   out[at] = 0;
+  return true;
+}
+
+inline bool printerCardResolve(const PrinterCard &card, const char *name,
+                               char *out, const size_t max) {
+  if (!name || !*name || !out || !max)
+    return false;
+  bool ambiguous = false;
+  const PrinterCardEntry *entry = card.find(name, &ambiguous);
+  if (ambiguous)
+    return false;
+  char target[PRINTER_CARD_NAME_BYTES];
+  if (!entry) {
+    if (!printerCardTarget(name, target, sizeof target))
+      return false;
+    entry = card.find(target, &ambiguous);
+    if (ambiguous)
+      return false;
+    name = target;
+  }
+  if (entry)
+    name = entry->name[0] ? entry->name : entry->dos;
+  if (strlen(name) >= max)
+    return false;
+  memmove(out, name, strlen(name) + 1);
   return true;
 }
 

@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+static uint32_t millis() { static uint32_t now; return now++; }
+
 struct ByteSource {
   virtual ~ByteSource() {}
   virtual int next(uint8_t *, size_t) = 0;

@@ -30,7 +30,7 @@ completion = extract('if (chore == ChoreSending && !sender.running() && !sendAsk
 bin_branch = completion.split('else if (!worthPacking(choreTarget)) {', 1)[1].split('else if (!askPrinterCard())', 1)[0]
 assert bin_branch.count('say("M21");') == 1, 'Expected one bin remount for mutation check'
 mutant = completion.replace('say("M21");', '', 1)
-helpers = '\n'.join(extract(marker) for marker in ('static bool worthPacking(', 'static bool settleWire() {', 'static bool askPrinterCard() {'))
+helpers = '\n'.join(extract(marker) for marker in ('static bool worthPacking(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard() {', 'static String openPrinterFile('))
 chore_enum = re.search(r'enum Chore\s*:\s*uint8_t\s*\{[^}]+\};', source).group()
 binary_header = (root / 'ESP8266WirelessPrintAsync/BinaryTransfer.h').read_text()
 binary_enum = re.search(r'enum BinaryPhase\s*:\s*uint8_t\s*\{[^}]+\};', binary_header).group()
@@ -45,6 +45,13 @@ program = r'''
 #include <vector>
 uint32_t testClock=0;
 void delay(unsigned ms) { testClock+=ms; }
+#define PRINTER_BAUD 115200
+#define PRINTER_FAST 2000000
+unsigned chirps=0;
+void chirp(int times) { chirps+=times; }
+uint32_t linkRate=PRINTER_BAUD;
+struct { void updateBaudRate(uint32_t) {} size_t write(const uint8_t *, size_t n) { return n; } } Printer;
+void drain() {}
 struct CompletionString : String {
   using String::String;
   CompletionString(const String &value):String(value) {}
@@ -67,7 +74,8 @@ Chore chore;
 String choreTrouble;
 char choreTarget[PRINTER_CARD_NAME_BYTES];
 bool choreShouldPrint=false,sendAsked=false,sawOk=false;
-PrinterCard printerCard;
+PrinterCard printerCard, printerListing;
+bool printing=false,listingRequested=false;
 std::vector<std::string> commands;
 const char *scenario="";
 unsigned checks=0,deletions=0;
@@ -97,11 +105,11 @@ String say(const String &text) {
   }
   if (cmd=="M20 L") {
     if (!mounted || !readWorks) return "SD read error";
-    printerCard.observe("Begin file list");
+    printerListing.observe("Begin file list");
     char line[160];
     std::snprintf(line,sizeof line,"%s %lu",listedName.c_str(),static_cast<unsigned long>(listedSize));
-    printerCard.observe(line);
-    if (listEnd) printerCard.observe("End file list");
+    printerListing.observe(line);
+    if (listEnd) printerListing.observe("End file list");
     return "ok";
   }
   if (cmd.compare(0,4,"M23 ")==0) {
@@ -187,7 +195,8 @@ int main(int argc,char **) {
     if (fault==5) wireWorks=false;
     finish();failed();
     require(!sent("M23 PART.GCO"),"bad listing must not reach file selection");
-    if (fault==1 || fault==3) require(!printerCard.holds("PART.GCO",4096),"old successful listing must not survive refresh");
+    if (fault==1) require(!printerCard.holds("PART.GCO",4096),"a complete replacement listing must replace the old one");
+    if (fault==3) require(printerCard.holds("PART.GCO",4096),"an incomplete listing preserves the display cache without authorizing printing");
   }
   reset("PART.GCO",true);openWorks=false;finish();failed();
   require(!sent("M27 S3"),"failed open must not enable print reporting");

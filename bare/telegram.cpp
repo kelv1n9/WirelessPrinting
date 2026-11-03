@@ -23,6 +23,9 @@ static void trail(const String text) {
 
 extern bool isPrinting;
 extern bool somethingIsStreaming();
+extern bool relayCarriesTelegram();
+extern bool relayConfigured();
+extern void relaySendTelegram(const String &chat, const String &text);
 
 #define TELEGRAM_HOST    "https://api.telegram.org"
 #define TELEGRAM_STACK   16384         // The handshake checks a chain of three and needs the room
@@ -265,6 +268,17 @@ void TelegramBot::deliver(const String chat, const String text) {
 }
 
 
+// With the relay up, Telegram talks to the Worker and the Worker talks to us down the
+// socket that is already open. Two encrypted connections do not fit in this heap, and
+// the one to the Worker is the one that must stay.
+void TelegramBot::fromRelay(const String chat, const String text) {
+  if (!allowed(chat)) {
+    remember(chat);
+    return;
+  }
+  deliver(chat, text);
+}
+
 void TelegramBot::send(const String chat, const String text) {
   Hold hold(mutex);
 
@@ -496,6 +510,37 @@ void TelegramBot::run(void *argument) {
   for (;;) {
     if (somethingIsStreaming() || tlsWanted) {
       vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+
+    // Once the relay is set up the bot never opens a connection of its own: while the
+    // relay was reconnecting the bot's long poll took the memory its handshake needed,
+    // and the relay never came back.
+    if (relayConfigured()) {
+      if (!relayCarriesTelegram()) {
+        {
+          Hold hold(mutex);
+          status = "waiting for the relay, and for the Worker to hold the bot token";
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        continue;
+      }
+      for (;;) {
+        Message one;
+        {
+          Hold hold(mutex);
+          if (outboxHead == outboxTail)
+            break;
+          one = outbox[outboxTail];
+          outboxTail = (outboxTail + 1) % QUEUE;
+        }
+        relaySendTelegram(one.chat, one.text);
+      }
+      {
+        Hold hold(mutex);
+        status = "through the relay";
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
       continue;
     }
 
