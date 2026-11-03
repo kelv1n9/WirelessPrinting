@@ -1,0 +1,182 @@
+--- a/Marlin/src/sd/disk_io_driver.h
++++ b/Marlin/src/sd/disk_io_driver.h
+@@ -60,6 +60,13 @@
+   virtual bool readBlock(const uint32_t block, uint8_t * const dst) = 0;
+   virtual bool writeBlock(const uint32_t blockNumber, const uint8_t * const src) = 0;
+ 
++  virtual bool writeBlocks(const uint32_t block, const uint8_t * const src, const uint16_t count) {
++    if (!src || !count || uint32_t(count - 1) > UINT32_MAX - block) return false;
++    for (uint16_t i = 0; i < count; ++i)
++      if (!writeBlock(block + i, src + 512U * i)) return false;
++    return true;
++  }
++
+   virtual uint32_t cardSize() = 0;
+ 
+   virtual bool isReady() = 0;
+--- a/Marlin/src/sd/SdBaseFile.cpp
++++ b/Marlin/src/sd/SdBaseFile.cpp
+@@ -2223,12 +2223,16 @@
+     // block for data write
+     uint32_t block = vol_->clusterStartBlock(curCluster_) + blockOfCluster;
+     if (n == 512) {
++      uint16_t blocks = nToWrite >> 9;
++      NOMORE(blocks, vol_->blocksPerCluster() - blockOfCluster);
++      NOMORE(blocks, 2);
++      n = blocks * 512;
+       // full block - don't need to use cache
+-      if (vol_->cacheBlockNumber() == block) {
++      if (vol_->cacheBlockNumber() >= block && vol_->cacheBlockNumber() - block < blocks) {
+         // invalidate cache if block is in cache
+         vol_->cacheSetBlockNumber(0xFFFFFFFF, false);
+       }
+-      if (!vol_->writeBlock(block, src)) goto FAIL;
++      if (blocks > 1 ? !vol_->sdCard()->writeBlocks(block, src, blocks) : !vol_->writeBlock(block, src)) goto FAIL;
+     }
+     else {
+       if (blockOffset == 0 && curPosition_ >= fileSize_) {
+--- a/Marlin/src/sd/Sd2Card_sdio.h
++++ b/Marlin/src/sd/Sd2Card_sdio.h
+@@ -29,6 +29,9 @@
+ bool SDIO_Init();
+ bool SDIO_ReadBlock(uint32_t block, uint8_t *dst);
+ bool SDIO_WriteBlock(uint32_t block, const uint8_t *src);
++#ifdef ARDUINO_ARCH_STM32F1
++  bool SDIO_WriteBlocks(uint32_t block, const uint8_t *src, uint16_t count);
++#endif
+ bool SDIO_IsReady();
+ uint32_t SDIO_GetCardSize();
+ 
+@@ -49,6 +52,10 @@
+     bool readBlock(uint32_t block, uint8_t *dst)          override { return SDIO_ReadBlock(block, dst); }
+     bool writeBlock(uint32_t block, const uint8_t *src)   override { return SDIO_WriteBlock(block, src); }
+ 
++    #ifdef ARDUINO_ARCH_STM32F1
++      bool writeBlocks(uint32_t block, const uint8_t *src, uint16_t count) override { return SDIO_WriteBlocks(block, src, count); }
++    #endif
++
+     uint32_t cardSize()                                   override { return SDIO_GetCardSize(); }
+ 
+     bool isReady()                                        override { return SDIO_IsReady(); }
+--- a/Marlin/src/HAL/STM32F1/sdio.h
++++ b/Marlin/src/HAL/STM32F1/sdio.h
+@@ -38,9 +38,11 @@
+ #define SDMMC_CMD_SEL_DESEL_CARD                      ((uint8_t)7)   /* Selects the card by its own relative address and gets deselected by any other address */
+ #define SDMMC_CMD_HS_SEND_EXT_CSD                     ((uint8_t)8)   /* Sends SD Memory Card interface condition, which includes host supply voltage information and asks the card whether card supports voltage. */
+ #define SDMMC_CMD_SEND_CSD                            ((uint8_t)9)   /* Addressed card sends its card specific data (CSD) on the CMD line. */
++#define SDMMC_CMD_STOP_TRANSMISSION                   ((uint8_t)12)
+ #define SDMMC_CMD_SEND_STATUS                         ((uint8_t)13)  /*!< Addressed card sends its status register. */
+ #define SDMMC_CMD_READ_SINGLE_BLOCK                   ((uint8_t)17)  /* Reads single block of size selected by SET_BLOCKLEN in case of SDSC, and a block of fixed 512 bytes in case of SDHC and SDXC. */
+ #define SDMMC_CMD_WRITE_SINGLE_BLOCK                  ((uint8_t)24)  /* Writes single block of size selected by SET_BLOCKLEN in case of SDSC, and a block of fixed 512 bytes in case of SDHC and SDXC. */
++#define SDMMC_CMD_WRITE_MULTIPLE_BLOCK                ((uint8_t)25)
+ #define SDMMC_CMD_APP_CMD                             ((uint8_t)55)  /* Indicates to the card that the next command is an application specific command rather than a standard command. */
+ 
+ #define SDMMC_ACMD_APP_SD_SET_BUSWIDTH                ((uint8_t)6)   /* (ACMD6) Defines the data bus width to be used for data transfer. The allowed data bus widths are given in SCR register. */
+@@ -53,9 +55,11 @@
+ #define CMD7_SEL_DESEL_CARD                           (uint16_t)(SDMMC_CMD_SEL_DESEL_CARD | SDIO_CMD_WAIT_SHORT_RESP)
+ #define CMD8_HS_SEND_EXT_CSD                          (uint16_t)(SDMMC_CMD_HS_SEND_EXT_CSD | SDIO_CMD_WAIT_SHORT_RESP)
+ #define CMD9_SEND_CSD                                 (uint16_t)(SDMMC_CMD_SEND_CSD | SDIO_CMD_WAIT_LONG_RESP)
++#define CMD12_STOP_TRANSMISSION                       (uint16_t)(SDMMC_CMD_STOP_TRANSMISSION | SDIO_CMD_WAIT_SHORT_RESP)
+ #define CMD13_SEND_STATUS                             (uint16_t)(SDMMC_CMD_SEND_STATUS | SDIO_CMD_WAIT_SHORT_RESP)
+ #define CMD17_READ_SINGLE_BLOCK                       (uint16_t)(SDMMC_CMD_READ_SINGLE_BLOCK | SDIO_CMD_WAIT_SHORT_RESP)
+ #define CMD24_WRITE_SINGLE_BLOCK                      (uint16_t)(SDMMC_CMD_WRITE_SINGLE_BLOCK | SDIO_CMD_WAIT_SHORT_RESP)
++#define CMD25_WRITE_MULTIPLE_BLOCK                    (uint16_t)(SDMMC_CMD_WRITE_MULTIPLE_BLOCK | SDIO_CMD_WAIT_SHORT_RESP)
+ #define CMD55_APP_CMD                                 (uint16_t)(SDMMC_CMD_APP_CMD | SDIO_CMD_WAIT_SHORT_RESP)
+ 
+ #define ACMD6_APP_SD_SET_BUSWIDTH                     (uint16_t)(SDMMC_ACMD_APP_SD_SET_BUSWIDTH | SDIO_CMD_WAIT_SHORT_RESP)
+@@ -139,6 +143,9 @@
+ bool SDIO_CmdSendStatus(uint32_t argument);
+ bool SDIO_CmdReadSingleBlock(uint32_t address);
+ bool SDIO_CmdWriteSingleBlock(uint32_t address);
++bool SDIO_CmdWriteMultipleBlock(uint32_t address);
++bool SDIO_CmdStopTransfer();
++bool SDIO_WriteBlocks(uint32_t blockAddress, const uint8_t *data, uint16_t count);
+ bool SDIO_CmdAppCommand(uint32_t rsa);
+ 
+ bool SDIO_CmdAppSetBusWidth(uint32_t rsa, uint32_t argument);
+--- a/Marlin/src/HAL/STM32F1/sdio.cpp
++++ b/Marlin/src/HAL/STM32F1/sdio.cpp
+@@ -194,6 +194,63 @@
+   return false;
+ }
+ 
++bool SDIO_WriteBlocks(uint32_t blockAddress, const uint8_t *data, uint16_t count) {
++  if (!data || !count || count > 0xFFFFU / 128U) return false;
++  if (count == 1) return SDIO_WriteBlock(blockAddress, data);
++  if ((uintptr_t(data) & 3U) || blockAddress >= SdCard.LogBlockNbr || count > SdCard.LogBlockNbr - blockAddress) return false;
++  const uint32_t transferStarted = micros();
++  if (SDIO_GetCardState() != SDIO_CARD_TRANSFER) return false;
++  if (SdCard.CardType != CARD_SDHC_SDXC) blockAddress *= 512U;
++
++  dma_disable(SDIO_DMA_DEV, SDIO_DMA_CHANNEL);
++  SDIO->DCTRL &= ~(SDIO_DCTRL_DMAEN | SDIO_DCTRL_DTEN);
++  dma_clear_isr_bits(SDIO_DMA_DEV, SDIO_DMA_CHANNEL);
++  SDIO_CLEAR_FLAG(SDIO_ICR_CMD_FLAGS | SDIO_ICR_DATA_FLAGS);
++
++  bool transferred = false;
++  if (SDIO_CmdWriteMultipleBlock(blockAddress)) {
++    dma_setup_transfer(SDIO_DMA_DEV, SDIO_DMA_CHANNEL, &SDIO->FIFO, DMA_SIZE_32BITS, (volatile void *)data, DMA_SIZE_32BITS, DMA_MINC_MODE | DMA_FROM_MEM);
++    dma_set_num_transfers(SDIO_DMA_DEV, SDIO_DMA_CHANNEL, 128U * count);
++    dma_enable(SDIO_DMA_DEV, SDIO_DMA_CHANNEL);
++    const uint32_t dataTimeout = SDIO_DATA_TIMEOUT * uint32_t(count);
++    sdio_setup_transfer(dataTimeout * (F_CPU / 1000U), 512U * count, SDIO_BLOCKSIZE_512 | SDIO_DCTRL_DMAEN | SDIO_DCTRL_DTEN);
++    const uint32_t started = millis();
++    do {
++      if (SDIO_GET_FLAG(SDIO_STA_TRX_ERROR_FLAGS) || (DMA2_BASE->ISR & DMA_ISR_TEIF4)) break;
++      if (SDIO_GET_FLAG(SDIO_STA_DATAEND) && (DMA2_BASE->ISR & DMA_ISR_TCIF4)) {
++        transferred = true;
++        break;
++      }
++    } while (uint32_t(millis() - started) < dataTimeout);
++  }
++
++  dma_disable(SDIO_DMA_DEV, SDIO_DMA_CHANNEL);
++  SDIO->DCTRL &= ~(SDIO_DCTRL_DMAEN | SDIO_DCTRL_DTEN);
++  if (SDIO_GET_FLAG(SDIO_STA_TRX_ERROR_FLAGS) || (DMA2_BASE->ISR & DMA_ISR_TEIF4)) transferred = false;
++  if (transferred) {
++    sdioWriteCalls += count;
++    sdioTransferUs += uint32_t(micros() - transferStarted);
++  }
++  const uint32_t busyStarted = micros();
++  const bool stopped = SDIO_CmdStopTransfer();
++  dma_clear_isr_bits(SDIO_DMA_DEV, SDIO_DMA_CHANNEL);
++  SDIO_CLEAR_FLAG(SDIO_ICR_CMD_FLAGS | SDIO_ICR_DATA_FLAGS);
++  const uint32_t started = millis();
++  do {
++    const uint32_t state = SDIO_GetCardState();
++    if (state == SDIO_CARD_ERROR) break;
++    if (state == SDIO_CARD_TRANSFER && (SDIO_GetResponse(SDIO_RESP1) & (1U << 8))) {
++      if (transferred) {
++        const uint32_t spent = micros() - busyStarted;
++        sdioBusyUs += spent;
++        if (spent > sdioMaxBusyUs) sdioMaxBusyUs = spent;
++      }
++      return transferred && stopped;
++    }
++  } while (uint32_t(millis() - started) < SDIO_WRITE_TIMEOUT);
++  return false;
++}
++
+ inline uint32_t SDIO_GetCardState() { return SDIO_CmdSendStatus(SdCard.RelCardAdd << 16U) ? (SDIO_GetResponse(SDIO_RESP1) >> 9U) & 0x0FU : SDIO_CARD_ERROR; }
+ 
+ // No F1 board with SDIO + MSC using Maple, that I aware of...
+@@ -217,6 +274,8 @@
+ bool SDIO_CmdSendStatus(uint32_t argument) { SDIO_SendCommand(CMD13_SEND_STATUS, argument); return SDIO_GetCmdResp1(SDMMC_CMD_SEND_STATUS); }
+ bool SDIO_CmdReadSingleBlock(uint32_t address) { SDIO_SendCommand(CMD17_READ_SINGLE_BLOCK, address); return SDIO_GetCmdResp1(SDMMC_CMD_READ_SINGLE_BLOCK); }
+ bool SDIO_CmdWriteSingleBlock(uint32_t address) { SDIO_SendCommand(CMD24_WRITE_SINGLE_BLOCK, address); return SDIO_GetCmdResp1(SDMMC_CMD_WRITE_SINGLE_BLOCK); }
++bool SDIO_CmdWriteMultipleBlock(uint32_t address) { SDIO_SendCommand(CMD25_WRITE_MULTIPLE_BLOCK, address); return SDIO_GetCmdResp1(SDMMC_CMD_WRITE_MULTIPLE_BLOCK); }
++bool SDIO_CmdStopTransfer() { SDIO_SendCommand(CMD12_STOP_TRANSMISSION, 0); return SDIO_GetCmdResp1(SDMMC_CMD_STOP_TRANSMISSION); }
+ bool SDIO_CmdAppCommand(uint32_t rsa) { SDIO_SendCommand(CMD55_APP_CMD, rsa); return SDIO_GetCmdResp1(SDMMC_CMD_APP_CMD); }
+ 
+ bool SDIO_CmdAppSetBusWidth(uint32_t rsa, uint32_t argument) {
+--- a/Marlin/src/feature/binary_stream.h
++++ b/Marlin/src/feature/binary_stream.h
+@@ -27,7 +27,7 @@
+ #if ENABLED(BINARY_STREAM_COMPRESSION)
+   #include "../libs/heatshrink/heatshrink_decoder.h"
+   // STM32 (and others?) require a word-aligned buffer for SD card transfers via DMA
+-  static __attribute__((aligned(sizeof(size_t)))) uint8_t decode_buffer[512] = {};
++  static __attribute__((aligned(sizeof(size_t)))) uint8_t decode_buffer[1024] = {};
+   static heatshrink_decoder hsd;
+ #endif
+ 

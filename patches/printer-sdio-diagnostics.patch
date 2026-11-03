@@ -1,0 +1,70 @@
+--- a/Marlin/src/HAL/STM32F1/sdio.h
++++ b/Marlin/src/HAL/STM32F1/sdio.h
+@@ -25,6 +25,8 @@
+ 
+ #include <libmaple/sdio.h>
+ #include <libmaple/dma.h>
++
++extern uint32_t sdioWriteCalls, sdioTransferUs, sdioBusyUs, sdioMaxBusyUs;
+ 
+ // ------------------------
+ // Defines
+--- a/Marlin/src/HAL/STM32F1/sdio.cpp
++++ b/Marlin/src/HAL/STM32F1/sdio.cpp
+@@ -30,6 +30,7 @@
+ #include "sdio.h"
+ 
+ SDIO_CardInfoTypeDef SdCard;
++uint32_t sdioWriteCalls, sdioTransferUs, sdioBusyUs, sdioMaxBusyUs;
+ 
+ bool SDIO_Init() {
+   uint32_t count = 0U;
+@@ -148,6 +149,7 @@
+ uint32_t millis();
+ 
+ bool SDIO_WriteBlock(uint32_t blockAddress, const uint8_t *data) {
++  const uint32_t transferStarted = micros();
+   if (SDIO_GetCardState() != SDIO_CARD_TRANSFER) return false;
+   if (blockAddress >= SdCard.LogBlockNbr) return false;
+   if ((0x03 & (uint32_t)data)) return false; // misaligned data
+@@ -177,9 +179,15 @@
+ 
+   SDIO_CLEAR_FLAG(SDIO_ICR_CMD_FLAGS | SDIO_ICR_DATA_FLAGS);
+ 
++  sdioWriteCalls++;
++  sdioTransferUs += uint32_t(micros() - transferStarted);
++  const uint32_t busyStarted = micros();
+   uint32_t timeout = millis() + SDIO_WRITE_TIMEOUT;
+   while (timeout > millis()) {
+     if (SDIO_GetCardState() == SDIO_CARD_TRANSFER) {
++      const uint32_t spent = micros() - busyStarted;
++      sdioBusyUs += spent;
++      if (spent > sdioMaxBusyUs) sdioMaxBusyUs = spent;
+       return true;
+     }
+   }
+--- a/Marlin/src/gcode/host/M115.cpp
++++ b/Marlin/src/gcode/host/M115.cpp
+@@ -23,6 +23,10 @@
+ #include "../gcode.h"
+ #include "../../inc/MarlinConfig.h"
+ #include "../queue.h"           // for getting the command port
++
++#if defined(__STM32F1__) && ENABLED(ONBOARD_SDIO)
++  #include "../../HAL/STM32F1/sdio.h"
++#endif
+ 
+ #if ENABLED(BINARY_FILE_TRANSFER)
+   #include "../../sd/cardreader.h"
+@@ -110,6 +114,11 @@
+   #ifdef __STM32F1__
+     SERIAL_ECHOLNPGM("UART:overrun:", printerUartOverruns,
+       ",frame:", printerUartFrames, ",parity:", printerUartParity, ",full:", printerUartFull);
++  #endif
++  #if defined(__STM32F1__) && ENABLED(ONBOARD_SDIO)
++    SERIAL_ECHOLNPGM("SDIO:writes:", sdioWriteCalls,
++      ",transfer_ms:", sdioTransferUs / 1000,
++      ",busy_ms:", sdioBusyUs / 1000, ",max_busy_us:", sdioMaxBusyUs);
+   #endif
+ 
+   #if ENABLED(EXTENDED_CAPABILITIES_REPORT)

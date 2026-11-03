@@ -56,5 +56,7 @@ else
 fi
 
 CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_printer_rx_dma.py "$MARLIN" || fail=1
+CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_printer_crc.py "$MARLIN" || fail=1
+CXX="$CXX" python3 -B test_printer_sdio.py "$MARLIN" || fail=1
 
 exit $fail

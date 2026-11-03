@@ -1,0 +1,355 @@
+--- a/Marlin/src/HAL/STM32F1/MarlinSerial.h
++++ b/Marlin/src/HAL/STM32F1/MarlinSerial.h
+@@ -32,6 +32,56 @@
+ #define UART_IRQ_PRIO 1
+ 
+ extern volatile uint32_t printerUartOverruns, printerUartFrames, printerUartParity, printerUartFull;
++extern uint32_t printerUartDmaStarts;
++
++struct PrinterRxDmaCursor {
++  static constexpr uint16_t capacity = 1280;
++  volatile bool active = false;
++  uint16_t head = 0;
++  uint32_t consumed = 0;
++
++  void begin(volatile uint8_t *buffer, const uint16_t old_head, const uint16_t old_tail) {
++    const uint16_t pending = (old_tail + capacity - old_head) % capacity;
++    auto reverse = [&](uint16_t first, uint16_t last) {
++      while (first < last) {
++        const uint8_t byte = buffer[first];
++        buffer[first++] = buffer[--last];
++        buffer[last] = byte;
++      }
++    };
++    reverse(0, old_tail);
++    reverse(old_tail, capacity);
++    reverse(0, capacity);
++    head = pending ? capacity - pending : 0;
++    consumed = uint32_t(0) - pending;
++    active = true;
++  }
++
++  uint32_t available(const uint32_t produced) const { return produced - consumed; }
++
++  int peek(const volatile uint8_t *buffer, const uint32_t produced) const {
++    return available(produced) ? buffer[head] : -1;
++  }
++
++  int read(const volatile uint8_t *buffer, const uint32_t produced) {
++    const int byte = peek(buffer, produced);
++    if (byte >= 0) {
++      if (++head == capacity) head = 0;
++      ++consumed;
++    }
++    return byte;
++  }
++
++  bool end(const uint32_t produced, const uint16_t tail) {
++    const bool overflow = available(produced) >= capacity;
++    if (overflow) {
++      head = tail + 1 == capacity ? 0 : tail + 1;
++      consumed = produced - (capacity - 1);
++    }
++    active = false;
++    return overflow;
++  }
++};
+ 
+ struct MarlinSerial : public HardwareSerial {
+   MarlinSerial(struct usart_dev *usart_device, uint8 tx_pin, uint8 rx_pin) : HardwareSerial(usart_device, tx_pin, rx_pin) { }
+@@ -43,6 +93,7 @@
+     }
+ 
+     void begin(uint32 baud, uint8_t config) {
++      endRxDma();
+       HardwareSerial::begin(baud, config);
+       if (c_dev() == USART3) {
+         static uint8_t printer_rx[1280];
+@@ -51,6 +102,14 @@
+       nvic_irq_set_priority(c_dev()->irq_num, UART_IRQ_PRIO);
+     }
+   #endif
++
++  bool beginRxDma();
++  void endRxDma();
++  bool rxDmaActive() const;
++  int available() override;
++  int read() override;
++  int peek() override;
++  void end() { endRxDma(); HardwareSerial::end(); }
+ };
+ 
+ typedef Serial1Class<MarlinSerial> MSerialT;
+--- a/Marlin/src/HAL/STM32F1/MarlinSerial.cpp
++++ b/Marlin/src/HAL/STM32F1/MarlinSerial.cpp
+@@ -25,8 +25,119 @@
+ #include "../../inc/MarlinConfig.h"
+ #include "MarlinSerial.h"
+ #include <libmaple/usart.h>
++#include <libmaple/dma.h>
+ 
+ volatile uint32_t printerUartOverruns, printerUartFrames, printerUartParity, printerUartFull;
++uint32_t printerUartDmaStarts;
++
++static PrinterRxDmaCursor printerRxDma;
++static volatile uint32_t printerRxDmaProduced;
++static volatile bool printerRxDmaError;
++static uint32_t printerRxDmaCr1, printerRxDmaCr3;
++
++static void printer_rx_dma_irq() {
++  const uint8_t flags = dma_get_isr_bits(DMA1, DMA_CH3);
++  if (!(flags & (DMA_ISR_TCIF | DMA_ISR_TEIF))) return;
++  dma_clear_isr_bits(DMA1, DMA_CH3);
++  if (flags & DMA_ISR_TCIF) printerRxDmaProduced += PrinterRxDmaCursor::capacity;
++  if (flags & DMA_ISR_TEIF) {
++    printerRxDmaError = true;
++    USART3->regs->CR3 &= ~USART_CR3_DMAR;
++    dma_disable(DMA1, DMA_CH3);
++  }
++}
++
++static uint32_t printer_rx_dma_position(uint16_t &tail) {
++  uint16_t remaining;
++  do {
++    printer_rx_dma_irq();
++    remaining = dma_get_count(DMA1, DMA_CH3);
++  } while ((dma_get_isr_bits(DMA1, DMA_CH3) & DMA_ISR_TCIF)
++           || (!remaining && dma_is_enabled(DMA1, DMA_CH3)));
++  tail = remaining ? PrinterRxDmaCursor::capacity - remaining : 0;
++  return printerRxDmaProduced + tail;
++}
++
++bool MarlinSerial::rxDmaActive() const {
++  return this == static_cast<const MarlinSerial *>(&MSerial3) && printerRxDma.active;
++}
++
++bool MarlinSerial::beginRxDma() {
++  #if MB(MKS_ROBIN_NANO) && ENABLED(BINARY_FILE_TRANSFER) && !HAS_SPI_TFT && SPI_DEVICE != 1
++    if (c_dev() != USART3) return false;
++    if (printerRxDma.active) return true;
++    dma_init(DMA1);
++    if (dma_is_enabled(DMA1, DMA_CH3) || DMA1->handlers[DMA_CH3 - 1].handler) return false;
++    usart_reg_map * const regs = c_dev()->regs;
++    ring_buffer * const rb = c_dev()->rb;
++    nvic_irq_disable(c_dev()->irq_num);
++    printerRxDmaCr1 = regs->CR1 & (USART_CR1_RXNEIE | USART_CR1_PEIE);
++    printerRxDmaCr3 = regs->CR3 & USART_CR3_EIE;
++    regs->CR1 &= ~(USART_CR1_RXNEIE | USART_CR1_PEIE);
++    regs->CR3 &= ~USART_CR3_EIE;
++    printerRxDma.begin(rb->buf, rb->head, rb->tail);
++    printerRxDmaProduced = 0;
++    printerRxDmaError = false;
++    dma_setup_transfer(DMA1, DMA_CH3, &regs->DR, DMA_SIZE_8BITS, rb->buf, DMA_SIZE_8BITS,
++                       DMA_MINC_MODE | DMA_CIRC_MODE | DMA_TRNS_CMPLT | DMA_TRNS_ERR);
++    dma_set_num_transfers(DMA1, DMA_CH3, PrinterRxDmaCursor::capacity);
++    dma_set_priority(DMA1, DMA_CH3, DMA_PRIORITY_VERY_HIGH);
++    dma_clear_isr_bits(DMA1, DMA_CH3);
++    dma_attach_interrupt(DMA1, DMA_CH3, printer_rx_dma_irq);
++    dma_enable(DMA1, DMA_CH3);
++    regs->CR3 |= USART_CR3_DMAR;
++    nvic_irq_enable(c_dev()->irq_num);
++    printerUartDmaStarts++;
++    return true;
++  #else
++    return false;
++  #endif
++}
++
++void MarlinSerial::endRxDma() {
++  if (!rxDmaActive()) return;
++  const bool irq_enabled = !__get_primask();
++  nvic_globalirq_disable();
++  c_dev()->regs->CR3 &= ~USART_CR3_DMAR;
++  dma_disable(DMA1, DMA_CH3);
++  uint16_t tail;
++  const uint32_t produced = printer_rx_dma_position(tail);
++  if (printerRxDma.end(produced, tail)) ++printerUartFull;
++  c_dev()->rb->head = printerRxDma.head;
++  c_dev()->rb->tail = tail;
++  dma_detach_interrupt(DMA1, DMA_CH3);
++  dma_clear_isr_bits(DMA1, DMA_CH3);
++  c_dev()->regs->CR1 |= printerRxDmaCr1;
++  c_dev()->regs->CR3 |= printerRxDmaCr3;
++  if (irq_enabled) nvic_globalirq_enable();
++}
++
++int MarlinSerial::available() {
++  if (!rxDmaActive()) return HardwareSerial::available();
++  const bool irq_enabled = !__get_primask();
++  nvic_globalirq_disable();
++  uint16_t tail;
++  const uint32_t produced = printer_rx_dma_position(tail);
++  const uint32_t pending = printerRxDma.available(produced);
++  if (irq_enabled) nvic_globalirq_enable();
++  if (printerRxDmaError || pending >= PrinterRxDmaCursor::capacity) {
++    endRxDma();
++    return HardwareSerial::available();
++  }
++  return pending;
++}
++
++int MarlinSerial::peek() {
++  if (!rxDmaActive()) return HardwareSerial::peek();
++  return available() ? c_dev()->rb->buf[printerRxDma.head] : -1;
++}
++
++int MarlinSerial::read() {
++  if (!rxDmaActive()) return HardwareSerial::read();
++  const int pending = available();
++  if (!rxDmaActive()) return HardwareSerial::read();
++  return printerRxDma.read(c_dev()->rb->buf, printerRxDma.consumed + pending);
++}
+ 
+ // Copied from ~/.platformio/packages/framework-arduinoststm32-maple/STM32F1/system/libmaple/usart_private.h
+ // Changed to handle Emergency Parser
+@@ -44,7 +155,8 @@
+     if (srflags & USART_SR_PE) printerUartParity++;
+   }
+ 
+-  if ((cr1its & USART_CR1_RXNEIE) && (srflags & USART_SR_RXNE)) {
++  const bool rx_dma = serial.rxDmaActive();
++  if (!rx_dma && (cr1its & USART_CR1_RXNEIE) && (srflags & USART_SR_RXNE)) {
+     if (srflags & USART_SR_FE || srflags & USART_SR_PE ) {
+       // framing error or parity error
+       regs->DR; // Read and throw away the data, which also clears FE and PE
+@@ -66,7 +178,7 @@
+       #endif
+     }
+   }
+-  else if (srflags & USART_SR_ORE) {
++  else if (!rx_dma && (srflags & USART_SR_ORE)) {
+     // overrun and empty data, just do a dummy read to clear ORE
+     // and prevent a raise condition where a continuous interrupt stream (due to ORE set) occurs
+     // (see chapter "Overrun error" ) in STM32 reference manual
+--- a/Marlin/src/gcode/sd/M28_M29.cpp
++++ b/Marlin/src/gcode/sd/M28_M29.cpp
+@@ -48,8 +48,19 @@
+ 
+     // Binary transfer mode
+     if ((card.flag.binary_mode = binary_mode)) {
++      TERN_(HAS_MULTI_SERIAL, card.transfer_port_index = queue.ring_buffer.command_port().index);
++      #ifdef __STM32F1__
++        const int8_t port = card.transfer_port_index.index;
++        if ((SERIAL_PORT == 3 && port == 0)
++            #ifdef SERIAL_PORT_2
++              || (SERIAL_PORT_2 == 3 && port == 1)
++            #endif
++            #ifdef SERIAL_PORT_3
++              || (SERIAL_PORT_3 == 3 && port == 2)
++            #endif
++        ) MSerial3.beginRxDma();
++      #endif
+       SERIAL_ECHO_MSG("Switching to Binary Protocol");
+-      TERN_(HAS_MULTI_SERIAL, card.transfer_port_index = queue.ring_buffer.command_port().index);
+     }
+     else
+       card.openFileWrite(p);
+--- a/Marlin/src/feature/binary_stream.h
++++ b/Marlin/src/feature/binary_stream.h
+@@ -39,6 +39,12 @@
+   return SERIAL_IMPL.read(index);
+ }
+ 
++inline void bs_restore_serial() {
++  #ifdef __STM32F1__
++    MSerial3.endRxDma();
++  #endif
++}
++
+ class SDFileTransferProtocol  {
+ private:
+   struct Packet {
+@@ -110,6 +116,7 @@
+   }
+ 
+   static bool file_close() {
++    bs_restore_serial();
+     if (!dummy_transfer) {
+       #if ENABLED(BINARY_STREAM_COMPRESSION)
+         // flush any buffered data
+@@ -127,6 +134,7 @@
+   }
+ 
+   static void transfer_abort() {
++    bs_restore_serial();
+     if (!dummy_transfer) {
+       card.closefile();
+       card.removeFile(card.filename);
+@@ -187,6 +195,7 @@
+               break;
+             }
+           }
++          bs_restore_serial();
+           SERIAL_ECHOLNPGM("PFT:fail");
+         }
+         break;
+@@ -209,7 +218,10 @@
+           processUs += spent;
+           if (spent > maxProcessUs) maxProcessUs = spent;
+           writePackets++;
+-          if (!good) SERIAL_ECHOLNPGM("PFT:ioerror");
++          if (!good) {
++            bs_restore_serial();
++            SERIAL_ECHOLNPGM("PFT:ioerror");
++          }
+         }
+         break;
+       case FileTransfer::ABORT:
+@@ -364,7 +376,7 @@
+                 else
+                   stream_state = StreamState::PACKET_PROCESS;
+               }
+-              else if (packet.header.sync == sync - 1) {           // ok response must have been lost
++              else if (packet.header.sync == uint8_t(sync - 1)) {
+                 SERIAL_ECHOLNPGM("ok", packet.header.sync);  // transmit valid packet received and drop the payload
+                 stream_state = StreamState::PACKET_RESET;
+               }
+@@ -426,6 +438,7 @@
+           dispatch();
+           if (delayed_ack) SERIAL_ECHOLNPGM("ok", packet.header.sync);
+           stream_state = StreamState::PACKET_RESET;
++          if (!card.flag.binary_mode) return;
+           break;
+         }
+         case StreamState::PACKET_RESEND:
+@@ -439,10 +452,12 @@
+             stream_state = StreamState::PACKET_ERROR;
+           break;
+         case StreamState::PACKET_TIMEOUT:
++          bs_restore_serial();
+           SERIAL_ECHO_MSG("Datastream timeout");
+           stream_state = StreamState::PACKET_RESEND;
+           break;
+         case StreamState::PACKET_ERROR:
++          bs_restore_serial();
+           SERIAL_ECHOLNPGM("fe", packet.header.sync);
+           reset(); // reset everything, resync required
+           stream_state = StreamState::PACKET_RESET;
+@@ -458,6 +473,7 @@
+       case Protocol::CONTROL:
+         switch (static_cast<ProtocolControl>(packet.header.type())) {
+           case ProtocolControl::CLOSE: // revert back to ASCII mode
++            bs_restore_serial();
+             card.flag.binary_mode = false;
+             break;
+           default:
+@@ -473,6 +489,7 @@
+   }
+ 
+   void idle() {
++    if (ELAPSED(millis(), packet.timeout)) bs_restore_serial();
+     // Some Protocols may need periodic updates without new data
+     SDFileTransferProtocol::idle();
+   }
+--- a/Marlin/src/gcode/host/M115.cpp
++++ b/Marlin/src/gcode/host/M115.cpp
+@@ -113,7 +113,8 @@
+   #endif
+   #ifdef __STM32F1__
+     SERIAL_ECHOLNPGM("UART:overrun:", printerUartOverruns,
+-      ",frame:", printerUartFrames, ",parity:", printerUartParity, ",full:", printerUartFull);
++      ",frame:", printerUartFrames, ",parity:", printerUartParity, ",full:", printerUartFull,
++      ",dma_starts:", printerUartDmaStarts);
+   #endif
+   #if defined(__STM32F1__) && ENABLED(ONBOARD_SDIO)
+     SERIAL_ECHOLNPGM("SDIO:writes:", sdioWriteCalls,
