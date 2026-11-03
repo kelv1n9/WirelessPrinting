@@ -268,7 +268,7 @@ static void drain() {
 // reads still goes through the parser, so a reply is never lost to the state.
 // Asks the printer what is on its card and fills the index from the answer. The card is
 // released after every binary transfer, so M21 goes first every time.
-static bool askPrinterCard();
+static bool askPrinterCard(const bool bins = false);
 
 static String say(const String line) {
   if (sender.running())
@@ -608,14 +608,14 @@ static bool settleWire() {
   return false;
 }
 
-static bool askPrinterCard() {
+static bool askPrinterCard(const bool bins) {
   if (sender.running())
     return false;
   if (!settleWire())
     return false;
   say("M21");
-  printerCard.begin();
-  say("M20 L");
+  printerCard.begin(bins);
+  say(bins ? "M20 F L" : "M20 L");
   return printerCard.complete();
 }
 
@@ -1660,7 +1660,7 @@ void loop() {
       choreTrouble = sender.trouble ? sender.trouble : "the transfer did not finish";
       chore = ChoreFailed;
     }
-    else if (!askPrinterCard()) {
+    else if (!askPrinterCard(!worthPacking(choreTarget))) {
       choreTrouble = "the printer did not answer with a listing";
       chore = ChoreFailed;
     }

@@ -321,6 +321,24 @@ int main() {
     check(pick.waiting == 0, "nor counted as waiting");
   }
 
+  scenario = "firmware listing checks the exact binary name and size";
+  {
+    PrinterCard card;
+    card.begin(true);
+    card.observe("Begin file list");
+    card.observe("ROBIN_~1.BIN 298524 Robin_nano.bin");
+    card.observe("End file list");
+    check(card.complete(), "firmware listing completed");
+    check(card.holds("Robin_nano.bin", 298524), "the full image is present");
+    check(!card.holds("Robin_nano.bin", 298523), "a short image is refused");
+    check(!card.holds("other.bin", 298524), "a different image is refused");
+    card.begin();
+    card.observe("Begin file list");
+    card.observe("ROBIN_~1.BIN 298524 Robin_nano.bin");
+    card.observe("End file list");
+    check(!card.holds("Robin_nano.bin", 298524), "normal gcode listing still excludes binaries");
+  }
+
   // ------------------------------------------------- more files than there are slots
   scenario = "more files than slots";
   {

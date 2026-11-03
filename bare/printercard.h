@@ -58,7 +58,8 @@ class PrinterCard {
 public:
   // Called the moment "M20 L" goes out, and again by "Begin file list" itself, so a
   // second listing cannot be mistaken for more of the first one.
-  void begin() {
+  void begin(const bool includeBin = false) {
+    bins_ = includeBin;
     held = filling = 0;
     rejected_ = skipped_ = dropped_ = oversize_ = 0;
     listing_ = complete_ = false;
@@ -81,7 +82,7 @@ public:
       line[--n] = 0;
 
     if (!strcmp(line, "Begin file list")) {
-      begin();
+      begin(bins_);
       listing_ = true;
       return true;
     }
@@ -126,6 +127,7 @@ private:
   uint8_t held = 0, filling = 0;
   uint16_t rejected_ = 0, skipped_ = 0, dropped_ = 0, oversize_ = 0;
   bool listing_ = false, complete_ = false;
+  bool bins_ = false;
 
   // "<8.3 name> <size>" and, because we always ask with L, " <long name>" after it.
   // Anything that is not exactly that shape is thrown away whole. A listing full of
@@ -190,7 +192,10 @@ private:
     dos[dosLen] = 0;
 
     // Without the L the printer sends no long name, so the short one has to answer for it
-    if (!printerCardIsGcode(longName ? longName : dos)) {
+    const char *listed = longName ? longName : dos;
+    const char *extension = strrchr(listed, '.');
+    if (bins_ ? (!extension || !printerCardSame(extension, ".bin"))
+              : !printerCardIsGcode(listed)) {
       skipped_++;
       return;
     }
