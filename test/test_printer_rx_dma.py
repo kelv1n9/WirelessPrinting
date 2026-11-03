@@ -1,4 +1,5 @@
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -202,5 +203,5 @@ with tempfile.TemporaryDirectory(prefix='printer-rx-dma-check-') as tmp:
     cpp = Path(tmp) / 'check.cpp'
     exe = Path(tmp) / 'check'
     cpp.write_text(program)
-    subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++14', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', str(cpp), '-o', str(exe)], check=True)
+    subprocess.run([os.environ.get('CXX', 'c++')] + shlex.split(os.environ.get('CXXFLAGS', '')) + ['-std=c++14', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
