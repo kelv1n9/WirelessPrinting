@@ -37,6 +37,13 @@ static uint32_t nextTry;
 static volatile uint32_t piecesIn, piecesDropped, acksSent, worstAckMs, worstGapMs, pourFails;
 static volatile bool workerHasBot;      // the Worker said it holds a bot token
 
+// One Yandex request at a time, answered straight from the socket's task so that an
+// upload being poured in by the other task cannot hold the answer up.
+static SemaphoreHandle_t yandexAnswered;
+static volatile uint32_t yandexAsked;
+static String yandexBody;
+static int yandexCode;
+
 static const char *FORWARD[] = {"Content-Type", "Cache-Control", "WWW-Authenticate",
                                 "Location", "Content-Disposition"};
 
@@ -141,6 +148,17 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
   memcpy(assembling + e->payload_offset, e->data_ptr, e->data_len);
   if (e->payload_offset + e->data_len >= e->payload_len) {
     assembling[e->payload_len] = 0;
+    if (!strncmp(assembling, "{\"t\":\"yxr\"", 10)) {
+      DynamicJsonDocument doc(e->payload_len + 256);
+      if (!deserializeJson(doc, assembling) && (uint32_t)(doc["q"] | 0) == yandexAsked) {
+        yandexCode = doc["s"] | 0;
+        yandexBody = (const char *)(doc["b"] | "");
+        xSemaphoreGive(yandexAnswered);
+      }
+      free(assembling);
+      assembling = nullptr;
+      return;
+    }
     if (xQueueSend(inbox, &assembling, 0) != pdTRUE)
       free(assembling);
     assembling = nullptr;
@@ -167,6 +185,32 @@ static void answer(uint32_t id, int status, const char *message) {
 }
 
 bool relayCarriesTelegram() { return connected && workerHasBot; }
+
+bool relayYandexReady() { return connected; }
+
+bool relayYandexCall(const String &path, const String &payload, const String &bearer,
+                     String &body, int &code) {
+  static uint32_t asked;
+  xSemaphoreTake(yandexAnswered, 0);              // nothing left over from a late answer
+  yandexAsked = ++asked;
+  DynamicJsonDocument doc(512 + payload.length() + bearer.length());
+  doc["t"] = "yx";
+  doc["q"] = yandexAsked;
+  doc["p"] = path;
+  doc["b"] = payload;
+  doc["a"] = bearer;
+  String out;
+  serializeJson(doc, out);
+  doc.clear();
+  sendText(out);
+  out = String();
+  if (xSemaphoreTake(yandexAnswered, pdMS_TO_TICKS(20000)) != pdTRUE)
+    return false;
+  code = yandexCode;
+  body = yandexBody;
+  yandexBody = String();
+  return true;
+}
 
 void relaySendTelegram(const String &chat, const String &text) {
   DynamicJsonDocument doc(text.length() + 128);
@@ -378,6 +422,7 @@ static void stopSocket() {
 void relayBegin() {
   loadSettings();
   inbox = xQueueCreate(6, sizeof(char *));
+  yandexAnswered = xSemaphoreCreateBinary();
   bodies = xQueueCreate(RELAY_BODY_PIECES, sizeof(Piece));
   freeSlots = xQueueCreate(RELAY_BODY_PIECES, sizeof(uint8_t));
   for (uint8_t i = 0; i < RELAY_BODY_PIECES; i++)

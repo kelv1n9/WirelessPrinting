@@ -11,6 +11,14 @@ extern SemaphoreHandle_t tlsGate;   // Shared with the bot: one encrypted connec
 extern volatile bool tlsWanted;
 
 #define YANDEX_HOST      "https://api.iot.yandex.net"
+
+// Supplied by the bare firmware's relay. With the relay up the module has one encrypted
+// connection already, to the Worker, and a second one for Yandex (60 KB to shake hands)
+// does not fit beside it, so the request goes down that one and the Worker makes it.
+bool relayYandexReady() __attribute__((weak));
+bool relayYandexCall(const String &path, const String &payload, const String &bearer,
+                     String &body, int &code) __attribute__((weak));
+bool relayConfigured() __attribute__((weak));
 #define YANDEX_TASK_STACK 10240
 #define YANDEX_TIMEOUT    15000
 #define YANDEX_BLOCK_FLOOR 20000
@@ -80,7 +88,9 @@ void YandexHome::begin() {
 
   status = token == "" ? "no token" : "idle";
 
-  xTaskCreatePinnedToCore(run, "yandex", YANDEX_TASK_STACK, NULL, 1, &task, 0);
+  // Its own handshake needs the big stack; through the relay it only waits for an answer
+  const bool relayed = relayConfigured && relayConfigured();
+  xTaskCreatePinnedToCore(run, "yandex", relayed ? 6144 : YANDEX_TASK_STACK, NULL, 1, &task, 0);
 }
 
 bool YandexHome::hasToken() {
@@ -185,6 +195,21 @@ bool YandexHome::call(const String path, const String payload, String &body) {
     Guard guard(mutex);
     status = "no network";
     return false;
+  }
+
+  if (relayConfigured && relayConfigured()) {
+    int code = 0;
+    const bool got = relayYandexReady() && relayYandexCall(path, payload, bearer, body, code);
+    Guard guard(mutex);
+    if (!got)
+      status = "no answer through the relay";
+    else if (code == 401 || code == 403)
+      status = "token rejected, code " + String(code);
+    else if (code != 200)
+      status = "HTTP " + String(code);
+    else
+      status = "ok";
+    return got && code == 200;
   }
 
   // The same floor the bot keeps: a handshake started without room for its buffers

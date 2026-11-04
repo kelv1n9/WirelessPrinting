@@ -416,6 +416,22 @@ export class Relay {
     if (typeof message === "string") {
       let m;
       try { m = JSON.parse(message); } catch { return; }
+      if (m.t === "yx") {
+        // A request the module would make to Yandex itself if it had the memory for a
+        // second encrypted connection. Its own token comes with it and is not kept or
+        // written anywhere here.
+        let status = 0, text = "";
+        if (typeof m.p === "string" && m.p.startsWith("/v1.0/") && typeof m.a === "string") {
+          const r = await fetch("https://api.iot.yandex.net" + m.p, {
+            method: m.b ? "POST" : "GET",
+            headers: m.b ? { authorization: m.a, "content-type": "application/json" } : { authorization: m.a },
+            body: m.b || undefined,
+          }).catch(() => null);
+          if (r) { status = r.status; text = await r.text().catch(() => ""); }
+        }
+        try { ws.send(JSON.stringify({ t: "yxr", q: m.q, s: status, b: text })); } catch (e) {}
+        return;
+      }
       if (m.t === "tgfetch") {
         if (this.env.TELEGRAM_TOKEN && m.c && m.id && m.route && m.token)
           await this.fetchForModule(m);

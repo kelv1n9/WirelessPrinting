@@ -1686,8 +1686,8 @@ void setup() {
     autoPowerOff = settings.getBool("autooff", false);
     settings.end();
   }
+  relayBegin();                      // first: the bot and Yandex size their stacks by whether the relay is set up
   yandexHome.begin();
-  relayBegin();                      // first: the bot sizes its stack by whether the relay is set up
   telegramBot.begin();
   {
     Preferences keep;
