@@ -211,6 +211,14 @@ export class Relay {
         const device = await this.waitForDevice(RECONNECT_WAIT_MS);
         if (!device) break;
         last = await this.sendBody(device, method, path, headers, body);
+        // A firmware image that went down whole and then lost the module is a flash that
+        // worked: the module reboots before its answer is out. Sending it again only
+        // met the new firmware with yesterday's credentials.
+        if (last.lost && last.sentAll && path.startsWith("/update")) {
+          this.note(`all of ${path} went down and the module dropped away, taken as flashed`);
+          return { status: 200, headers: { "content-type": "text/plain" },
+                   body: new TextEncoder().encode("Sent whole; the module dropped away to reboot, which is what a good flash does. Check /api/status in a minute.\n") };
+        }
         if (!last.lost && last.status !== 502 && last.status !== 504) break;
         this.note(`attempt ${attempt} of ${path} did not get through (${last.lost ? "lost" : last.status}), ${attempt < UPLOAD_ATTEMPTS ? "trying again" : "giving up"}`);
       }
@@ -317,6 +325,7 @@ export class Relay {
       const w = { collect: [], credit: inFlight, inFlight, wake: null, t0: Date.now(), sentPieces: 0, timer: null, finished: false };
       w.finish = (result) => {
         if (w.finished) return;
+        if (result.lost) result.sentAll = w.sentPieces * CHUNK >= body.length;
         w.finished = true;
         clearTimeout(w.timer);
         this.waiting.delete(id);

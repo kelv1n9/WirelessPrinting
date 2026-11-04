@@ -82,11 +82,11 @@ while :; do
   read -r version printing up block slot <<< "$(status)"
   echo "$(stamp)    back, largest free block $block; sending the image"
 
-  answer=$(r -H "Expect:" --max-time 1500 -w "|%{http_code}|%{time_total}" \
+  answer=$(r -H "Expect:" --max-time 1500 -o "$WORK/answer" -w "%{http_code} %{time_total}" \
              -F "firmware=@$WORK/firmware.bin" "$RELAY/update")
-  code=$(echo "$answer" | awk -F'|' '{print $(NF-1)}')
-  took=$(echo "$answer" | awk -F'|' '{print $NF}')
-  said=$(echo "$answer" | awk -F'|' '{print $1}' | tr -d '\n' | cut -c1-160)
+  code=${answer%% *}
+  took=${answer##* }
+  said=$(tr '\n' ' ' < "$WORK/answer" | sed 's/<[^>]*>//g' | cut -c1-160)
   echo "$(stamp)    answer $code after ${took%.*}s: $said"
 
   if [ "$code" = 200 ]; then
