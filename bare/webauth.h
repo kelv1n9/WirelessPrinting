@@ -32,6 +32,7 @@
 // is registered through.
 WebServer server(80);
 extern volatile uint32_t loopBeat;
+extern volatile bool uploadActive;
 
 static String webAuthPassword, webAuthApiKey, webAuthNonce;
 
@@ -229,6 +230,8 @@ inline void route(const char *uri, const HTTPMethod method,
                   WebServer::THandlerFunction fn, WebServer::THandlerFunction upload) {
   server.on(uri, method, [fn]() { if (webAuthLets()) fn(); }, [upload]() {
     loopBeat = millis();          // a long upload is one call of the loop, and not a hang
+    const int phase = server.upload().status;
+    uploadActive = phase == UPLOAD_FILE_START || phase == UPLOAD_FILE_WRITE;
     static bool letting = false;
     if (server.upload().status == UPLOAD_FILE_START)
       letting = webAuthAllows();

@@ -23,6 +23,7 @@ const SILENT_GIVE_UP_MS = 10000;
 const ANSWER_TIMEOUT_MS = 30000;
 const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match", "x-relay-once"];
 const LOST = Symbol("lost");
+const CACHED = new Set(["/api/status", "/printer/send/status"]);
 const wentAway = () => new Response("The printer module went away.\n", { status: 503 });
 
 export default {
@@ -69,6 +70,8 @@ export class Relay {
     this.waiting = new Map();
     this.bodies = Promise.resolve();      // one body at a time, or their chunks would interleave
     this.trail = [];
+    this.cache = new Map();
+    this.uploading = 0;
   }
 
   note(text) {
@@ -179,6 +182,26 @@ export class Relay {
       if (v) headers[name] = v;
     }
 
+    // While a file is going down the module's web server is busy with it and answers
+    // nothing else, so the page would see every poll time out and the module look dead.
+    // The status it last gave is handed out instead, and the rest is told to wait.
+    if (!hasBody && this.uploading > 0) {
+      const cached = this.cache.get(url.pathname);
+      if (cached) {
+        const h = new Headers(cached.headers || {});
+        h.set("x-relay-cached", "uploading");
+        return new Response(cached.body, { status: 200, headers: h });
+      }
+      return new Response("The module is busy taking a file. Try again when it is done.\n",
+                          { status: 503, headers: { "retry-after": "5" } });
+    }
+    if (!hasBody && CACHED.has(url.pathname)) {
+      const last = await this.sendBody(ws, request.method, url.pathname + url.search, headers, new Uint8Array(0));
+      if (last.lost) return wentAway();
+      if (last.status === 200) this.cache.set(url.pathname, last);
+      return new Response(last.body, { status: last.status, headers: new Headers(last.headers || {}) });
+    }
+
     if (!hasBody) {
       // Asked again once if the socket went away before any answer came: the module
       // reconnects in seconds, and a browser would otherwise show the error page.
@@ -206,6 +229,8 @@ export class Relay {
   // whole answer, or null when it never got through.
   deliver(method, path, headers, body) {
     const turn = this.bodies.then(async () => {
+      this.uploading++;
+      try {
       let last = null;
       for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
         const device = await this.waitForDevice(RECONNECT_WAIT_MS);
@@ -223,6 +248,9 @@ export class Relay {
         this.note(`attempt ${attempt} of ${path} did not get through (${last.lost ? "lost" : last.status}), ${attempt < UPLOAD_ATTEMPTS ? "trying again" : "giving up"}`);
       }
       return last && !last.lost ? last : null;
+      } finally {
+        this.uploading--;
+      }
     });
     this.bodies = turn.catch(() => {});
     return turn;

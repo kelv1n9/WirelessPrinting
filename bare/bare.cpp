@@ -24,6 +24,8 @@ SemaphoreHandle_t tlsGate;
 volatile bool tlsWanted;
 
 volatile uint32_t loopBeat;
+volatile bool uploadActive;
+static String lastRestart;      // why the guardian last restarted the module, read back from NVS
 static void guardian(void *);
 #include "ota.h"
 
@@ -904,6 +906,7 @@ void setup() {
 
     j += ",\"system\":{\"machine\":\"" + String(machine[0] ? machine : "KP3S") + "\"";
     j += ",\"resetReason\":" + String((int)esp_reset_reason());
+    j += ",\"guardianRestart\":\"" + lastRestart + "\"";
     j += ",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100);
     j += ",\"version\":\"" SKETCH_VERSION "\"}";
 
@@ -1684,6 +1687,13 @@ void setup() {
   yandexHome.begin();
   telegramBot.begin();
   relayBegin();
+  {
+    Preferences keep;
+    keep.begin("guard", false);
+    lastRestart = keep.getString("why", "");
+    keep.remove("why");
+    keep.end();
+  }
   loopBeat = millis();
   xTaskCreatePinnedToCore(guardian, "guardian", 3072, nullptr, 2, nullptr, 0);
   {
@@ -1892,7 +1902,15 @@ static void handleTelegram() {
 #define GUARD_LOOP_MS     60000
 #define GUARD_RELAY_MS    300000
 #define GUARD_BLOCK_FLOOR 6144
-#define GUARD_BLOCK_MS    120000
+#define GUARD_BLOCK_MS    300000
+
+static void guardianRestart(const char *why) {
+  Preferences keep;
+  keep.begin("guard", false);
+  keep.putString("why", why);
+  keep.end();
+  esp_restart();
+}
 
 static void guardian(void *) {
   uint32_t relayDownSince = 0, lowSince = 0;
@@ -1902,7 +1920,7 @@ static void guardian(void *) {
     if (otaActive.load())
       continue;
     if (now - loopBeat > GUARD_LOOP_MS)
-      esp_restart();
+      guardianRestart("the loop stood still for a minute");
 
     const bool relayWanted = relayConfigured() && webAuthSet() && WiFi.status() == WL_CONNECTED;
     if (!relayWanted || relayState() == "connected")
@@ -1910,14 +1928,17 @@ static void guardian(void *) {
     else if (!relayDownSince)
       relayDownSince = now;
     else if (now - relayDownSince > GUARD_RELAY_MS)
-      esp_restart();
+      guardianRestart("the relay was down for five minutes");
 
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= GUARD_BLOCK_FLOOR)
+    // An upload breaks the heap into small pieces for as long as it runs and gives
+    // them back at the end. Counting that as a hang restarted the module two minutes
+    // into every long upload through the relay.
+    if (uploadActive || heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= GUARD_BLOCK_FLOOR)
       lowSince = 0;
     else if (!lowSince)
       lowSince = now;
     else if (now - lowSince > GUARD_BLOCK_MS)
-      esp_restart();
+      guardianRestart("the largest free block stayed under 6 KB for five minutes");
   }
 }
 
