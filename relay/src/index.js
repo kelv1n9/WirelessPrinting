@@ -115,6 +115,12 @@ export class Relay {
       return new Response("ok");
     }
 
+    // A large answer coming back up the socket hangs the module (seen 04.11.2026: a
+    // 200 KB download stopped after 2 KB and the module needed a power cycle). Closed
+    // here until the module side is fixed and can be flashed.
+    if (url.pathname === "/download")
+      return new Response("Downloading files through the relay is switched off for now.\n", { status: 501 });
+
     const ws = this.device();
     if (!ws)
       return new Response("The printer module is not connected right now.\n",
