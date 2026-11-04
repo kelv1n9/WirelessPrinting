@@ -31,8 +31,15 @@
 // The one server, declared here because the guard below is what every route
 // is registered through.
 WebServer server(80);
+extern volatile uint32_t loopBeat;
 
 static String webAuthPassword, webAuthApiKey, webAuthNonce;
+
+// A pass for a file sent to the Telegram bot. The Worker fetches it from Telegram and
+// carries it down, and needs to get past the password to do so without ever being
+// given the password or the slicer's key. One at a time, ten minutes.
+static String webAuthOnceToken;
+static uint32_t webAuthOnceUntil;
 
 inline bool webAuthSet() { return webAuthPassword != ""; }
 inline const String &webAuthKey() { return webAuthApiKey; }
@@ -129,6 +136,9 @@ static bool webAuthAllows() {
   if (webAuthApiKey != "" && server.hasHeader("X-Api-Key")
       && server.header("X-Api-Key") == webAuthApiKey)
     return true;
+  if (webAuthOnceToken != "" && (int32_t)(webAuthOnceUntil - millis()) > 0 &&
+      server.hasHeader("X-Relay-Once") && server.header("X-Relay-Once") == webAuthOnceToken)
+    return true;
   if (!server.hasHeader("Authorization"))
     return false;
   String said = server.header("Authorization");
@@ -150,6 +160,12 @@ static bool webAuthLets() {
       "<p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. "
       "Reload the page to try again.</p>"));
   return false;
+}
+
+inline String webAuthMakeOnce() {
+  webAuthOnceToken = webAuthInvent(32);
+  webAuthOnceUntil = millis() + 600000;
+  return webAuthOnceToken;
 }
 
 inline void webAuthSetPassword(const String &chosen) {
@@ -186,12 +202,18 @@ inline void webAuthBegin() {
     webAuthApiKey = webAuthInvent(WEBAUTH_KEY_LEN);
     keep.putString("key", webAuthApiKey);
   }
+  // Kept across reboots: the relay sends an upload again if it broke off, with the
+  // answer it already worked out, and a nonce made fresh at every boot turned the second
+  // try into a 401 whenever the first had ended in a restart.
+  webAuthNonce = keep.getString("nonce", "");
+  if (webAuthNonce.length() != 32) {
+    webAuthNonce = webAuthInvent(32);
+    keep.putString("nonce", webAuthNonce);
+  }
   keep.end();
 
-  webAuthNonce = webAuthInvent(32);
-
-  static const char *wanted[] = {"X-Api-Key"};
-  server.collectHeaders(wanted, 1);
+  static const char *wanted[] = {"X-Api-Key", "X-Relay-Once"};
+  server.collectHeaders(wanted, 2);
 }
 
 // Every route goes on through here, so there is nothing to remember per route. The
@@ -206,6 +228,7 @@ inline void route(const char *uri, const HTTPMethod method,
 inline void route(const char *uri, const HTTPMethod method,
                   WebServer::THandlerFunction fn, WebServer::THandlerFunction upload) {
   server.on(uri, method, [fn]() { if (webAuthLets()) fn(); }, [upload]() {
+    loopBeat = millis();          // a long upload is one call of the loop, and not a hang
     static bool letting = false;
     if (server.upload().status == UPLOAD_FILE_START)
       letting = webAuthAllows();

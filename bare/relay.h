@@ -14,3 +14,5 @@ void relayForget();
 String relayUrl();
 String relayState();
 String relayStats();
+void relaySendTelegramFetch(const String &chat, const String &fileId, const String &route,
+                           const String &field, const String &name, const String &token);

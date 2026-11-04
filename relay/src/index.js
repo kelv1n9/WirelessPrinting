@@ -17,10 +17,13 @@ const UPLOAD_LIMIT = 64 * 1024 * 1024;
 const CHUNK = 2040;                       // plus four bytes of number, one module buffer
 const IN_FLIGHT = 5;                      // one fewer than the module has slots for pieces
 const ACK_GRACE_MS = 4000;
+const UPLOAD_ATTEMPTS = 3;
+const RECONNECT_WAIT_MS = 90000;
 const SILENT_GIVE_UP_MS = 10000;
-const ERASE_PAUSE_MS = 15000;             // the firmware route erases a whole flash slot first
 const ANSWER_TIMEOUT_MS = 30000;
-const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match"];
+const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match", "x-relay-once"];
+const LOST = Symbol("lost");
+const wentAway = () => new Response("The printer module went away.\n", { status: 503 });
 
 export default {
   async fetch(request, env) {
@@ -75,8 +78,8 @@ export class Relay {
   }
 
   device() {
-    const all = this.state.getWebSockets("device");
-    return all.length ? all[all.length - 1] : null;
+    const open = this.state.getWebSockets("device").filter((ws) => ws.readyState === 1);
+    return open.length ? open[open.length - 1] : null;
   }
 
   async fetch(request) {
@@ -133,9 +136,11 @@ export class Relay {
       const m = update && update.message;
       const ws = this.device();
       if (m && ws) {
-        const text = m.text || (m.document ? "/__document" : "");
-        if (text)
-          ws.send(JSON.stringify({ t: "tg", c: String(m.chat.id), x: text }));
+        if (m.document)
+          ws.send(JSON.stringify({ t: "tgdoc", c: String(m.chat.id), id: m.document.file_id,
+                                   name: m.document.file_name || "file", size: m.document.file_size || 0 }));
+        else if (m.text)
+          ws.send(JSON.stringify({ t: "tg", c: String(m.chat.id), x: m.text }));
       }
       return new Response("ok");
     }
@@ -174,86 +179,196 @@ export class Relay {
       if (v) headers[name] = v;
     }
 
+    if (!hasBody) {
+      // Asked again once if the socket went away before any answer came: the module
+      // reconnects in seconds, and a browser would otherwise show the error page.
+      for (let attempt = 1; ; attempt++) {
+        const device = attempt === 1 ? ws : await this.waitForDevice(20000);
+        if (!device) break;
+        const answer = await this.carry(device, request.method, url.pathname + url.search, headers);
+        if (answer !== LOST || attempt >= 2) return answer === LOST ? wentAway() : answer;
+      }
+      return wentAway();
+    }
+
+    // A body is sent again if it did not get through: an upload overwrites the same
+    // file and a firmware image starts over, so trying twice is harmless, and a print
+    // asked for alongside starts only once the whole file has landed.
+    const last = await this.deliver(request.method, url.pathname + url.search, headers, buffered);
+    if (!last)
+      return new Response("The upload did not get through the relay. Try again.\n", { status: 503 });
+    const h = new Headers(last.headers || {});
+    h.set("x-robots-tag", "noindex");
+    return new Response(last.body, { status: last.status, headers: h });
+  }
+
+  // A body, tried up to three times, one body at a time. Resolves with the module's
+  // whole answer, or null when it never got through.
+  deliver(method, path, headers, body) {
+    const turn = this.bodies.then(async () => {
+      let last = null;
+      for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
+        const device = await this.waitForDevice(RECONNECT_WAIT_MS);
+        if (!device) break;
+        last = await this.sendBody(device, method, path, headers, body);
+        if (!last.lost && last.status !== 502 && last.status !== 504) break;
+        this.note(`attempt ${attempt} of ${path} did not get through (${last.lost ? "lost" : last.status}), ${attempt < UPLOAD_ATTEMPTS ? "trying again" : "giving up"}`);
+      }
+      return last && !last.lost ? last : null;
+    });
+    this.bodies = turn.catch(() => {});
+    return turn;
+  }
+
+  async telegram(method, payload) {
+    const r = await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => null);
+    return r ? r.json().catch(() => ({})) : {};
+  }
+
+  // The module has looked at a file sent to the bot and said where it goes. Telegram
+  // hands files only to whoever holds the bot token, and the module cannot afford the
+  // second encrypted connection, so the file is fetched here and carried down.
+  async fetchForModule(m) {
+    const say = (text) => this.telegram("sendMessage", { chat_id: m.c, text });
+    const started = Date.now();
+    const info = await this.telegram("getFile", { file_id: m.id });
+    const filePath = info && info.result && info.result.file_path;
+    if (!filePath) return say("Telegram would not say where that file is. Send it again.");
+    const got = await fetch(`https://api.telegram.org/file/bot${this.env.TELEGRAM_TOKEN}/${filePath}`).catch(() => null);
+    if (!got || !got.ok) return say("Telegram would not hand the file over. Send it again.");
+    const file = new Uint8Array(await got.arrayBuffer());
+
+    const boundary = "kp3s" + crypto.randomUUID().replace(/-/g, "");
+    const safeName = String(m.name).replace(/["\r\n]/g, "_");
+    const head = new TextEncoder().encode(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${m.field}"; filename="${safeName}"\r\n` +
+      `Content-Type: application/octet-stream\r\n\r\n`);
+    const tail = new TextEncoder().encode(`\r\n--${boundary}--\r\n`);
+    const body = new Uint8Array(head.length + file.length + tail.length);
+    body.set(head, 0); body.set(file, head.length); body.set(tail, head.length + file.length);
+
+    const answer = await this.deliver("POST", m.route, {
+      "content-type": `multipart/form-data; boundary=${boundary}`,
+      "x-relay-once": m.token,
+    }, body);
+    const seconds = Math.round((Date.now() - started) / 1000);
+    const kb = Math.round(file.length / 1024);
+    const said = answer ? new TextDecoder().decode(answer.body).trim() : "";
+
+    if (m.route === "/update") {
+      if (answer && answer.status === 200)
+        return say(`Firmware flashed \u2014 ${m.name}\n\nSize       ${kb} KB\nTransfer   ${seconds} s\n\nRebooting. Send /status in a minute.`);
+      return say(`Firmware not flashed \u2014 ${said || "it did not get through"}\n\nThe module is still running what it ran before.`);
+    }
+    if (answer && answer.status < 300)
+      return say(`Saved \u2014 ${m.name}\n\nSize       ${kb} KB\nTransfer   ${seconds} s\n\nGoing on to the printer's card now. I will say when it is there.`);
+    return say(`Could not save ${m.name} \u2014 ${said || "it did not get through"}`);
+  }
+
+  async waitForDevice(limitMs) {
+    const until = Date.now() + limitMs;
+    for (;;) {
+      const ws = this.device();
+      if (ws) return ws;
+      if (Date.now() > until) return null;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  newId() {
     const id = this.next++;
     if (this.next > 0x7fffffff) this.next = 1;
+    return id;
+  }
 
+  // A request with no body, answered as a stream straight back to the browser
+  carry(ws, method, path, headers) {
+    const id = this.newId();
     let resolve;
     const answered = new Promise((r) => (resolve = r));
-    const w = { resolve, timer: null, writer: null, credit: IN_FLIGHT, wake: null, t0: Date.now() };
-    this.note(`req ${id} ${request.method} ${url.pathname} length ${length}`);
+    const w = { resolve, timer: null, writer: null, t0: Date.now() };
     this.waiting.set(id, w);
-    // The module pours an upload into its card at its own pace, well after the last
-    // byte has left here, so the wait grows with the size (a floor of 16 KB/s).
-    const wait = ANSWER_TIMEOUT_MS + (hasBody ? Math.ceil(length / 16384) * 1000 : 0);
-    const arm = () => {
-      w.timer = setTimeout(() => {
-        this.waiting.delete(id);
-        if (w.writer) w.writer.abort("timeout").catch(() => {});
-        else resolve(new Response("The printer module did not answer in time.\n", { status: 504 }));
-      }, wait);
-    };
-
-    const send = async () => {
-      ws.send(JSON.stringify({ i: id, m: request.method, p: url.pathname + url.search, h: headers,
-                               l: hasBody ? length : 0 }));
-      if (hasBody) {
-        // The firmware route wipes its flash slot as soon as the part header arrives and
-        // reads nothing for several seconds. Module builds before 04.11.2026 gave up on
-        // a stalled loopback within two seconds, so the rest waits until the wipe is done.
-        let sent = 0;
-        const pushChunks = async (bytes) => {
-          for (let o = 0; o < bytes.length; o += CHUNK) {
-            sent++;
-            // An acknowledgement can be lost: module builds before 04.11.2026 give up on
-            // sending one after five seconds waiting for the socket library's lock. So a
-            // missing one is presumed lost after a moment, up to LOST_ACKS ahead, which is
-            // still inside the module's six piece slots.
-            while (w.credit <= 0) {
-              const more = await new Promise((r) => {
-                w.wake = r;
-                setTimeout(() => r(false), ACK_GRACE_MS);
-              });
-              if (more !== false) continue;
-              if (Date.now() - (w.lastAck || w.t0) > SILENT_GIVE_UP_MS) {
-                this.note(`req ${id} gave up: no ack for ${SILENT_GIVE_UP_MS} ms after ${w.sentPieces} pieces`);
-                throw new Error("the module stopped taking the upload");
-              }
-              w.presumedCount = (w.presumedCount || 0) + 1;
-              w.credit++;                 // presumed lost while the module is still answering
-            }
-            w.credit--;
-            ws.send(framed(id, bytes.subarray(o, o + CHUNK)));
-            w.sentPieces = (w.sentPieces || 0) + 1;
-            if (w.sentPieces % 25 === 1)
-              this.note(`req ${id} piece ${w.sentPieces} at ${Date.now() - w.t0} ms, credit ${w.credit}`);
-          }
-        };
-        if (buffered) await pushChunks(buffered);
-        else {
-          const reader = request.body.getReader();
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            await pushChunks(value);
-          }
-        }
-      }
-      arm();
-    };
-
-    const turn = hasBody ? (this.bodies = this.bodies.then(send, send)) : send();
-    turn.catch(() => {
+    w.timer = setTimeout(() => {
+      this.waiting.delete(id);
+      if (w.writer) w.writer.abort("timeout").catch(() => {});
+      else resolve(new Response("The printer module did not answer in time.\n", { status: 504 }));
+    }, ANSWER_TIMEOUT_MS);
+    try {
+      ws.send(JSON.stringify({ i: id, m: method, p: path, h: headers, l: 0 }));
+    } catch (e) {
       clearTimeout(w.timer);
       this.waiting.delete(id);
-      resolve(new Response("The printer module went away.\n", { status: 503 }));
-    });
+      resolve(LOST);
+    }
     return answered;
+  }
+
+  // One try at a body: resolves with the module's whole answer, or { lost: true }
+  sendBody(ws, method, path, headers, body) {
+    const id = this.newId();
+    return new Promise(async (done) => {
+      // A firmware image goes one piece at a time: the module is short of memory while it
+      // flashes, and the only flash through the relay so far went through like that.
+      const inFlight = path.startsWith("/update") ? 2 : IN_FLIGHT;
+      const w = { collect: [], credit: inFlight, inFlight, wake: null, t0: Date.now(), sentPieces: 0, timer: null, finished: false };
+      w.finish = (result) => {
+        if (w.finished) return;
+        w.finished = true;
+        clearTimeout(w.timer);
+        this.waiting.delete(id);
+        done(result);
+      };
+      this.waiting.set(id, w);
+      this.note(`req ${id} ${method} ${path} length ${body.length}`);
+      try {
+        ws.send(JSON.stringify({ i: id, m: method, p: path, h: headers, l: body.length }));
+        for (let o = 0; o < body.length; o += CHUNK) {
+          while (w.credit <= 0) {
+            const more = await new Promise((r) => {
+              w.wake = r;
+              setTimeout(() => r(false), ACK_GRACE_MS);
+            });
+            if (w.finished) return;
+            if (more !== false) continue;
+            // The firmware route can sit for half a minute before it reads (it waits for
+            // the TLS gate, then opens its flash). Starting another attempt while the
+            // module is still busy with this one only has the two collide.
+            const silentLimit = path.startsWith("/update") ? 60000 : SILENT_GIVE_UP_MS;
+            if (Date.now() - (w.lastAck || w.t0) > silentLimit) {
+              this.note(`req ${id} no acknowledgement for ${silentLimit} ms after ${w.sentPieces} pieces, waiting for the module to say so`);
+              w.timer = setTimeout(() => w.finish({ lost: true }), 45000);
+              return;              // the module answers once it gives up on its side
+            }
+            w.credit++;               // presumed lost while the module is still answering
+          }
+          if (w.finished) return;
+          w.credit--;
+          ws.send(framed(id, body.subarray(o, o + CHUNK)));
+          w.sentPieces++;
+        }
+      } catch (e) {
+        return w.finish({ lost: true });
+      }
+      // The module pours an upload into its card at its own pace, well after the last
+      // byte has left here, so the wait grows with the size (a floor of 16 KB/s).
+      w.timer = setTimeout(() => w.finish({ lost: true }),
+                           ANSWER_TIMEOUT_MS + Math.ceil(body.length / 16384) * 1000);
+    });
   }
 
   async webSocketMessage(ws, message) {
     if (typeof message === "string") {
       let m;
       try { m = JSON.parse(message); } catch { return; }
+      if (m.t === "tgfetch") {
+        if (this.env.TELEGRAM_TOKEN && m.c && m.id && m.route && m.token)
+          await this.fetchForModule(m);
+        return;
+      }
       if (m.t === "tg") {
         if (this.env.TELEGRAM_TOKEN && m.c && m.x)
           await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_TOKEN}/sendMessage`, {
@@ -267,13 +382,29 @@ export class Relay {
         const w = this.waiting.get(m.k);
         if (w) {
           w.lastAck = Date.now();
-          if (w.credit < IN_FLIGHT) w.credit = Math.min(IN_FLIGHT, w.credit + (m.n || 1));
+          w.acks = (w.acks || 0) + 1;
+          if (w.acks <= 12 || w.acks % 20 === 0)
+            this.note(`ack ${w.acks} for req ${m.k} n ${m.n || 1} at ${Date.now() - w.t0} ms, sent ${w.sentPieces}, credit ${w.credit}`);
+          const most = w.inFlight || IN_FLIGHT;
+          if (w.credit < most) w.credit = Math.min(most, w.credit + (m.n || 1));
           if (w.wake) { const wake = w.wake; w.wake = null; wake(true); }
         }
         return;
       }
       const w = this.waiting.get(m.i);
       if (!w) return;
+      if (w.collect) {
+        if (m.s) { w.status = m.s; w.headers = m.h; }
+        if (m.e) {
+          const total = w.collect.reduce((n, c) => n + c.length, 0);
+          const body = new Uint8Array(total);
+          let at = 0;
+          for (const c of w.collect) { body.set(c, at); at += c.length; }
+          this.note(`req ${m.i} answered ${w.status} at ${Date.now() - w.t0} ms after ${w.sentPieces} pieces`);
+          w.finish({ status: w.status || 502, headers: w.headers, body });
+        }
+        return;
+      }
       if (m.e) {
         clearTimeout(w.timer);
         this.waiting.delete(m.i);
@@ -294,15 +425,17 @@ export class Relay {
     if (bytes.length < 4) return;
     const id = (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0;
     const w = this.waiting.get(id);
-    if (w && w.writer) w.writer.write(bytes.subarray(4)).catch(() => {});
+    if (w && w.collect) w.collect.push(bytes.slice(4));
+    else if (w && w.writer) w.writer.write(bytes.subarray(4)).catch(() => {});
   }
 
   webSocketClose() {
     this.note("device socket closed");
     for (const [, w] of this.waiting) {
+      if (w.finish) { w.finish({ lost: true }); continue; }
       clearTimeout(w.timer);
       if (w.writer) w.writer.abort("closed").catch(() => {});
-      else w.resolve(new Response("The printer module went away.\n", { status: 503 }));
+      else w.resolve(LOST);
     }
     this.waiting.clear();
   }

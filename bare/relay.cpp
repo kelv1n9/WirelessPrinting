@@ -183,6 +183,21 @@ static bool pour(WiFiClient &local, const uint8_t *data, size_t n) {
                       [] { vTaskDelay(pdMS_TO_TICKS(5)); });
 }
 
+void relaySendTelegramFetch(const String &chat, const String &fileId, const String &route,
+                           const String &field, const String &name, const String &token) {
+  DynamicJsonDocument doc(512 + name.length() + fileId.length());
+  doc["t"] = "tgfetch";
+  doc["c"] = chat;
+  doc["id"] = fileId;
+  doc["route"] = route;
+  doc["field"] = field;
+  doc["name"] = name;
+  doc["token"] = token;
+  String out;
+  serializeJson(doc, out);
+  sendText(out);
+}
+
 static void carry(char *raw) {
   DynamicJsonDocument doc(strlen(raw) + 512);
   if (deserializeJson(doc, raw))
@@ -190,6 +205,12 @@ static void carry(char *raw) {
   const char *kind = doc["t"] | "";
   if (!strcmp(kind, "hello")) {
     workerHasBot = doc["tg"] | false;
+    return;
+  }
+  if (!strcmp(kind, "tgdoc")) {
+    TelegramBot::fromRelay(String((const char *)(doc["c"] | "")),
+                           String("/__file ") + (const char *)(doc["id"] | "") + " " +
+                           String((uint32_t)(doc["size"] | 0)) + " " + (const char *)(doc["name"] | "file"));
     return;
   }
   if (!strcmp(kind, "tg")) {

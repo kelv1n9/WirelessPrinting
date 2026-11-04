@@ -560,6 +560,9 @@ static void chirp(const int times) {
   }
 }
 
+// A file sent to the bot, waiting to become a chore, and the chat to tell when it ends
+static String fileChat, fileName, choreChat, choreFile;
+
 // Said once when a print starts and once when it stops, to everyone the bot knows.
 static void tellTheBot(const String &text) {
   if (telegramBot.hasToken() || relayCarriesTelegram())
@@ -1005,6 +1008,11 @@ void setup() {
     String said = andPrint ? "printing" : "sending";
     if (!startChore(lastUpload, andPrint))
       said = choreTrouble.length() ? choreTrouble : "the printer is busy";
+    else if (fileChat != "") {
+      choreChat = fileChat;            // it came from the bot, so the bot says how it ended
+      choreFile = fileName;
+      fileChat = "";
+    }
     server.send(201, "application/json",
       "{\"done\":true,\"name\":\"" + lastUpload + "\",\"said\":\"" + said + "\"}");
   }, takeUpload);
@@ -1655,7 +1663,8 @@ void setup() {
     const bool good = otaComplete;
     otaComplete = false;
     server.sendHeader("Connection", "close");
-    server.send(good ? 200 : 500, "text/plain", good ? "OK, rebooting\n" : "failed\n");
+    server.send(good ? 200 : 500, "text/plain",
+                good ? "OK, rebooting\n" : "failed: " + (otaTrouble.length() ? otaTrouble : String("nothing was written")) + "\n");
     if (good) {
       bootGuardArm();
       delay(300);
@@ -1703,9 +1712,42 @@ static void handleTelegram() {
     if (addressed > 0)
       verb = verb.substring(0, addressed);
 
-    if (verb == "/__document") {
-      telegramBot.send(chat, "This build does not take files over the bot yet. Send it through the "
-                             "web page or the slicer.");
+    if (verb == "/__file") {
+      // "<file id> <size> <name>", put together by the relay from what Telegram said
+      const int a = rest.indexOf(' '), b = rest.indexOf(' ', a + 1);
+      const String fileId = a > 0 ? rest.substring(0, a) : "";
+      const uint32_t size = b > a ? (uint32_t)rest.substring(a + 1, b).toInt() : 0;
+      const String name = b > 0 ? rest.substring(b + 1) : "file";
+      String lower = name;
+      lower.toLowerCase();
+      const bool bin = lower.endsWith(".bin");
+      const bool printerFirmware = bin && lower.startsWith("robin_nano");
+      const bool gcode = lower.endsWith(".gcode") || lower.endsWith(".gco") || lower.endsWith(".g");
+      const bool forPrinter = gcode || printerFirmware;
+      if (!bin && !gcode)
+        telegramBot.send(chat, "Send a .gcode to print, a .bin to flash the module, or Robin_nano*.bin "
+                               "to flash the printer. This one is " + name + ".");
+      else if (size > 20UL * 1024 * 1024)
+        telegramBot.send(chat, "That file is " + String(size / 1024 / 1024) +
+                               " MB. Telegram only lets a bot fetch 20 MB.");
+      else if (!relayCarriesTelegram() || fileId == "")
+        telegramBot.send(chat, "Files come in through the Cloudflare relay, and it is not connected.");
+      else if (sender.running() || sendAsked || chore == ChoreSending)
+        telegramBot.send(chat, "A file is on its way to the printer already. Send this one in a moment.");
+      else if (forPrinter && printing)
+        telegramBot.send(chat, "A print is running and the wire to the printer is not free. "
+                               "Send it when the print is done.");
+      else {
+        const String token = webAuthMakeOnce();
+        if (forPrinter) {
+          fileChat = chat;
+          fileName = name;
+        }
+        relaySendTelegramFetch(chat, fileId, forPrinter ? "/api/files/local" : "/update",
+                               forPrinter ? "file" : "firmware", name, token);
+        telegramBot.send(chat, "Taking " + name + ", " + String(size / 1024) + " KB. About " +
+                               String(size / 15000 + 10) + " s.");
+      }
     }
 
     else if (verb == "/start" || verb == "/help") {
@@ -1717,7 +1759,11 @@ static void handleTelegram() {
         "/stop - cancel the running print\n"
         "/nozzle <degrees> - set the hotend, 0 to turn it off\n"
         "/bed <degrees> - set the bed\n"
-        "/on and /off - the socket");
+        "/on and /off - the socket\n\n"
+        "Send a .gcode and it goes onto the printer's card. Send a .bin and the module "
+        "flashes itself and reboots; a print carries on, the printer reads its own card. "
+        "Send Robin_nano*.bin and it goes onto the printer's card to flash the printer at "
+        "its next power on. Telegram only lets a bot fetch files up to 20 MB.");
     }
 
     else if (verb == "/status") {
@@ -1986,6 +2032,24 @@ void loop() {
   }
 
   handleTelegram();
+
+  static Chore lastChore;
+  if (chore != lastChore) {
+    lastChore = chore;
+    if (choreChat != "" && (chore == ChoreDone || chore == ChoreFailed)) {
+      String lower = choreFile;
+      lower.toLowerCase();
+      if (chore == ChoreFailed)
+        telegramBot.send(choreChat, "Could not put " + choreFile + " on the printer's card \u2014 " + choreTrouble);
+      else if (lower.startsWith("robin_nano"))
+        telegramBot.send(choreChat, "Printer firmware is on its card \u2014 " + choreFile +
+                                    "\n\nIt is flashed the next time the printer is switched on: /off, then /on.");
+      else
+        telegramBot.send(choreChat, "On the printer's card \u2014 " + choreFile +
+                                    "\n\n/files to see it, /print <number> to start it.");
+      choreChat = "";
+    }
+  }
 
   static bool toldPrinting;
   if (printing != toldPrinting) {

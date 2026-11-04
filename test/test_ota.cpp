@@ -5,6 +5,19 @@
 #include <cstdio>
 #include <mutex>
 #include <thread>
+#include <string>
+
+struct String : std::string {
+  String() {}
+  String(const char *t) : std::string(t) {}
+  String(const std::string &t) : std::string(t) {}
+  String(unsigned v) : std::string(std::to_string(v)) {}
+  size_t length() const { return size(); }
+};
+inline String operator+(const String &a, const char *b) { return String(std::string(a) + b); }
+inline String operator+(const String &a, const String &b) { return String(std::string(a) + std::string(b)); }
+static constexpr int MALLOC_CAP_8BIT = 0;
+static unsigned heap_caps_get_largest_free_block(int) { return 20000; }
 
 enum { UPLOAD_FILE_START, UPLOAD_FILE_WRITE, UPLOAD_FILE_END, UPLOAD_FILE_ABORTED };
 struct HTTPUpload {
@@ -50,6 +63,7 @@ struct {
   }
   void abort() { ++aborts; running = false; }
   void printError(int) {}
+  const char *errorString() { return "stub"; }
 } Update;
 
 volatile uint32_t loopBeat = 0;
