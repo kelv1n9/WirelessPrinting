@@ -580,6 +580,8 @@ static String spanWords(const int32_t seconds) {
   return String(minutes / 60) + " h " + String(minutes % 60) + " min";
 }
 
+static bool choreRetried;        // the transfer to the printer has been tried a second time
+
 static bool startChore(const String &name, const bool andPrint, const uint8_t window = 2) {
   choreTrouble = "";
   if (sender.running()) {
@@ -1971,7 +1973,19 @@ void loop() {
   // The transfer is over. Nothing is believed until the printer's own card says so.
   if (chore == ChoreSending && !sender.running() && !sendAsked) {
     const uint32_t was = sendBytes.size();
-    if (sender.phase != BinaryDone) {
+    if (sender.phase != BinaryDone && !choreRetried) {
+      // Sent once more before it is called a failure: a printer that has just been
+      // talked to at another rate, or just come out of packet mode, can refuse a step
+      // and take the same file whole a moment later.
+      choreRetried = true;
+      const String name = sendName;
+      const bool andPrint = choreShouldPrint;
+      if (!startChore(name, andPrint)) {
+        choreTrouble = sender.trouble ? sender.trouble : "the transfer did not finish";
+        chore = ChoreFailed;
+      }
+    }
+    else if (sender.phase != BinaryDone) {
       choreTrouble = sender.trouble ? sender.trouble : "the transfer did not finish";
       chore = ChoreFailed;
     }
@@ -2059,6 +2073,8 @@ void loop() {
   static Chore lastChore;
   if (chore != lastChore) {
     lastChore = chore;
+    if (chore == ChoreDone || chore == ChoreFailed)
+      choreRetried = false;
     if (choreChat != "" && (chore == ChoreDone || chore == ChoreFailed)) {
       String lower = choreFile;
       lower.toLowerCase();

@@ -74,6 +74,9 @@ Chore chore;
 String choreTrouble;
 char choreTarget[PRINTER_CARD_NAME_BYTES];
 bool choreShouldPrint=false,sendAsked=false,sawOk=false;
+bool choreRetried=true;           // the existing scenarios judge the second, final try
+char sendName[64]="x.gcode";
+bool startChore(const String &, bool) { return false; }
 PrinterCard printerCard, printerListing;
 bool printing=false,listingRequested=false;
 std::vector<std::string> commands;
