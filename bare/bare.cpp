@@ -1685,8 +1685,8 @@ void setup() {
     settings.end();
   }
   yandexHome.begin();
+  relayBegin();                      // first: the bot sizes its stack by whether the relay is set up
   telegramBot.begin();
-  relayBegin();
   {
     Preferences keep;
     keep.begin("guard", false);
@@ -1900,7 +1900,7 @@ static void handleTelegram() {
 // watches from outside and restarts the module, which a print does not notice: the
 // printer reads its own card.
 #define GUARD_LOOP_MS     60000
-#define GUARD_RELAY_MS    300000
+#define GUARD_RELAY_MS    90000
 #define GUARD_BLOCK_FLOOR 6144
 #define GUARD_BLOCK_MS    300000
 
@@ -1923,12 +1923,14 @@ static void guardian(void *) {
       guardianRestart("the loop stood still for a minute");
 
     const bool relayWanted = relayConfigured() && webAuthSet() && WiFi.status() == WL_CONNECTED;
-    if (!relayWanted || relayState() == "connected")
+    // Not while a file is going to the printer: a restart there would break the
+    // transfer, and the printer would be left waiting in packet mode.
+    if (!relayWanted || relayState() == "connected" || somethingIsStreaming() || uploadActive)
       relayDownSince = 0;
     else if (!relayDownSince)
       relayDownSince = now;
     else if (now - relayDownSince > GUARD_RELAY_MS)
-      guardianRestart("the relay was down for five minutes");
+      guardianRestart("the relay was down for a minute and a half");
 
     // An upload breaks the heap into small pieces for as long as it runs and gives
     // them back at the end. Counting that as a hang restarted the module two minutes

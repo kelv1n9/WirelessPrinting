@@ -149,7 +149,9 @@ void TelegramBot::begin() {
 
   status = token == "" ? "no token" : "starting";
 
-  xTaskCreatePinnedToCore(run, "telegram", TELEGRAM_STACK, NULL, 1, &task, 0);
+  // With the relay set up the bot never opens a connection of its own, and the stack a
+  // handshake needs is twelve kilobytes the relay's own handshake goes without.
+  xTaskCreatePinnedToCore(run, "telegram", relayConfigured() ? 4096 : TELEGRAM_STACK, NULL, 1, &task, 0);
 }
 
 bool TelegramBot::hasToken() {
