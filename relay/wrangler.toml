@@ -9,3 +9,6 @@ class_name = "Relay"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Relay"]
+
+[vars]
+TRACE = "1"

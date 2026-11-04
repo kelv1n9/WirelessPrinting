@@ -16,6 +16,8 @@
 const UPLOAD_LIMIT = 64 * 1024 * 1024;
 const CHUNK = 2040;                       // plus four bytes of number, one module buffer
 const IN_FLIGHT = 5;                      // one fewer than the module has slots for pieces
+const ACK_GRACE_MS = 4000;
+const SILENT_GIVE_UP_MS = 10000;
 const ERASE_PAUSE_MS = 15000;             // the firmware route erases a whole flash slot first
 const ANSWER_TIMEOUT_MS = 30000;
 const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match"];
@@ -23,6 +25,14 @@ const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match"
 export default {
   async fetch(request, env) {
     const relay = env.RELAY.get(env.RELAY.idFromName("kp3s"));
+    // curl and libcurl, Orca among them, ask "Expect: 100-continue" before a body over
+    // 1 MB, and passed on to the Durable Object the body then never arrived: Cloudflare
+    // gave up at 55 s with a 502 of its own. Without it the body flows.
+    if (request.headers.has("expect")) {
+      const headers = new Headers(request.headers);
+      headers.delete("expect");
+      request = new Request(request, { headers });
+    }
     return relay.fetch(request);
   },
 };
@@ -55,6 +65,13 @@ export class Relay {
     this.next = 1;
     this.waiting = new Map();
     this.bodies = Promise.resolve();      // one body at a time, or their chunks would interleave
+    this.trail = [];
+  }
+
+  note(text) {
+    if (!this.env.TRACE) return;
+    this.trail.push(`${new Date().toISOString().slice(11, 23)} ${text}`);
+    if (this.trail.length > 200) this.trail.shift();
   }
 
   device() {
@@ -77,6 +94,13 @@ export class Relay {
       this.state.acceptWebSocket(pair[1], ["device"]);
       pair[1].send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN }));
       return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+
+    if (url.pathname === "/.trace") {
+      const given = (request.headers.get("Authorization") || "").replace(/^Bearer /, "");
+      if (!sameSecret(given, this.env.DEVICE_KEY))
+        return new Response("no\n", { status: 403 });
+      return new Response(this.trail.join("\n") + "\n");
     }
 
     if (url.pathname === "/.tg-setup") {
@@ -130,9 +154,16 @@ export class Relay {
     const hasBody = request.method !== "GET" && request.method !== "HEAD" && request.body;
     let length = Number(request.headers.get("content-length") || 0);
     let buffered = null;
-    if (hasBody && !length) {
+    // The whole body is taken in first. Reading it from the client at the module's
+    // pace, minutes for a firmware image, had Cloudflare's edge give up on the request
+    // at about 55 seconds with a 502 of its own.
+    if (hasBody) {
+      if (length > UPLOAD_LIMIT)
+        return new Response("Too large to send through the relay.\n", { status: 413 });
+      this.note(`taking in a body of ${length} for ${url.pathname}`);
       buffered = new Uint8Array(await request.arrayBuffer());
       length = buffered.length;
+      this.note(`took it in, ${length} bytes`);
     }
     if (length > UPLOAD_LIMIT)
       return new Response("Too large to send through the relay.\n", { status: 413 });
@@ -148,7 +179,8 @@ export class Relay {
 
     let resolve;
     const answered = new Promise((r) => (resolve = r));
-    const w = { resolve, timer: null, writer: null, credit: IN_FLIGHT, wake: null };
+    const w = { resolve, timer: null, writer: null, credit: IN_FLIGHT, wake: null, t0: Date.now() };
+    this.note(`req ${id} ${request.method} ${url.pathname} length ${length}`);
     this.waiting.set(id, w);
     // The module pours an upload into its card at its own pace, well after the last
     // byte has left here, so the wait grows with the size (a floor of 16 KB/s).
@@ -171,18 +203,29 @@ export class Relay {
         let sent = 0;
         const pushChunks = async (bytes) => {
           for (let o = 0; o < bytes.length; o += CHUNK) {
-            if (url.pathname === "/update" && sent === 1)
-              await new Promise((r) => setTimeout(r, ERASE_PAUSE_MS));
             sent++;
+            // An acknowledgement can be lost: module builds before 04.11.2026 give up on
+            // sending one after five seconds waiting for the socket library's lock. So a
+            // missing one is presumed lost after a moment, up to LOST_ACKS ahead, which is
+            // still inside the module's six piece slots.
             while (w.credit <= 0) {
               const more = await new Promise((r) => {
                 w.wake = r;
-                setTimeout(() => r(false), ANSWER_TIMEOUT_MS);
+                setTimeout(() => r(false), ACK_GRACE_MS);
               });
-              if (more === false && w.credit <= 0) throw new Error("the module stopped taking the upload");
+              if (more !== false) continue;
+              if (Date.now() - (w.lastAck || w.t0) > SILENT_GIVE_UP_MS) {
+                this.note(`req ${id} gave up: no ack for ${SILENT_GIVE_UP_MS} ms after ${w.sentPieces} pieces`);
+                throw new Error("the module stopped taking the upload");
+              }
+              w.presumedCount = (w.presumedCount || 0) + 1;
+              w.credit++;                 // presumed lost while the module is still answering
             }
             w.credit--;
             ws.send(framed(id, bytes.subarray(o, o + CHUNK)));
+            w.sentPieces = (w.sentPieces || 0) + 1;
+            if (w.sentPieces % 25 === 1)
+              this.note(`req ${id} piece ${w.sentPieces} at ${Date.now() - w.t0} ms, credit ${w.credit}`);
           }
         };
         if (buffered) await pushChunks(buffered);
@@ -223,7 +266,8 @@ export class Relay {
       if (m.k) {
         const w = this.waiting.get(m.k);
         if (w) {
-          w.credit += m.n || 1;
+          w.lastAck = Date.now();
+          if (w.credit < IN_FLIGHT) w.credit = Math.min(IN_FLIGHT, w.credit + (m.n || 1));
           if (w.wake) { const wake = w.wake; w.wake = null; wake(true); }
         }
         return;
@@ -237,6 +281,7 @@ export class Relay {
         return;
       }
       if (m.s) {
+        this.note(`req ${m.i} answered ${m.s} at ${Date.now() - w.t0} ms after ${w.sentPieces || 0} pieces`);
         const { readable, writable } = new TransformStream();
         w.writer = writable.getWriter();
         const h = new Headers(m.h || {});
@@ -253,6 +298,7 @@ export class Relay {
   }
 
   webSocketClose() {
+    this.note("device socket closed");
     for (const [, w] of this.waiting) {
       clearTimeout(w.timer);
       if (w.writer) w.writer.abort("closed").catch(() => {});
