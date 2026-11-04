@@ -23,7 +23,11 @@ const SILENT_GIVE_UP_MS = 10000;
 const ANSWER_TIMEOUT_MS = 30000;
 const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match", "x-relay-once"];
 const LOST = Symbol("lost");
-const CACHED = new Set(["/api/status", "/printer/send/status"]);
+// What the page asks for is kept, so the page still works while the module is busy
+// taking a file. The console is not: handed out again it would repeat its lines.
+const CACHE_ITEMS = 64;
+const CACHE_ITEM_LIMIT = 64 * 1024;
+const cacheKey = (url) => url.pathname + url.search;
 const wentAway = () => new Response("The printer module went away.\n", { status: 503 });
 
 export default {
@@ -186,7 +190,12 @@ export class Relay {
     // nothing else, so the page would see every poll time out and the module look dead.
     // The status it last gave is handed out instead, and the rest is told to wait.
     if (!hasBody && this.uploading > 0) {
-      const cached = this.cache.get(url.pathname);
+      const key = cacheKey(url);
+      let cached = this.cache.get(key);
+      if (!cached && url.pathname === "/") {
+        const kept = await this.state.storage.get("page");
+        if (kept) cached = kept;
+      }
       if (cached) {
         const h = new Headers(cached.headers || {});
         h.set("x-relay-cached", "uploading");
@@ -195,10 +204,16 @@ export class Relay {
       return new Response("The module is busy taking a file. Try again when it is done.\n",
                           { status: 503, headers: { "retry-after": "5" } });
     }
-    if (!hasBody && CACHED.has(url.pathname)) {
+    if (!hasBody && request.method === "GET" && url.pathname !== "/download") {
       const last = await this.sendBody(ws, request.method, url.pathname + url.search, headers, new Uint8Array(0));
       if (last.lost) return wentAway();
-      if (last.status === 200) this.cache.set(url.pathname, last);
+      if (last.status === 200 && last.body.length <= CACHE_ITEM_LIMIT && url.pathname !== "/api/console") {
+        const key = cacheKey(url);
+        this.cache.delete(key);
+        this.cache.set(key, last);
+        while (this.cache.size > CACHE_ITEMS) this.cache.delete(this.cache.keys().next().value);
+        if (url.pathname === "/") this.state.storage.put("page", last).catch(() => {});
+      }
       return new Response(last.body, { status: last.status, headers: new Headers(last.headers || {}) });
     }
 
