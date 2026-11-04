@@ -16,6 +16,7 @@
 const UPLOAD_LIMIT = 64 * 1024 * 1024;
 const CHUNK = 2040;                       // plus four bytes of number, one module buffer
 const IN_FLIGHT = 5;                      // one fewer than the module has slots for pieces
+const ERASE_PAUSE_MS = 15000;             // the firmware route erases a whole flash slot first
 const ANSWER_TIMEOUT_MS = 30000;
 const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match"];
 
@@ -164,8 +165,15 @@ export class Relay {
       ws.send(JSON.stringify({ i: id, m: request.method, p: url.pathname + url.search, h: headers,
                                l: hasBody ? length : 0 }));
       if (hasBody) {
+        // The firmware route wipes its flash slot as soon as the part header arrives and
+        // reads nothing for several seconds. Module builds before 04.11.2026 gave up on
+        // a stalled loopback within two seconds, so the rest waits until the wipe is done.
+        let sent = 0;
         const pushChunks = async (bytes) => {
           for (let o = 0; o < bytes.length; o += CHUNK) {
+            if (url.pathname === "/update" && sent === 1)
+              await new Promise((r) => setTimeout(r, ERASE_PAUSE_MS));
+            sent++;
             while (w.credit <= 0) {
               const more = await new Promise((r) => {
                 w.wake = r;
@@ -215,7 +223,7 @@ export class Relay {
       if (m.k) {
         const w = this.waiting.get(m.k);
         if (w) {
-          w.credit++;
+          w.credit += m.n || 1;
           if (w.wake) { const wake = w.wake; w.wake = null; wake(true); }
         }
         return;

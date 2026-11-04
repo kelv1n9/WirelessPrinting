@@ -310,7 +310,7 @@ void WebServer::handleClient() {
         if (_parseRequest(_currentClient)) {
           // because HTTP_MAX_SEND_WAIT is expressed in milliseconds,
           // it must be divided by 1000
-          _currentClient.setTimeout(HTTP_MAX_SEND_WAIT / 1000);
+          _currentClient.setTimeout(HTTP_BODY_WAIT / 1000);
           _contentLength = CONTENT_LENGTH_NOT_SET;
           _handleRequest();
 

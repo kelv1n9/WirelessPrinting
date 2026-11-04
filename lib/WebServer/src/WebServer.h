@@ -54,6 +54,9 @@ enum HTTPAuthMethod { BASIC_AUTH, DIGEST_AUTH };
 // quarter of a second is a hundred times that and still refuses nothing real.
 #define HTTP_MAX_DATA_WAIT 250 //ms to wait for the client to send the request
 #define HTTP_MAX_POST_WAIT 5000 //ms to wait for POST data to arrive
+// Also changed here: a body arriving through the Cloudflare relay pauses for seconds at
+// a time on its way across the internet, and five seconds of silence dropped uploads.
+#define HTTP_BODY_WAIT 20000 //ms of silence in the middle of a request body before giving up
 #define HTTP_MAX_SEND_WAIT 5000 //ms to wait for data chunk to be ACKed
 #define HTTP_MAX_CLOSE_WAIT 2000 //ms to wait for the client to close the connection
 

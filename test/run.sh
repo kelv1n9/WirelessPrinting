@@ -87,4 +87,7 @@ CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_transfer_completion.py || fail=1
 CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_ui_metadata.py || fail=1
 node test_page_ui.js || fail=1
 
+echo "=== relay pour ==="
+$CXX $FLAGS -std=c++17 -Wall -o /tmp/test_relaypour test_relaypour.cpp && /tmp/test_relaypour || fail=1
+
 exit $fail

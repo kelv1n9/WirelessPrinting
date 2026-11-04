@@ -52,6 +52,8 @@ struct {
   void printError(int) {}
 } Update;
 
+volatile uint32_t loopBeat = 0;
+static uint32_t millis() { return 1; }
 #include "../bare/ota.h"
 
 static int xSemaphoreTake(std::mutex *mutex, int wait) {

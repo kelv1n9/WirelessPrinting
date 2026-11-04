@@ -23,6 +23,8 @@ bool relayCarriesTelegram();
 SemaphoreHandle_t tlsGate;
 volatile bool tlsWanted;
 
+volatile uint32_t loopBeat;
+static void guardian(void *);
 #include "ota.h"
 
 #define POWEROFF_NOZZLE   100    // the nozzle has to be below this before mains may go
@@ -492,6 +494,7 @@ static void takeUpload() {
     }
   }
   else if (up.status == UPLOAD_FILE_WRITE && into) {
+    loopBeat = millis();
     for (size_t at = 0; at < up.currentSize; at += sizeof(lined)) {
       const size_t take = up.currentSize - at < sizeof(lined) ? up.currentSize - at : sizeof(lined);
       memcpy(lined, up.buf + at, take);
@@ -1300,6 +1303,7 @@ void setup() {
       "input,button{font:inherit;padding:.4rem .6rem}form{margin:1rem 0}code{word-break:break-all}</style>"
       "<h1>Remote access</h1><p><a href=\"/\">back to the printer</a></p>";
     out += "<p>State: <b>" + relayState() + "</b></p>";
+    out += "<p>Uploads: " + relayStats() + "</p>";
     if (!webAuthSet())
       out += "<p>Set a <a href=/auth>password</a> first. The relay will not start without one.</p>";
     out += "<form method=post action=/relay/set>"
@@ -1671,6 +1675,8 @@ void setup() {
   yandexHome.begin();
   telegramBot.begin();
   relayBegin();
+  loopBeat = millis();
+  xTaskCreatePinnedToCore(guardian, "guardian", 3072, nullptr, 2, nullptr, 0);
   {
     Preferences keep;
     keep.begin("sound", true);
@@ -1833,7 +1839,44 @@ static void handleTelegram() {
   }
 }
 
+// Hangs here leave no reset behind them: the loop has no watchdog in this core, and a
+// relay that cannot get the memory for its handshake back never reconnects. This
+// watches from outside and restarts the module, which a print does not notice: the
+// printer reads its own card.
+#define GUARD_LOOP_MS     60000
+#define GUARD_RELAY_MS    300000
+#define GUARD_BLOCK_FLOOR 6144
+#define GUARD_BLOCK_MS    120000
+
+static void guardian(void *) {
+  uint32_t relayDownSince = 0, lowSince = 0;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    const uint32_t now = millis();
+    if (otaActive.load())
+      continue;
+    if (now - loopBeat > GUARD_LOOP_MS)
+      esp_restart();
+
+    const bool relayWanted = relayConfigured() && webAuthSet() && WiFi.status() == WL_CONNECTED;
+    if (!relayWanted || relayState() == "connected")
+      relayDownSince = 0;
+    else if (!relayDownSince)
+      relayDownSince = now;
+    else if (now - relayDownSince > GUARD_RELAY_MS)
+      esp_restart();
+
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= GUARD_BLOCK_FLOOR)
+      lowSince = 0;
+    else if (!lowSince)
+      lowSince = now;
+    else if (now - lowSince > GUARD_BLOCK_MS)
+      esp_restart();
+  }
+}
+
 void loop() {
+  loopBeat = millis();
   server.handleClient();
   isPrinting = printing;             // what the bot's task reads, kept in step from one place
   bootGuardWatch(WiFi.status() == WL_CONNECTED);

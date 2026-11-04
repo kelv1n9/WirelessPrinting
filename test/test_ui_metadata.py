@@ -51,6 +51,7 @@ void delay(unsigned ms) { testClock+=ms; }
 uint32_t linkRate=PRINTER_BAUD;
 struct { void updateBaudRate(uint32_t) {} size_t write(const uint8_t *, size_t n) { return n; } } Printer;
 void drain() {}
+volatile uint32_t loopBeat=0;
 struct TestString : String {
   using String::String;
   TestString(const String &v):String(v) {}

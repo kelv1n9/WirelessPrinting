@@ -2,6 +2,8 @@
 
 #include <atomic>
 
+extern volatile uint32_t loopBeat;
+
 static std::atomic<bool> otaActive{false};
 static bool otaGateHeld;
 static bool otaStarted;
@@ -42,6 +44,7 @@ static void onUpload() {
     }
   }
   else if (up.status == UPLOAD_FILE_WRITE && otaStarted) {
+    loopBeat = millis();          // a long upload is one call of the loop, and not a hang
     if (Update.write(up.buf, up.currentSize) != up.currentSize) {
       Update.printError(Serial);
       otaAbort();

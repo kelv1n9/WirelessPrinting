@@ -6,9 +6,10 @@
 #include "relay.h"
 #include "relayroots.h"
 #include "telegram.h"
+#include "relaypour.h"
 
 #define RELAY_FRAME_LIMIT   (24 * 1024)   // a request, body and all, as the Worker sends it
-#define RELAY_CHUNK         2048
+#define RELAY_CHUNK         2044          // plus four bytes of number makes one 2048 byte buffer, one frame
 #define RELAY_IDLE_MS       20000
 #define RELAY_BLOCK_FLOOR   (45 * 1024)   // a TLS handshake needs this much in one piece
 #define RELAY_RETRY_MS      15000
@@ -31,6 +32,9 @@ static char *assembling;
 static volatile bool connected;
 static String url, key, auth, state = "off";
 static uint32_t nextTry;
+
+// What the upload path has been doing, so the next problem is read and not guessed
+static volatile uint32_t piecesIn, piecesDropped, acksSent, worstAckMs, worstGapMs, pourFails;
 static volatile bool workerHasBot;      // the Worker said it holds a bot token
 
 static const char *FORWARD[] = {"Content-Type", "Cache-Control", "WWW-Authenticate",
@@ -47,6 +51,12 @@ static void loadSettings() {
 bool relayConfigured() { return url != "" && key != ""; }
 String relayUrl() { return url; }
 String relayState() { return state; }
+
+String relayStats() {
+  return "pieces " + String(piecesIn) + ", dropped " + String(piecesDropped) +
+         ", acks " + String(acksSent) + ", worst ack " + String(worstAckMs) +
+         " ms, worst gap " + String(worstGapMs) + " ms, pour fails " + String(pourFails);
+}
 
 void relaySet(const String &u, const String &k) {
   Preferences keep;
@@ -102,8 +112,10 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
       // Never wait here: this is the socket's own task, and while it waits nothing
       // answers pings or sends. The Worker keeps no more pieces in flight than there are
       // slots and sends the next only when one is acknowledged.
-      if (!holding && xQueueReceive(freeSlots, &cur.slot, 0) != pdTRUE)
+      if (!holding && xQueueReceive(freeSlots, &cur.slot, 0) != pdTRUE) {
+        piecesDropped++;
         return;
+      }
       holding = true;
       cur.len = (uint16_t)e->payload_len;
     }
@@ -111,8 +123,10 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
       return;
     memcpy(slots[cur.slot] + e->payload_offset, e->data_ptr, e->data_len);
     if (e->payload_offset + e->data_len == cur.len) {
-      if (xQueueSend(bodies, &cur, 0) == pdTRUE)
+      if (xQueueSend(bodies, &cur, 0) == pdTRUE) {
         holding = false;
+        piecesIn++;
+      }
     }
     return;
   }
@@ -164,6 +178,11 @@ void relaySendTelegram(const String &chat, const String &text) {
   sendText(out);
 }
 
+static bool pour(WiFiClient &local, const uint8_t *data, size_t n) {
+  return relayPourAll(local, data, n, 30000, [] { return (uint32_t)millis(); },
+                      [] { vTaskDelay(pdMS_TO_TICKS(5)); });
+}
+
 static void carry(char *raw) {
   DynamicJsonDocument doc(strlen(raw) + 512);
   if (deserializeJson(doc, raw))
@@ -194,14 +213,21 @@ static void carry(char *raw) {
   for (JsonPair kv : h)
     head += String(kv.key().c_str()) + ": " + kv.value().as<const char *>() + "\r\n";
   head += "Content-Length: " + String(bodyLen) + "\r\n\r\n";
-  local.write((const uint8_t *)head.c_str(), head.length());
   doc.clear();
+  if (!pour(local, (const uint8_t *)head.c_str(), head.length())) {
+    local.stop();
+    answer(id, 502, "the module's own web server stopped reading the request\n");
+    return;
+  }
 
-  uint32_t poured = 0;
+  uint32_t poured = 0, unacked = 0, waitedFrom = millis();
   while (poured < bodyLen && connected) {
     Piece one;
     if (xQueueReceive(bodies, &one, pdMS_TO_TICKS(RELAY_IDLE_MS)) != pdTRUE)
       break;
+    const uint32_t gap = millis() - waitedFrom;
+    if (gap > worstGapMs)
+      worstGapMs = gap;
     uint32_t whose = 0;
     const uint8_t *data = slots[one.slot];
     if (one.len >= 4)
@@ -209,13 +235,26 @@ static void carry(char *raw) {
     bool good = true;
     if (one.len >= 4 && whose == id) {
       const size_t n = one.len - 4;
-      good = local.write(data + 4, n) == n;
+      good = pour(local, data + 4, n);
       poured += n;
     }
     xQueueSend(freeSlots, &one.slot, 0);     // a piece of a dropped request is just thrown away
-    sendText("{\"k\":" + String(whose) + "}");
-    if (!good)
+    // Acknowledged two at a time: each send waits for the socket's own lock, and one per
+    // piece made the pauses long enough for the web server to give up on the body.
+    if (++unacked >= 2 || poured >= bodyLen) {
+      const uint32_t t0 = millis();
+      sendText("{\"k\":" + String(whose) + ",\"n\":" + String(unacked) + "}");
+      const uint32_t took = millis() - t0;
+      if (took > worstAckMs)
+        worstAckMs = took;
+      acksSent++;
+      unacked = 0;
+    }
+    if (!good) {
+      pourFails++;
       break;
+    }
+    waitedFrom = millis();
   }
   if (poured < bodyLen) {
     local.stop();

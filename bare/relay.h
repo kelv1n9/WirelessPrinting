@@ -13,3 +13,4 @@ void relaySet(const String &url, const String &key);   // key kept in NVS, never
 void relayForget();
 String relayUrl();
 String relayState();
+String relayStats();
