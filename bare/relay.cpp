@@ -215,7 +215,9 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
   if (e->payload_offset + e->data_len >= e->payload_len) {
     assembling[e->payload_len] = 0;
     if (!strncmp(assembling, "{\"t\":\"yxr\"", 10)) {
-      DynamicJsonDocument doc(e->payload_len + 256);
+      // Parsed where it lies: the strings stay in the frame, so the document needs
+      // room for four members and not for a second copy of a few kilobytes of answer
+      DynamicJsonDocument doc(384);
       if (!deserializeJson(doc, assembling) && (uint32_t)(doc["q"] | 0) == yandexAsked) {
         yandexCode = doc["s"] | 0;
         yandexBody = (const char *)(doc["b"] | "");
@@ -475,8 +477,45 @@ static void put(uint32_t id, JsonDocument &doc) {
   crumbRelay = 9;
 }
 
+int relayGetBegin(const String &said, const String &key, const String &name, uint32_t &size, String &why);
+size_t relayGetRead(uint8_t *into, size_t len);
+void relayGetEnd();
+
+// A file off the card for a download, a piece at a time. The socket's own send
+// buffer is the pace: each piece waits there until the last has left.
+static void get(uint32_t id, JsonDocument &doc) {
+  const String name = doc["name"] | "";
+  JsonObject h = doc["h"];
+  const String said = h["authorization"] | "";
+  const String key = h["x-api-key"] | "";
+  doc.clear();
+  pushStatus();
+  String why;
+  uint32_t size = 0;
+  const int refused = relayGetBegin(said, key, name, size, why);
+  if (refused) {
+    answer(id, refused, (why + "\n").c_str());
+    return;
+  }
+  sendText("{\"i\":" + String(id) + ",\"s\":200,\"h\":{\"Content-Type\":\"application/octet-stream\","
+           "\"Content-Length\":\"" + String(size) + "\"}}");
+  memcpy(frame, &id, 4);
+  uint32_t sent = 0;
+  while (sent < size && connected) {
+    const size_t n = relayGetRead(frame + 4, RELAY_CHUNK);
+    if (!n || esp_websocket_client_send_bin(ws, (const char *)frame, 4 + n, pdMS_TO_TICKS(10000)) < 0)
+      break;
+    sent += n;
+  }
+  relayGetEnd();
+  // Cut short is said so: the Worker then breaks the download off rather than end it
+  // as if it were whole.
+  sendText("{\"i\":" + String(id) + ",\"e\":1" + (sent == size ? "}" : ",\"x\":1}"));
+}
+
 static void carry(char *raw) {
-  DynamicJsonDocument doc(strlen(raw) + 512);
+  // Parsed where it lies, so the document holds a few dozen members and no text
+  DynamicJsonDocument doc(1024);
   if (deserializeJson(doc, raw))
     return;
   const char *kind = doc["t"] | "";
@@ -489,6 +528,12 @@ static void carry(char *raw) {
     TelegramBot::fromRelay(String((const char *)(doc["c"] | "")),
                            String("/__file ") + (const char *)(doc["id"] | "") + " " +
                            String((uint32_t)(doc["size"] | 0)) + " " + (const char *)(doc["name"] | "file"));
+    return;
+  }
+  if (!strcmp(kind, "get")) {
+    const uint32_t gid = doc["i"] | 0;
+    if (gid)
+      get(gid, doc);
     return;
   }
   if (!strcmp(kind, "put")) {

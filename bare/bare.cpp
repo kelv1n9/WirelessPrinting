@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <Preferences.h>
@@ -700,8 +701,14 @@ static String spanWords(const int32_t seconds) {
 
 static bool choreRetried;        // the transfer to the printer has been tried a second time
 
+static volatile bool relayReading;   // the relay is reading a file off the card for a download
+
 static bool startChore(const String &name, const bool andPrint, const uint8_t window = 2) {
   choreTrouble = "";
+  if (relayReading) {
+    choreTrouble = "a file is being downloaded off the card, try again when it is done";
+    return false;
+  }
   if (sender.running()) {
     choreTrouble = "a transfer is already running";
     return false;
@@ -814,6 +821,44 @@ int relayPutEnd(const uint32_t size, const bool andPrint, const String &path, St
   body = putAnswer;
   type = putType;
   return putCode;
+}
+
+// A download through the relay, read straight off the card by the relay's task for
+// the reason an upload is written straight onto it: carried through the web server
+// it held the loop for as long as the internet took, and that once hung the module.
+// It counts as an upload under way, so nothing else has the card meanwhile.
+static File getFrom;
+
+int relayGetBegin(const String &said, const String &key, const String &name, uint32_t &size, String &why) {
+  if (!webAuthAllowsWith("GET", said, key, "", "")) {
+    why = "the password was not right";
+    return 401;
+  }
+  if (!cardUp || relayPutting || uploadActive || otaActive.load() || printerWireBusy()) {
+    why = cardUp ? "the card is busy, try again in a moment" : "the module has no card";
+    return 503;
+  }
+  relayReading = true;
+  relayPutting = true;
+  uploadActive = true;
+  getFrom = SD_MMC.open("/" + name);
+  if (!getFrom || getFrom.isDirectory()) {
+    getFrom.close();
+    relayReading = false;
+    putFinished();
+    why = "no such file";
+    return 404;
+  }
+  size = getFrom.size();
+  return 0;
+}
+
+size_t relayGetRead(uint8_t *into, const size_t len) { return getFrom.read(into, len); }
+
+void relayGetEnd() {
+  getFrom.close();
+  relayReading = false;
+  putFinished();
 }
 
 static void finishPut() {
@@ -1108,10 +1153,28 @@ static void startPortal() {
   server.begin();
 }
 
+// The WiFi driver started with half the receive buffers this Arduino core gives it:
+// 8 fixed ones instead of 16 at 1.6 KB each, and a block acknowledgement window of 6,
+// which are close to what the IDF itself ships with. The TCP window here is four
+// segments, so sixteen buffers were never filled. The core's own start finds the
+// driver already up and leaves it as it is.
+void tcpipInit();
+
+static void wifiLean() {
+  tcpipInit();
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  cfg.static_rx_buf_num = 8;
+  cfg.rx_ba_win = 6;
+  cfg.dynamic_rx_buf_num = 16;
+  cfg.dynamic_tx_buf_num = 16;
+  esp_wifi_init(&cfg);
+}
+
 void setup() {
   Serial.begin(115200);
   bootGuardBegin();                 // First, so everything after it is allowed to be broken
 
+  wifiLean();
   WiFi.persistent(true);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -1639,10 +1702,21 @@ void setup() {
     server.send(303, "text/plain", "saved\n");
   });
 
+  // Followed by a restart: the bot's and the socket's tasks were given small stacks at
+  // boot because the relay carried their encryption, and without it they would run
+  // their own handshakes on those.
   route("/relay/forget", HTTP_POST, []() {
+    if (printing) {
+      server.send(409, "text/plain", "the printer is printing: forget the relay when it is done, the module restarts for it\n");
+      return;
+    }
     relayForget();
     server.sendHeader("Location", "/relay");
     server.send(303, "text/plain", "gone\n");
+    journal("relay forgotten, restarting");
+    journalFlush(true);
+    delay(200);
+    ESP.restart();
   });
 
   route("/auth", HTTP_GET, []() {

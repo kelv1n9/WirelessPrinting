@@ -288,12 +288,6 @@ export class Relay {
       return new Response("ok");
     }
 
-    // A large answer coming back up the socket hangs the module (seen 04.11.2026: a
-    // 200 KB download stopped after 2 KB and the module needed a power cycle). Closed
-    // here until the module side is fixed and can be flashed.
-    if (url.pathname === "/download")
-      return new Response("Downloading files through the relay is switched off for now.\n", { status: 501 });
-
     const ws = this.device();
     if (!ws)
       return wantsPage(request)
@@ -385,6 +379,19 @@ export class Relay {
       if (last.status === 200 && (headers.authorization || headers["x-api-key"]))
         await this.giveSession(request, answer);
       return new Response(last.body, { status: last.status, headers: answer });
+    }
+
+    // A file off the module's card. Carried through the module's web server a large
+    // answer hung it (04.11.2026), so the module reads the file and sends it up itself.
+    // It answers nothing else meanwhile, so for the page this counts as an upload: the
+    // password is checked here and the status comes from what was last heard.
+    if (!hasBody && url.pathname === "/download") {
+      const verdict = await this.checkHere(request, url);
+      if (verdict === "challenge")
+        return new Response("The user name is print.\n", { status: 401, headers: { "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
+      const answer = await this.carry(ws, "GET", url.pathname + url.search, headers,
+                                      { t: "get", name: url.searchParams.get("name") || "" });
+      return answer === LOST ? wentAway() : answer;
     }
 
     if (!hasBody) {
@@ -597,22 +604,34 @@ export class Relay {
   }
 
   // A request with no body, answered as a stream straight back to the browser
-  carry(ws, method, path, headers) {
+  // With extra it is a download: the module is busy with it from start to end.
+  carry(ws, method, path, headers, extra = null) {
     const id = this.newId();
     let resolve;
     const answered = new Promise((r) => (resolve = r));
-    const w = { resolve, timer: null, writer: null, t0: Date.now() };
-    this.waiting.set(id, w);
-    w.timer = setTimeout(() => {
-      this.waiting.delete(id);
-      if (w.writer) w.writer.abort("timeout").catch(() => {});
-      else resolve(new Response("The printer module did not answer in time.\n", { status: 504 }));
-    }, ANSWER_TIMEOUT_MS);
-    try {
-      ws.send(JSON.stringify({ i: id, m: method, p: path, h: headers, l: 0 }));
-    } catch (e) {
+    const w = { resolve, timer: null, writer: null, t0: Date.now(), busy: !!extra };
+    if (w.busy) this.uploading++;
+    // Called once, however the answer ends
+    w.over = () => {
       clearTimeout(w.timer);
       this.waiting.delete(id);
+      if (w.busy) { w.busy = false; this.uploading--; }
+    };
+    // Silence is what is timed, so an answer of any length gets through
+    w.quiet = () => {
+      clearTimeout(w.timer);
+      w.timer = setTimeout(() => {
+        w.over();
+        if (w.writer) w.writer.abort("timeout").catch(() => {});
+        else resolve(new Response("The printer module did not answer in time.\n", { status: 504 }));
+      }, ANSWER_TIMEOUT_MS);
+    };
+    this.waiting.set(id, w);
+    w.quiet();
+    try {
+      ws.send(JSON.stringify(Object.assign({ i: id, m: method, p: path, h: headers, l: 0 }, extra || {})));
+    } catch (e) {
+      w.over();
       resolve(LOST);
     }
     return answered;
@@ -771,16 +790,18 @@ export class Relay {
         return;
       }
       if (m.e) {
-        clearTimeout(w.timer);
-        this.waiting.delete(m.i);
-        if (w.writer) w.writer.close().catch(() => {});
+        w.over();
+        if (w.writer) (m.x ? w.writer.abort("cut short") : w.writer.close()).catch(() => {});
         return;
       }
       if (m.s) {
         this.note(`req ${m.i} answered ${m.s} at ${Date.now() - w.t0} ms after ${w.sentPieces || 0} pieces`);
-        const { readable, writable } = new TransformStream();
-        w.writer = writable.getWriter();
         const h = new Headers(m.h || {});
+        // A download says its length, and a stream of a fixed length is what keeps the
+        // header on the way out and fails the download if it ends short
+        const length = w.busy && m.s === 200 ? Number(h.get("content-length")) : 0;
+        const { readable, writable } = length > 0 ? new FixedLengthStream(length) : new TransformStream();
+        w.writer = writable.getWriter();
         h.set("x-robots-tag", "noindex");
         w.resolve(new Response(readable, { status: m.s, headers: h }));
       }
@@ -791,14 +812,14 @@ export class Relay {
     const id = (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0;
     const w = this.waiting.get(id);
     if (w && w.collect) w.collect.push(bytes.slice(4));
-    else if (w && w.writer) w.writer.write(bytes.subarray(4)).catch(() => {});
+    else if (w && w.writer) { w.quiet(); w.writer.write(bytes.subarray(4)).catch(() => {}); }
   }
 
   webSocketClose() {
     this.incident("device socket closed");
     for (const [, w] of this.waiting) {
       if (w.finish) { w.finish({ lost: true }); continue; }
-      clearTimeout(w.timer);
+      w.over();
       if (w.writer) w.writer.abort("closed").catch(() => {});
       else w.resolve(LOST);
     }
