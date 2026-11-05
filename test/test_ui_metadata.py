@@ -29,9 +29,9 @@ helpers = '\n'.join(extract(marker) + (';' if marker.startswith('struct ') else 
     'struct MetaOut :', 'static bool metaHead(', 'static uint32_t metaLayerAt(',
     'static int metaFanAt(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard() {',
     'static String openPrinterFile(', 'static String printOnPrinter('))
-upload = '\n'.join(['File upInto;', '#define UP_BLOCK 16384', 'static uint8_t upBlock[UP_BLOCK]; static size_t upHeld;', 'static volatile bool relayPutting = false;'] +
-                   [extract(m) for m in ('static bool uploadBegin(', 'static void cardWrite(', 'static void uploadWrite(', 'static void uploadEnd(',
-                                         'static void uploadAbort(', 'static void takeUpload()')])
+upload = '\n'.join(['File upInto;', '#define UP_BLOCK 16384', 'static uint8_t upBlock[UP_BLOCK]; static size_t upHeld;', 'static volatile bool relayPutting = false;', 'static bool printerWireBusy() { return false; }', 'static char sendName[64];', 'static void wifiDropTick() {}', 'static void serviceSender() {}', 'static const char EMPTY_FILE[] = "empty";', 'static const char SAME_NAME[] = "busy";'] +
+                   [extract(m) for m in ('static bool uploadBegin(', 'static void cardWrite(', 'static void uploadWrite(', 'static void uploadAbort(',
+                                         'static void uploadEnd(', 'static void takeUpload()')])
 list_route = extract('route("/printer/files",').split('[]() ', 1)[1]
 thumb_route = extract('route("/thumbnail",').split('[]() ', 1)[1]
 print_route = extract('route("/printer/print",').split('[]() ', 1)[1]

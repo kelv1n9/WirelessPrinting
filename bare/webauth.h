@@ -256,16 +256,33 @@ inline void route(const char *uri, const HTTPMethod method,
   server.on(uri, method, [fn]() { if (webAuthLets()) fn(); });
 }
 
+// uploadActive belongs to whoever raised it: the relay raises it for its own files, and
+// an upload through the form must neither lower it under the relay nor let go of it
+// before its own handler has answered, which is when the file's fate is settled.
+static bool formHoldsUpload;
+
 inline void route(const char *uri, const HTTPMethod method,
                   WebServer::THandlerFunction fn, WebServer::THandlerFunction upload) {
-  server.on(uri, method, [fn]() { if (webAuthLets()) fn(); }, [upload]() {
+  server.on(uri, method, [fn]() {
+    if (webAuthLets())
+      fn();
+    if (formHoldsUpload)
+      uploadActive = formHoldsUpload = false;
+  }, [upload]() {
     loopBeat = millis();          // a long upload is one call of the loop, and not a hang
     const int phase = server.upload().status;
-    uploadActive = phase == UPLOAD_FILE_START || phase == UPLOAD_FILE_WRITE;
     static bool letting = false;
-    if (server.upload().status == UPLOAD_FILE_START)
+    if (phase == UPLOAD_FILE_START) {
+      if (formHoldsUpload)
+        uploadActive = false;     // the one before it never reached its handler
+      formHoldsUpload = !uploadActive;
+      if (formHoldsUpload)
+        uploadActive = true;
       letting = webAuthAllows();
+    }
     if (letting)
       upload();
+    if (phase == UPLOAD_FILE_ABORTED && formHoldsUpload)
+      uploadActive = formHoldsUpload = false;
   });
 }

@@ -19,7 +19,13 @@ extern volatile uint32_t crumbRelay, crumbWs;   // RTC, survives a panic: which 
 #define RELAY_FRAME_LIMIT   (24 * 1024)   // a request, body and all, as the Worker sends it
 #define RELAY_CHUNK         2044          // plus four bytes of number makes one 2048 byte buffer, one frame
 #define RELAY_IDLE_MS       20000
-#define RELAY_BLOCK_FLOOR   (45 * 1024)   // a TLS handshake needs this much in one piece
+// What a TLS handshake is started with: two record buffers of 16.7 KB each have to be
+// found whole, and about 65 KB stays taken once it is up. This used to ask for 45 KB
+// in one piece, a guess. After WiFi had gone and come back the largest piece was
+// 44.1 KB with 105 KB free, so the relay sat "waiting for memory" until the guardian
+// restarted the module (found 05.11.2026 by dropping WiFi on purpose).
+#define RELAY_BLOCK_FLOOR   (20 * 1024)
+#define RELAY_HEAP_FLOOR    (80 * 1024)
 #define RELAY_RETRY_MS      15000
 #define RELAY_BODY_PIECES   4             // chunks of an upload waiting to be written or poured
 #define RELAY_WINDOW        16384         // what a file is unpacked in: the card's block, 14 bits
@@ -44,6 +50,7 @@ static uint8_t lastOp;
 static TaskHandle_t worker;
 static char *assembling;
 static volatile bool connected;
+static volatile uint32_t linkEpoch;     // counts connections, so work begun on one is not carried on over the next
 static String url, key, auth, state = "off";
 static uint32_t nextTry;
 
@@ -123,10 +130,16 @@ static void noDelay() {
   }
 }
 
+static volatile uint32_t stopId;      // the download the Worker has called off
+static volatile uint32_t heardAt;     // when anything last came from the Worker, a pong included
+
 static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
   esp_websocket_event_data_t *e = (esp_websocket_event_data_t *)data;
+  if (id == WEBSOCKET_EVENT_DATA || id == WEBSOCKET_EVENT_CONNECTED)
+    heardAt = millis();
   if (id == WEBSOCKET_EVENT_CONNECTED) {
     noDelay();
+    linkEpoch++;
     connected = true;
     state = "connected";
     logEvent("remote access connected");
@@ -134,7 +147,7 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
   }
   if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_ERROR) {
     if (connected)
-      logEvent("remote access lost");
+      logEvent("remote access lost, last heard " + String((millis() - heardAt) / 1000) + " s ago");
     connected = false;
     workerHasBot = false;
     state = "reconnecting";
@@ -227,10 +240,39 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
       assembling = nullptr;
       return;
     }
+    if (!strncmp(assembling, "{\"t\":\"stop\",\"i\":", 16)) {
+      // Whoever was downloading has gone. Seen here and not in the queue, where it
+      // would wait behind the very download it is meant to end.
+      stopId = strtoul(assembling + 16, nullptr, 10);
+      free(assembling);
+      assembling = nullptr;
+      return;
+    }
+    // A request that brings a body. Its pieces come after it on this same socket, so
+    // whatever is in the slots now belongs to a request that is over: one that was
+    // refused, or one that broke off with pieces still on the way. Left there, they
+    // took the slots of this file's first pieces, and its first attempt was lost.
+    const char *l = strstr(assembling, ",\"l\":");
+    if (!taking && (strstr(assembling, "\"t\":\"put\"") || (l && l[5] != '0')))
+      for (Piece late; xQueueReceive(bodies, &late, 0) == pdTRUE;)
+        xQueueSend(freeSlots, &late.slot, 0);
     if (xQueueSend(inbox, &assembling, 0) != pdTRUE)
       free(assembling);
     assembling = nullptr;
   }
+}
+
+// The next piece of a body, or false when none came for 20 s or the connection the
+// request arrived on has gone. Without the second, a put cut off by a lost link went
+// on waiting, and ate the first pieces of the Worker's next attempt on the new link.
+static bool nextPiece(Piece &one, const uint32_t epoch) {
+  for (uint32_t waited = 0; waited < RELAY_IDLE_MS; waited += 500) {
+    if (!connected || linkEpoch != epoch)
+      return false;
+    if (xQueueReceive(bodies, &one, pdMS_TO_TICKS(500)) == pdTRUE)
+      return true;
+  }
+  return false;
 }
 
 static void sendText(const String &text) {
@@ -375,17 +417,25 @@ static void put(uint32_t id, JsonDocument &doc) {
   const String key = h["x-api-key"] | "";
   const String once = h["x-relay-once"] | "";
   doc.clear();
+  const uint32_t epoch = linkEpoch;
 
   // A file still going from the card to the printer is waited for. Empty
   // acknowledgements keep the Worker from taking the silence for a lost module.
-  for (const uint32_t asked = millis(); printerWireBusy() && connected && millis() - asked < 180000;) {
+  // The card is never begun on while that goes on, however long it takes.
+  String why;
+  int refused = -1;
+  for (const uint32_t asked = millis(); connected && linkEpoch == epoch && millis() - asked < 180000;) {
+    if (!printerWireBusy() && (refused = relayPutBegin(said, key, once, name, why)) != -1)
+      break;
     sendText("{\"k\":" + String(id) + ",\"n\":0}");
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
   crumbRelay = 1;
   pushStatus();
-  String why;
-  const int refused = relayPutBegin(said, key, once, name, why);
+  if (refused == -1) {
+    refused = 503;
+    why = "files are still going to the printer, send it again in a minute";
+  }
   if (refused) {
     answer(id, refused, (why + "\n").c_str());
     return;
@@ -429,9 +479,9 @@ static void put(uint32_t id, JsonDocument &doc) {
   uint32_t taken = 0, waitedFrom = millis();
   putWaitMs = putWorkMs = putAckMs = putWriteMs = 0;
   taking = true;
-  while (taken < packed && connected && good) {
+  while (taken < packed && good) {
     Piece one;
-    if (xQueueReceive(bodies, &one, pdMS_TO_TICKS(RELAY_IDLE_MS)) != pdTRUE)
+    if (!nextPiece(one, epoch))
       break;
     const uint32_t gap = millis() - waitedFrom;
     if (gap > worstGapMs)
@@ -465,7 +515,7 @@ static void put(uint32_t id, JsonDocument &doc) {
     relayPutAbort();
     pourFails++;
     logEvent("a file through the relay broke off at " + String(taken) + " of " + String(packed) + " bytes: " +
-             (!connected ? "the link went" : !good ? "it did not unpack" : taken < packed ? "no piece for 20 s" :
+             (!connected || linkEpoch != epoch ? "the link went" : !good ? "it did not unpack" : taken < packed ? "no piece for 20 s" :
               "it came out the wrong size") + ", pieces dropped so far " + String(piecesDropped));
     answer(id, 502, "the upload broke off on the way in\n");
     return;
@@ -501,7 +551,7 @@ static void get(uint32_t id, JsonDocument &doc) {
            "\"Content-Length\":\"" + String(size) + "\"}}");
   memcpy(frame, &id, 4);
   uint32_t sent = 0;
-  while (sent < size && connected) {
+  while (sent < size && connected && stopId != id) {
     const size_t n = relayGetRead(frame + 4, RELAY_CHUNK);
     if (!n || esp_websocket_client_send_bin(ws, (const char *)frame, 4 + n, pdMS_TO_TICKS(10000)) < 0)
       break;
@@ -577,10 +627,11 @@ static void carry(char *raw) {
     return;
   }
 
+  const uint32_t epoch = linkEpoch;
   uint32_t poured = 0, unacked = 0, waitedFrom = millis();
-  while (poured < bodyLen && connected) {
+  while (poured < bodyLen) {
     Piece one;
-    if (xQueueReceive(bodies, &one, pdMS_TO_TICKS(RELAY_IDLE_MS)) != pdTRUE)
+    if (!nextPiece(one, epoch))
       break;
     const uint32_t gap = millis() - waitedFrom;
     if (gap > worstGapMs)
@@ -736,7 +787,8 @@ void relayTick(const bool allowed) {
   }
   if (ws || (int32_t)(millis() - nextTry) < 0)
     return;
-  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < RELAY_BLOCK_FLOOR) {
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < RELAY_BLOCK_FLOOR ||
+      heap_caps_get_free_size(MALLOC_CAP_8BIT) < RELAY_HEAP_FLOOR) {
     state = "waiting for memory";
     nextTry = millis() + RELAY_RETRY_MS;
     return;

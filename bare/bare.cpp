@@ -29,6 +29,16 @@ volatile bool tlsWanted;
 
 volatile uint32_t loopBeat;
 volatile bool uploadActive;
+// The reason is left in memory that outlives a restart, and the journal line is the
+// loop's to write: this task has a 3 KB stack, and writing the card and the settings
+// from it lost both the line and the reason every time it was tried (05.11.2026).
+// Only when the loop is the thing that stopped does this task restart by itself.
+static const char *const GUARD_WHY[] = {"", "the loop stood still for a minute",
+                                        "the relay was down for a minute and a half",
+                                        "the largest free block stayed under 6 KB for five minutes"};
+#define GUARD_MARK 0x47550000
+RTC_NOINIT_ATTR static volatile uint32_t guardWhy;
+static volatile uint8_t restartAsked;
 static String lastRestart;      // why the guardian last restarted the module, read back from NVS
 static void guardian(void *);
 #include "ota.h"
@@ -509,6 +519,8 @@ uint8_t *relayPutBlock() { return upBlock; }
 // or the relay, which hands over the file itself without a form around it.
 static uint32_t upSince, upCardUs, upScanUs;
 
+static const char EMPTY_FILE[] = "the file is empty";
+
 static bool uploadBegin(const String &filename) {
   upSince = millis();
   upCardUs = upScanUs = 0;
@@ -574,6 +586,27 @@ static void uploadWrite(const uint8_t *data, size_t len) {
   }
 }
 
+// Half a file is worse than none: left on the card it looks like the file, and would
+// be sent to the printer as it is. So what was written goes, and what was read out
+// of it on the way goes with it.
+static void uploadAbort(const char *why) {
+  const bool begun = (bool)upInto;
+  upInto.close();
+  metaOut.into.close();
+  metaOut.fans.close();
+  metaOut.picture.close();
+  if (begun) {
+    SD_MMC.remove("/" + lastUpload);
+    if (metaWanted) {
+      SD_MMC.remove(metaPath(metaTarget, ".idx"));
+      SD_MMC.remove(metaPath(metaTarget, ".fan"));
+      SD_MMC.remove(metaOut.tmp);
+    }
+  }
+  metaWanted = false;
+  sendTrouble = why;
+}
+
 static void uploadEnd(const uint32_t expected) {
   if (!upInto)
     return;
@@ -581,6 +614,12 @@ static void uploadEnd(const uint32_t expected) {
     cardWrite(upBlock, upHeld);
   upHeld = 0;
   upInto.flush();
+  if (!expected || upInto.size() != expected) {
+    const char *why = expected ? "the stored upload size does not match" : EMPTY_FILE;
+    journal("did not keep " + lastUpload + ": " + why);
+    uploadAbort(why);
+    return;
+  }
   upInto.close();
   File stored = SD_MMC.open("/" + lastUpload);
   const uint32_t size = stored ? stored.size() : 0;
@@ -613,16 +652,6 @@ static void uploadEnd(const uint32_t expected) {
   }
 }
 
-static void uploadAbort(const char *why) {
-  upInto.close();
-  metaOut.into.close();
-  metaOut.fans.close();
-  metaOut.picture.close();
-  metaWanted = false;
-  sendTrouble = why;
-}
-
-
 // The settings pages wear the main page's colours, day and night, so moving between
 // them does not look like leaving the product.
 static String settingsHead(const char *heading) {
@@ -641,6 +670,24 @@ static String settingsHead(const char *heading) {
     "</style><main><p><a href=\"/\">\u2190 back to the printer</a></p><h1>") + heading + "</h1>";
 }
 
+bool printerWireBusy();
+static void wifiDropTick();
+
+// The file going to the printer is kept going from inside an upload too. The web server
+// takes an upload in one go, and the printer gives a transfer up after ten seconds of
+// silence: a long upload behind a transfer used to cost that transfer a second start.
+static void serviceSender() {
+  if (!sender.running())
+    return;
+  sender.service(millis());
+  if (!sender.running()) {
+    sendBytes.shut();
+    choreSent = millis();
+  }
+}
+static const char SAME_NAME[] = "that file is going to the printer right now, send it again when it is there";
+static int refusalCode(const String &why) { return why == SAME_NAME ? 409 : why == EMPTY_FILE ? 400 : 500; }
+
 static void takeUpload() {
   HTTPUpload &up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
@@ -648,10 +695,18 @@ static void takeUpload() {
       sendTrouble = "a file is coming in through the relay";
       return;
     }
+    // Written over while it is being read for the printer, the printer would get the
+    // start of one file and the end of another
+    if (printerWireBusy() && !strncmp(up.filename.c_str(), sendName, sizeof(sendName) - 1)) {
+      sendTrouble = SAME_NAME;
+      return;
+    }
     uploadBegin(up.filename);
   }
   else if (up.status == UPLOAD_FILE_WRITE && upInto && !relayPutting) {
     loopBeat = millis();
+    wifiDropTick();
+    serviceSender();
     uploadWrite(up.buf, up.currentSize);
   }
   else if (up.status == UPLOAD_FILE_END && upInto && !relayPutting)
@@ -703,7 +758,11 @@ static bool choreRetried;        // the transfer to the printer has been tried a
 
 static volatile bool relayReading;   // the relay is reading a file off the card for a download
 
-static bool startChore(const String &name, const bool andPrint, const uint8_t window = 2) {
+static volatile bool choreStarting;   // startChore is making up its mind
+static bool startChore(const String &name, const bool andPrint, const uint8_t window = 2);
+static bool putLanding;               // the relay's file is whole and shut, only its answer is owed
+
+static bool choreBegin(const String &name, const bool andPrint, const uint8_t window) {
   choreTrouble = "";
   if (relayReading) {
     choreTrouble = "a file is being downloaded off the card, try again when it is done";
@@ -745,9 +804,28 @@ static bool startChore(const String &name, const bool andPrint, const uint8_t wi
 // The module's card is a place to pass through, not a place to keep things, so an
 // upload goes on to the printer's card either way. andPrint only says whether to start
 // it when it lands. Answers as the slicer expects.
+#define PENDING_MAX 6
+static String pendingName[PENDING_MAX];   // uploads that landed while another file was going to the printer
+static bool pendingPrint[PENDING_MAX];
+static uint8_t pendingCount;
+
 static String fileLanded(const bool andPrint) {
   String said = andPrint ? "printing" : "sending";
-  if (!startChore(lastUpload, andPrint))
+  if (printerWireBusy() && !printing) {
+    uint8_t at = 0;
+    while (at < pendingCount && pendingName[at] != lastUpload)
+      at++;
+    if (at == PENDING_MAX)
+      said = "on the module's card, but six files are already waiting: send it from the page later";
+    else {
+      pendingName[at] = lastUpload;    // it goes when the ones before it are there
+      pendingPrint[at] = andPrint;
+      if (at == pendingCount)
+        pendingCount++;
+      said = "queued";
+    }
+  }
+  else if (!startChore(lastUpload, andPrint))
     said = choreTrouble.length() ? choreTrouble : "the printer is busy";
   else if (fileChat != "") {
     choreChat = fileChat;            // it came from the bot, so the bot says how it ended
@@ -768,7 +846,22 @@ static SemaphoreHandle_t putDone;
 
 // The card takes one task at a time: a file read off it for the printer while the relay
 // writes the next one onto it took the module down, and the printer with it.
-bool printerWireBusy() { return sender.running() || sendAsked || chore == ChoreSending; }
+bool printerWireBusy() { return sender.running() || sendAsked || chore == ChoreSending || choreStarting; }
+
+// The relay writes its file on its own task. So each side says what it is about to do
+// before it looks at the other: the relay raises relayPutting and then looks at the wire,
+// this raises choreStarting and then looks at relayPutting. One of the two always sees
+// the other, and the card never has both.
+static bool startChore(const String &name, const bool andPrint, const uint8_t window) {
+  choreStarting = true;
+  bool began = false;
+  if (relayPutting && !putLanding)
+    choreTrouble = "a file is coming in through the relay, send it when that one is there";
+  else
+    began = choreBegin(name, andPrint, window);
+  choreStarting = false;
+  return began;
+}
 
 static void putFinished() {
   relayPutting = false;
@@ -786,6 +879,10 @@ int relayPutBegin(const String &said, const String &key, const String &once, con
   }
   relayPutting = true;
   uploadActive = true;
+  if (printerWireBusy()) {
+    putFinished();
+    return -1;                       // the caller waits and asks again
+  }
   if (!uploadBegin(name)) {
     why = sendTrouble;
     sendTrouble = "";
@@ -834,13 +931,19 @@ int relayGetBegin(const String &said, const String &key, const String &name, uin
     why = "the password was not right";
     return 401;
   }
-  if (!cardUp || relayPutting || uploadActive || otaActive.load() || printerWireBusy()) {
+  if (!cardUp || relayPutting || uploadActive || otaActive.load()) {
     why = cardUp ? "the card is busy, try again in a moment" : "the module has no card";
     return 503;
   }
   relayReading = true;
   relayPutting = true;
   uploadActive = true;
+  if (printerWireBusy()) {           // looked at after saying so, as a put does
+    relayReading = false;
+    putFinished();
+    why = "the card is busy, try again in a moment";
+    return 503;
+  }
   getFrom = SD_MMC.open("/" + name);
   if (!getFrom || getFrom.isDirectory()) {
     getFrom.close();
@@ -863,7 +966,7 @@ void relayGetEnd() {
 
 static void finishPut() {
   if (sendTrouble != "") {
-    putCode = putPath.startsWith("/api/files/local") ? 500 : 400;
+    putCode = putPath.startsWith("/api/files/local") ? refusalCode(sendTrouble) : 400;
     putType = "text/plain";
     putAnswer = sendTrouble + "\n";
     sendTrouble = "";
@@ -1160,6 +1263,21 @@ static void startPortal() {
 // driver already up and leaves it as it is.
 void tcpipInit();
 
+static uint32_t wifiBackAt;        // when a drop asked for through /bench/wifidrop ends
+static uint32_t wifiDropAt, wifiDropFor;
+
+// Called from the loop and from inside an upload, so that a drop can be made to fall
+// in the middle of one: the web server takes an upload in one go and the loop does not
+// turn meanwhile.
+static void wifiDropTick() {
+  if (!wifiDropAt || (int32_t)(millis() - wifiDropAt) < 0)
+    return;
+  wifiDropAt = 0;
+  journal("wifi dropped on purpose for " + String(wifiDropFor) + " ms");
+  wifiBackAt = millis() + wifiDropFor;
+  WiFi.disconnect(false);
+}
+
 static void wifiLean() {
   tcpipInit();
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -1320,7 +1438,7 @@ void setup() {
     if (sendTrouble != "") {
       const String why = sendTrouble;
       sendTrouble = "";
-      server.send(500, "application/json", "{\"error\":\"" + why + "\"}");
+      server.send(refusalCode(why), "application/json", "{\"error\":\"" + why + "\"}");
       return;
     }
     const String wanted = server.arg("print");
@@ -1580,6 +1698,17 @@ void setup() {
                 cardUp ? "mounted\n" : "the card would not come up\n");
   });
 
+  // The network taken away for a while, the way a router restart or a bad evening on
+  // the channel takes it, so that what the module does then is tested and not hoped:
+  // /bench/wifidrop?ms=8000. It rejoins by itself.
+  route("/bench/wifidrop", HTTP_POST, []() {
+    const uint32_t ms = constrain(server.arg("ms").toInt(), 1000, 30000);
+    const uint32_t after = constrain(server.arg("after").toInt(), 0, 60000);
+    server.send(200, "text/plain", "dropping wifi for " + String(ms) + " ms, " + String(after) + " ms from now\n");
+    wifiDropFor = ms;
+    wifiDropAt = millis() + after + 100;
+  });
+
   // Where the free memory is: every free block of 2 KB and over, largest first, with
   // its address. Found by taking them one after another and handing them all back.
   route("/bench/heap", HTTP_GET, []() {
@@ -1612,13 +1741,15 @@ void setup() {
   route("/bench/card", HTTP_POST, []() {
     const size_t block = constrain(server.arg("block").toInt(), 512, UP_BLOCK);
     const size_t kb = constrain(server.arg("kb").toInt(), 64, 8192);
-    if (!cardUp || printing || sender.running() || uploadActive) {
+    if (!cardUp || printing || printerWireBusy() || uploadActive || relayPutting) {
       server.send(409, "text/plain", "the card is busy or not there\n");
       return;
     }
-    uint8_t *const buf = upBlock;      // free: no upload is running
+    uploadActive = true;               // the card and the block are this bench's until it ends
+    uint8_t *const buf = upBlock;
     File out = SD_MMC.open("/zz_bench.bin", FILE_WRITE);
     if (!out) {
+      uploadActive = false;
       server.send(503, "text/plain", "the card refused the file\n");
       return;
     }
@@ -1659,6 +1790,7 @@ void setup() {
     }
     const uint32_t took = millis() - t0;
     SD_MMC.remove("/zz_bench.bin");
+    uploadActive = false;
     server.send(good ? 200 : 500, "text/plain", "block " + String(block) + ", " + String(kb) + " KB in " +
                 String(took) + " ms, " + String(took ? kb * 1000 / took : 0) + " KB/s, worst write " +
                 String(worst) + " ms, slow:" + slow + (good ? "\n" : ", a write failed\n"));
@@ -1706,8 +1838,8 @@ void setup() {
   // boot because the relay carried their encryption, and without it they would run
   // their own handshakes on those.
   route("/relay/forget", HTTP_POST, []() {
-    if (printing) {
-      server.send(409, "text/plain", "the printer is printing: forget the relay when it is done, the module restarts for it\n");
+    if (printing || printerWireBusy()) {
+      server.send(409, "text/plain", "the printer is printing or taking a file: forget the relay when it is done, the module restarts for it\n");
       return;
     }
     relayForget();
@@ -2021,11 +2153,9 @@ void setup() {
   yandexHome.begin();
   telegramBot.begin();
   {
-    Preferences keep;
-    keep.begin("guard", false);
-    lastRestart = keep.getString("why", "");
-    keep.remove("why");
-    keep.end();
+    if ((guardWhy & 0xFFFF0000) == GUARD_MARK)
+      lastRestart = GUARD_WHY[guardWhy & 3];
+    guardWhy = 0;
   }
   {
     static const char *const why[] = {"unknown", "power on", "reset pin", "software restart", "panic",
@@ -2248,13 +2378,13 @@ static void handleTelegram() {
 #define GUARD_BLOCK_FLOOR 6144
 #define GUARD_BLOCK_MS    300000
 
-static void guardianRestart(const char *why) {
-  journal(String("restarting: ") + why);
-  journalFlush(true);
-  Preferences keep;
-  keep.begin("guard", false);
-  keep.putString("why", why);
-  keep.end();
+
+static void guardianRestart(const uint8_t code) {
+  guardWhy = GUARD_MARK | code;
+  if (code != 1) {
+    restartAsked = code;
+    vTaskDelay(pdMS_TO_TICKS(15000));
+  }
   esp_restart();
 }
 
@@ -2266,7 +2396,7 @@ static void guardian(void *) {
     if (otaActive.load())
       continue;
     if (now - loopBeat > GUARD_LOOP_MS)
-      guardianRestart("the loop stood still for a minute");
+      guardianRestart(1);
 
     const bool relayWanted = relayConfigured() && webAuthSet() && WiFi.status() == WL_CONNECTED;
     // Not while a file is going to the printer: a restart there would break the
@@ -2276,7 +2406,7 @@ static void guardian(void *) {
     else if (!relayDownSince)
       relayDownSince = now;
     else if (now - relayDownSince > GUARD_RELAY_MS)
-      guardianRestart("the relay was down for a minute and a half");
+      guardianRestart(2);
 
     // An upload breaks the heap into small pieces for as long as it runs and gives
     // them back at the end. Counting that as a hang restarted the module two minutes
@@ -2286,16 +2416,24 @@ static void guardian(void *) {
     else if (!lowSince)
       lowSince = now;
     else if (now - lowSince > GUARD_BLOCK_MS)
-      guardianRestart("the largest free block stayed under 6 KB for five minutes");
+      guardianRestart(3);
   }
 }
 
 void loop() {
   loopBeat = millis();
   crumbLoop = 1;
+  if (restartAsked) {
+    journal(String("restarting: ") + GUARD_WHY[restartAsked & 3]);
+    journalFlush(true);
+    delay(200);
+    ESP.restart();
+  }
   if (putLanded) {
     putLanded = false;
+    putLanding = true;
     finishPut();
+    putLanding = false;
     xSemaphoreGive(putDone);
   }
   crumbLoop = 2;
@@ -2321,6 +2459,19 @@ void loop() {
         : "could not put " + String(sendName) + " on the printer's card: " + choreTrouble);
     }
     choreWas = chore;
+    // After the line above, so that the file before it is written down as done first
+    if (pendingCount && !printerWireBusy() && !relayPutting && !printing) {
+      const String next = pendingName[0];
+      const bool andPrint = pendingPrint[0];
+      pendingCount--;
+      for (uint8_t i = 0; i < pendingCount; i++) {
+        pendingName[i] = pendingName[i + 1];
+        pendingPrint[i] = pendingPrint[i + 1];
+      }
+      pendingName[pendingCount] = "";
+      if (!startChore(next, andPrint))
+        journal("could not send " + next + " from the queue: " + choreTrouble);
+    }
   }
   isPrinting = printing;             // what the bot's task reads, kept in step from one place
   bootGuardWatch(WiFi.status() == WL_CONNECTED);
@@ -2338,13 +2489,7 @@ void loop() {
   if (!sender.running())
     drain();                     // The one reader, whenever the sender does not own the wire
 
-  if (sender.running()) {
-    sender.service(millis());
-    if (!sender.running()) {
-      sendBytes.shut();
-      choreSent = millis();
-    }
-  }
+  serviceSender();
 
   // The transfer is over. Nothing is believed until the printer's own card says so.
   if (chore == ChoreSending && !sender.running() && !sendAsked) {
@@ -2377,7 +2522,7 @@ void loop() {
         chirp(2);
       }
     }
-    else if (!askPrinterCard()) {
+    else if (!askPrinterCard() && !askPrinterCard()) {   // asked twice: one listing in dozens comes back short
       choreTrouble = "the printer did not answer with a listing";
       chore = ChoreFailed;
     }
@@ -2486,6 +2631,25 @@ void loop() {
       !sender.running() && !yandexHome.busy() && (int32_t)(millis() - drawAgain) >= 0) {
     drawAgain = millis() + (printing ? POWERDRAW_EVERY : POWERDRAW_IDLE);
     yandexHome.request(YandexHome::PowerDraw);
+  }
+
+  // A line every half hour. When the module is found dead, the journal then says when
+  // it was last alive, how its memory was doing and what the socket was feeding it.
+  static uint32_t aliveAt;
+  if (millis() - aliveAt >= 1800000) {
+    aliveAt = millis();
+    const bool fresh = yandexHome.getPowerAt() && millis() - yandexHome.getPowerAt() < 2 * POWERDRAW_IDLE;
+    journal("alive, up " + String(millis() / 60000) + " min, data memory " +
+            String(heap_caps_get_free_size(MALLOC_CAP_8BIT)) + ", largest block " +
+            String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)) + ", lowest " +
+            String(heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)) + ", rssi " + String(WiFi.RSSI()) +
+            ", relay " + relayState() + ", socket " + (fresh ? String(yandexHome.getPower(), 1) + " W" : String("not read")));
+  }
+
+  wifiDropTick();
+  if (wifiBackAt && (int32_t)(millis() - wifiBackAt) >= 0) {
+    wifiBackAt = 0;
+    WiFi.reconnect();
   }
 
   static uint32_t downSince;

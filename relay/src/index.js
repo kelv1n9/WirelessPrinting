@@ -389,8 +389,16 @@ export class Relay {
       const verdict = await this.checkHere(request, url);
       if (verdict === "challenge")
         return new Response("The user name is print.\n", { status: 401, headers: { "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
-      const answer = await this.carry(ws, "GET", url.pathname + url.search, headers,
-                                      { t: "get", name: url.searchParams.get("name") || "" });
+      // In the same line as the uploads: the module does one of them at a time, and an
+      // upload sent into a running download waited for acknowledgements that could not come
+      let free;
+      const before = this.bodies;
+      this.bodies = before.then(() => new Promise((r) => (free = r)));
+      await before;
+      const device = this.device();
+      if (!device) { free(); return wentAway(); }
+      const answer = await this.carry(device, "GET", url.pathname + url.search, headers,
+                                      { t: "get", name: url.searchParams.get("name") || "" }, free);
       return answer === LOST ? wentAway() : answer;
     }
 
@@ -605,7 +613,7 @@ export class Relay {
 
   // A request with no body, answered as a stream straight back to the browser
   // With extra it is a download: the module is busy with it from start to end.
-  carry(ws, method, path, headers, extra = null) {
+  carry(ws, method, path, headers, extra = null, whenOver = null) {
     const id = this.newId();
     let resolve;
     const answered = new Promise((r) => (resolve = r));
@@ -616,6 +624,7 @@ export class Relay {
       clearTimeout(w.timer);
       this.waiting.delete(id);
       if (w.busy) { w.busy = false; this.uploading--; }
+      if (whenOver) { whenOver(); whenOver = null; }
     };
     // Silence is what is timed, so an answer of any length gets through
     w.quiet = () => {
@@ -694,8 +703,10 @@ export class Relay {
       }
       // The module pours an upload into its card at its own pace, well after the last
       // byte has left here, so the wait grows with the size (a floor of 16 KB/s).
-      w.timer = setTimeout(() => w.finish({ lost: true }),
-                           ANSWER_TIMEOUT_MS + Math.ceil(body.length / 16384) * 1000);
+      // Counted from the module's last word and not from the last byte: a module that is
+      // waiting for the printer's wire says so every two seconds, for minutes if it must
+      w.finalMs = ANSWER_TIMEOUT_MS + Math.ceil(body.length / 16384) * 1000;
+      w.timer = setTimeout(() => w.finish({ lost: true }), w.finalMs);
     });
   }
 
@@ -761,6 +772,10 @@ export class Relay {
         if (w) {
           w.lastAck = Date.now();
           w.acks = (w.acks || 0) + 1;
+          if (w.finalMs) {
+            clearTimeout(w.timer);
+            w.timer = setTimeout(() => w.finish({ lost: true }), w.finalMs);
+          }
           if (w.acks <= 12 || w.acks % 20 === 0)
             this.note(`ack ${w.acks} for req ${m.k} n ${m.n || 1} at ${Date.now() - w.t0} ms, sent ${w.sentPieces}, credit ${w.credit}`);
           // The module can widen the window for one file when it has the memory for it
@@ -812,10 +827,24 @@ export class Relay {
     const id = (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0;
     const w = this.waiting.get(id);
     if (w && w.collect) w.collect.push(bytes.slice(4));
-    else if (w && w.writer) { w.quiet(); w.writer.write(bytes.subarray(4)).catch(() => {}); }
+    else if (w && w.writer) {
+      w.quiet();
+      // Whoever was downloading has gone: the module is told, so that it stops reading
+      // its card for nobody and the card is free for the next request
+      w.writer.write(bytes.subarray(4)).catch(() => {
+        if (w.gone) return;
+        w.gone = true;
+        w.over();
+        this.note(`req ${id} was dropped by its reader, the module is told to stop`);
+        try { ws.send(JSON.stringify({ t: "stop", i: id })); } catch (e) {}
+      });
+    }
   }
 
-  webSocketClose() {
+  webSocketClose(ws) {
+    // The close of a socket the module has already replaced says nothing about the
+    // requests in flight on the new one
+    if (ws && this.state.getWebSockets("device").some((s) => s !== ws && s.readyState === 1)) return;
     this.incident("device socket closed");
     for (const [, w] of this.waiting) {
       if (w.finish) { w.finish({ lost: true }); continue; }
@@ -826,7 +855,7 @@ export class Relay {
     this.waiting.clear();
   }
 
-  webSocketError() {
-    this.webSocketClose();
+  webSocketError(ws) {
+    this.webSocketClose(ws);
   }
 }
