@@ -320,6 +320,14 @@ function spark(svg, arr){
 
 function render(d){
   $('machine').textContent = d.system.machine;
+  relayUploading = !!d.relayUpload;
+  if (relayUploading) {
+    const u = d.relayUpload, pct = u.total ? Math.round(u.sent * 100 / u.total) : 0;
+    $('xfer').classList.remove('hide');
+    $('xfer').textContent = 'upload ' + pct + '%';
+    $('xline').textContent = 'to the module, ' + kib(u.sent) + ' of ' + kib(u.total) +
+      (u.rate ? ', ' + kib(u.rate) + '/s' : '');
+  }
   $('unlocked').classList.toggle('hide', d.locked !== false);
   conPrinting = d.printing;
 
@@ -389,7 +397,12 @@ let busy = false;
 // Through the Cloudflare relay every poll is a request against the free day's allowance.
 const remote = !/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.|127\.|localhost)/.test(location.hostname);
 
+// Set while the Cloudflare relay is still carrying a file down to the module; the
+// module answers nothing else meanwhile, so that is the only progress there is.
+let relayUploading = false;
+
 async function pollTransfer(){
+  if (relayUploading) return;
   const t = await (await fetch('/printer/send/status')).text();
   const of = s => (t.match(new RegExp('^' + s + ' +(.*)$', 'm')) || ['',''])[1];
   const phase = of('phase'), w = of('written').split(' ');

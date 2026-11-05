@@ -311,57 +311,50 @@ void WebServer::_uploadWriteByte(uint8_t b){
 }
 
 int WebServer::_uploadReadByte(WiFiClient& client){
-  int res = client.read();
-  if(res < 0) {
-    // keep trying until you either read a valid byte or timeout
-    unsigned long startMillis = millis();
-    long timeoutIntervalMillis = client.getTimeout();
-    boolean timedOut = false;
-    for(;;) {
-      if (!client.connected()) return -1;
-      // loosely modeled after blinkWithoutDelay pattern
-      while(!timedOut && !client.available() && client.connected()){
-        delay(2);
-        timedOut = millis() - startMillis >= timeoutIntervalMillis;
-      }
-
-      res = client.read();
-      if(res >= 0) {
-        return res; // exit on a valid read
-      }
-      // NOTE: it is possible to get here and have all of the following
-      //       assertions hold true
-      //
-      //       -- client.available() > 0
-      //       -- client.connected == true
-      //       -- res == -1
-      //
-      //       a simple retry strategy overcomes this which is to say the
-      //       assertion is not permanent, but the reason that this works
-      //       is elusive, and possibly indicative of a more subtle underlying
-      //       issue
-
-      timedOut = millis() - startMillis >= timeoutIntervalMillis;
-      if(timedOut) {
-        return res; // exit on a timeout
+  if (_formPos < _formLen)
+    return _formBuf[_formPos++];
+  unsigned long startMillis = millis();
+  const long timeoutIntervalMillis = client.getTimeout();
+  for(;;) {
+    const int ready = client.available();
+    if (ready > 0) {
+      const int took = client.read(_formBuf, ready < (int)sizeof(_formBuf) ? ready : (int)sizeof(_formBuf));
+      if (took > 0) {
+        _formLen = took;
+        _formPos = 1;
+        return _formBuf[0];
       }
     }
+    else if (!client.connected())
+      return -1;
+    if (millis() - startMillis >= (unsigned long)timeoutIntervalMillis)
+      return -1;
+    delay(1);
   }
+}
 
-  return res;
+String WebServer::_formReadLine(WiFiClient& client, char terminator){
+  String out;
+  for(;;) {
+    const int c = _uploadReadByte(client);
+    if (c < 0 || c == terminator)
+      return out;
+    out += (char)c;
+  }
 }
 
 bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
   (void) len;
+  _formLen = _formPos = 0;
   log_v("Parse Form: Boundary: %s Length: %d", boundary.c_str(), len);
   String line;
   int retry = 0;
   do {
-    line = client.readStringUntil('\r');
+    line = _formReadLine(client, '\r');
     ++retry;
   } while (line.length() == 0 && retry < 3);
 
-  client.readStringUntil('\n');
+  _formReadLine(client, '\n');
   //start reading the form
   if (line == ("--"+boundary)){
    if(_postArgs) delete[] _postArgs;
@@ -374,8 +367,8 @@ bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
       String argFilename;
       bool argIsFile = false;
 
-      line = client.readStringUntil('\r');
-      client.readStringUntil('\n');
+      line = _formReadLine(client, '\r');
+      _formReadLine(client, '\n');
       if (line.length() > 19 && line.substring(0, 19).equalsIgnoreCase(F("Content-Disposition"))){
         int nameStart = line.indexOf('=');
         if (nameStart != -1){
@@ -395,19 +388,19 @@ bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
           log_v("PostArg Name: %s", argName.c_str());
           using namespace mime;
           argType = FPSTR(mimeTable[txt].mimeType);
-          line = client.readStringUntil('\r');
-          client.readStringUntil('\n');
+          line = _formReadLine(client, '\r');
+          _formReadLine(client, '\n');
           if (line.length() > 12 && line.substring(0, 12).equalsIgnoreCase(FPSTR(Content_Type))){
             argType = line.substring(line.indexOf(':')+2);
             //skip next line
-            client.readStringUntil('\r');
-            client.readStringUntil('\n');
+            _formReadLine(client, '\r');
+            _formReadLine(client, '\n');
           }
           log_v("PostArg Type: %s", argType.c_str());
           if (!argIsFile){
             while(1){
-              line = client.readStringUntil('\r');
-              client.readStringUntil('\n');
+              line = _formReadLine(client, '\r');
+              _formReadLine(client, '\n');
               if (line.startsWith("--"+boundary)) break;
               if (argValue.length() > 0) argValue += "\n";
               argValue += line;
@@ -495,8 +488,8 @@ readfile:
                 if(_currentHandler && _currentHandler->canUpload(_currentUri))
                   _currentHandler->upload(*this, _currentUri, *_currentUpload);
                 log_v("End File: %s Type: %s Size: %d", _currentUpload->filename.c_str(), _currentUpload->type.c_str(), _currentUpload->totalSize);
-                line = client.readStringUntil(0x0D);
-                client.readStringUntil(0x0A);
+                line = _formReadLine(client, 0x0D);
+                _formReadLine(client, 0x0A);
                 if (line == "--"){
                   log_v("Done Parsing POST");
                   break;

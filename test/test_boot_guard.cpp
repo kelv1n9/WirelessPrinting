@@ -38,7 +38,7 @@ static void check(const bool ok, const char *what) {
 // One power up. Returns true when the guard sent the module back to the other slot.
 // up_ms is how long the module then stays alive, online says whether wifi came up.
 static bool boot(const uint32_t up_ms, const bool online) {
-  guardOpen = guardArmed = guardConfirmed = guardQuickCleared = false;
+  guardOpen = guardArmed = guardConfirmed = guardQuickCleared = guardQuickCounted = false;
   guardStore = 0;
   guardBootAt = guardOnlineSince = 0;
   guardOnline = false;
@@ -146,6 +146,16 @@ int main() {
   check(!boot(5000, true), "two");
   check(boot(5000, true), "three must fall back");
   check(testBootSet == &testApp0, "pointed at the other slot");
+
+  scenario = "the supply bouncing as the printer comes on does not count";
+  freshFlash();
+  testBootSet = &testApp1; testRunning = &testApp1;
+  for (int i = 0; i < 6; i++)
+    check(!boot(500, true), "a reset within the first moment is not a flick");
+  check(testBootSet == &testApp1, "a confirmed image stays");
+  check(!boot(5000, true), "a real flick still counts, one");
+  check(!boot(5000, true), "two");
+  check(boot(5000, true), "and three still sends it back");
 
   scenario = "flicks do not add up once the module has been up a while";
   freshFlash();

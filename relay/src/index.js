@@ -205,7 +205,17 @@ export class Relay {
       if (cached) {
         const h = new Headers(cached.headers || {});
         h.set("x-relay-cached", "uploading");
-        return new Response(cached.body, { status: 200, headers: h });
+        let body = cached.body;
+        // The status carries how far the file has got, the only progress there is now
+        if (url.pathname === "/api/status" && this.progress) {
+          try {
+            const d = JSON.parse(new TextDecoder().decode(body));
+            const p = this.progress, secs = (Date.now() - p.t0) / 1000;
+            d.relayUpload = { sent: p.sent, total: p.total, rate: secs > 1 ? Math.round(p.sent / secs) : 0 };
+            body = new TextEncoder().encode(JSON.stringify(d));
+          } catch (e) {}
+        }
+        return new Response(body, { status: 200, headers: h });
       }
       return new Response("The module is busy taking a file. Try again when it is done.\n",
                           { status: 503, headers: { "retry-after": "5" } });
@@ -274,6 +284,7 @@ export class Relay {
       return last && !last.lost ? last : null;
       } finally {
         this.uploading--;
+        if (!this.uploading) this.progress = null;
       }
     });
     this.bodies = turn.catch(() => {});
@@ -433,6 +444,10 @@ export class Relay {
           w.credit--;
           ws.send(framed(id, body.subarray(o, o + CHUNK)));
           w.sentPieces++;
+          if (body.length > CHUNK) {
+            if (!this.progress || this.progress.id !== id) this.progress = { id, t0: Date.now(), sent: 0, total: body.length };
+            this.progress.sent = Math.min(body.length, w.sentPieces * CHUNK);
+          }
         }
       } catch (e) {
         return w.finish({ lost: true });

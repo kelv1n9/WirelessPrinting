@@ -169,6 +169,12 @@ protected:
   bool _parseFormUploadAborted();
   void _uploadWriteByte(uint8_t b);
   int _uploadReadByte(WiFiClient& client);
+  // Also changed here: the form parser read the body a byte at a time, one call into
+  // the network stack per byte, which held uploads to a few tens of KB/s. It now reads
+  // blocks into this buffer, and every read inside the form goes through it.
+  String _formReadLine(WiFiClient& client, char terminator);
+  uint8_t _formBuf[1460];
+  int _formLen = 0, _formPos = 0;
   void _prepareHeader(String& response, int code, const char* content_type, size_t contentLength);
   bool _collectHeader(const char* headerName, const char* headerValue);
 

@@ -13,12 +13,14 @@
 #define BOOTGUARD_OFFLINE_MS  300000    // Longer than the configuration portal, so that gets its turn
 #define BOOTGUARD_QUICK_MS    30000     // A boot shorter than this counts towards the escape
 #define BOOTGUARD_QUICK_HITS  3         // Power cycles in a row that force the other slot
+#define BOOTGUARD_COUNT_MS    2000      // A boot has to live this long to count as one of them
 
 static nvs_handle guardStore;
 static bool guardOpen;
 static bool guardArmed;         // This boot is the one on trial
 static bool guardConfirmed;
 static bool guardQuickCleared;
+static bool guardQuickCounted;
 static uint32_t guardBootAt;
 static uint32_t guardOnlineSince;
 static bool guardOnline;     // A plain flag, because a zero stamp cannot be told from a real one
@@ -102,8 +104,11 @@ void bootGuardBegin() {
   const uint32_t pending = guardGet32("pending");
   guardTrialsLeft = guardGet8("trials");
 
+  // Written down only once this boot has lived a couple of seconds. The module is fed
+  // by the printer, and a printer switched on can drop its supply a few times in the
+  // first moment; counted at once, those resets added up to three and sent a healthy,
+  // confirmed image back to the older one in the other slot.
   guardQuickCount = guardGet8("quick") + 1;
-  guardSet8("quick", guardQuickCount);
 
   // The loader can refuse a damaged image by itself, and then we are already home
   bool spoken = false;
@@ -138,6 +143,12 @@ void bootGuardBegin() {
 
 void bootGuardWatch(const bool online) {
   const uint32_t up = millis() - guardBootAt;
+
+  if (!guardQuickCounted && up >= BOOTGUARD_COUNT_MS) {
+    guardQuickCounted = true;
+    if (!guardQuickCleared)
+      guardSet8("quick", guardQuickCount);
+  }
 
   if (!guardQuickCleared && up >= BOOTGUARD_QUICK_MS) {
     guardQuickCleared = true;
