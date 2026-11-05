@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <esp_websocket_client.h>
+#include <esp_heap_caps.h>
 #include <ArduinoJson.h>
 #include "relay.h"
 #include "relayroots.h"
@@ -9,12 +10,18 @@
 #include "relaypour.h"
 #include "hsunpack.h"
 
+void logEvent(const String &text);
+bool printerWireBusy();
+extern volatile uint32_t crumbRelay, crumbWs;   // RTC, survives a panic: which step the relay task was at
+
 #define RELAY_FRAME_LIMIT   (24 * 1024)   // a request, body and all, as the Worker sends it
 #define RELAY_CHUNK         2044          // plus four bytes of number makes one 2048 byte buffer, one frame
 #define RELAY_IDLE_MS       20000
 #define RELAY_BLOCK_FLOOR   (45 * 1024)   // a TLS handshake needs this much in one piece
 #define RELAY_RETRY_MS      15000
 #define RELAY_BODY_PIECES   6             // chunks of an upload waiting to be poured into the web server
+#define RELAY_PUT_PIECES    10            // and for a file going straight to the card, while it lasts
+#define RELAY_PUT_HEAP_KEEP (60 * 1024)   // what stays free whatever the extra pieces would like
 
 static esp_websocket_client_handle_t ws;
 static QueueHandle_t inbox;
@@ -25,7 +32,8 @@ struct Piece {
   uint8_t slot;
   uint16_t len;
 };
-static uint8_t slots[RELAY_BODY_PIECES][RELAY_SLOT_BYTES];
+static uint8_t baseSlots[RELAY_BODY_PIECES][RELAY_SLOT_BYTES];
+static uint8_t *slots[RELAY_PUT_PIECES];
 static QueueHandle_t bodies, freeSlots;
 static uint8_t lastOp;
 static TaskHandle_t worker;
@@ -41,6 +49,7 @@ String relayInternalKey;
 
 // What the upload path has been doing, so the next problem is read and not guessed
 static volatile uint32_t piecesIn, piecesDropped, acksSent, worstAckMs, worstGapMs, pourFails;
+static volatile uint32_t putWaitMs, putWorkMs, putAckMs, putWriteMs, sendFails, putRoom, putTaken;
 static volatile bool workerHasBot;      // the Worker said it holds a bot token
 
 // One Yandex request at a time, answered straight from the socket's task so that an
@@ -68,7 +77,10 @@ String relayState() { return state; }
 String relayStats() {
   return "pieces " + String(piecesIn) + ", dropped " + String(piecesDropped) +
          ", acks " + String(acksSent) + ", worst ack " + String(worstAckMs) +
-         " ms, worst gap " + String(worstGapMs) + " ms, pour fails " + String(pourFails);
+         " ms, worst gap " + String(worstGapMs) + " ms, pour fails " + String(pourFails) +
+         ", last put waited " + String(putWaitMs) + " ms, worked " + String(putWorkMs) +
+         " ms (card " + String(putWriteMs) + " ms), acked " + String(putAckMs) + " ms, send fails " +
+         String(sendFails) + ", room " + String(putRoom) + ", taken " + String(putTaken) + ", heap " + String(ESP.getFreeHeap());
 }
 
 void relaySet(const String &u, const String &k) {
@@ -95,9 +107,12 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
   if (id == WEBSOCKET_EVENT_CONNECTED) {
     connected = true;
     state = "connected";
+    logEvent("remote access connected");
     return;
   }
   if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_ERROR) {
+    if (connected)
+      logEvent("remote access lost");
     connected = false;
     workerHasBot = false;
     state = "reconnecting";
@@ -129,12 +144,18 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
         piecesDropped++;
         return;
       }
+      if (!slots[cur.slot]) {
+        piecesDropped++;
+        return;
+      }
       holding = true;
       cur.len = (uint16_t)e->payload_len;
     }
     if (!holding || e->payload_offset + e->data_len > cur.len)
       return;
+    crumbWs = 100 + cur.slot;
     memcpy(slots[cur.slot] + e->payload_offset, e->data_ptr, e->data_len);
+    crumbWs = 0;
     if (e->payload_offset + e->data_len == cur.len) {
       if (xQueueSend(bodies, &cur, 0) == pdTRUE) {
         holding = false;
@@ -172,8 +193,9 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
 }
 
 static void sendText(const String &text) {
-  if (ws && connected)
-    esp_websocket_client_send_text(ws, text.c_str(), text.length(), pdMS_TO_TICKS(5000));
+  if (ws && connected &&
+      esp_websocket_client_send_text(ws, text.c_str(), text.length(), pdMS_TO_TICKS(5000)) < 0)
+    sendFails++;
 }
 
 static void answer(uint32_t id, int status, const char *message) {
@@ -311,6 +333,13 @@ static void put(uint32_t id, JsonDocument &doc) {
   const String once = h["x-relay-once"] | "";
   doc.clear();
 
+  // A file still going from the card to the printer is waited for. Empty
+  // acknowledgements keep the Worker from taking the silence for a lost module.
+  for (const uint32_t asked = millis(); printerWireBusy() && connected && millis() - asked < 180000;) {
+    sendText("{\"k\":" + String(id) + ",\"n\":0}");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+  crumbRelay = 1;
   pushStatus();
   String why;
   const int refused = relayPutBegin(said, key, once, name, why);
@@ -319,21 +348,84 @@ static void put(uint32_t id, JsonDocument &doc) {
     return;
   }
 
+  crumbRelay = 2;
+  // A wider window for this file only: more pieces in flight is what the speed across
+  // the internet comes down to. The extra pieces are one allocation, so handing it back
+  // leaves the heap as it was; pieces allocated one by one left it in bits.
+  static uint8_t *extra;
+  const uint8_t room = RELAY_PUT_PIECES - RELAY_BODY_PIECES;
+  if (!extra && ESP.getFreeHeap() >= RELAY_PUT_HEAP_KEEP + room * RELAY_SLOT_BYTES &&
+      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= room * RELAY_SLOT_BYTES + 12 * 1024) {
+    extra = (uint8_t *)malloc(room * RELAY_SLOT_BYTES);
+    if (extra)
+      for (uint8_t i = RELAY_BODY_PIECES; i < RELAY_PUT_PIECES; i++) {
+        slots[i] = extra + (i - RELAY_BODY_PIECES) * RELAY_SLOT_BYTES;
+        xQueueSend(freeSlots, &i, 0);
+      }
+  }
+  putRoom = extra ? room : 0;
+  if (extra)
+    sendText("{\"k\":" + String(id) + ",\"n\":0,\"c\":" + String(RELAY_PUT_PIECES - 1) + "}");
+  crumbRelay = 3;
+  struct GiveBack {
+    ~GiveBack() {
+      crumbRelay = 10;
+      if (!extra)
+        return;
+      Piece late;
+      while (xQueueReceive(bodies, &late, 0) == pdTRUE)
+        xQueueSend(freeSlots, &late.slot, 0);
+      // The block goes back only once every piece is home. One the socket task is still
+      // filling keeps it until the next file, which then uses it as it is.
+      uint8_t got[RELAY_PUT_PIECES], n = 0, i;
+      const uint32_t until = millis() + 2000;
+      while (n < RELAY_PUT_PIECES && millis() < until)
+        if (xQueueReceive(freeSlots, &i, pdMS_TO_TICKS(50)) == pdTRUE)
+          got[n++] = i;
+      const bool all = n == RELAY_PUT_PIECES;
+      for (uint8_t k = 0; k < n; k++)
+        if (!all || got[k] < RELAY_BODY_PIECES)
+          xQueueSend(freeSlots, &got[k], 0);
+      if (all) {
+        for (uint8_t k = RELAY_BODY_PIECES; k < RELAY_PUT_PIECES; k++)
+          slots[k] = nullptr;
+        free(extra);
+        extra = nullptr;
+      }
+      crumbRelay = 0;
+    }
+  } giveBack;
+
+  // Big card writes for this file only. The buffer is borrowed while it lasts and handed
+  // back before the extra pieces are, so the heap ends up as it was found.
+  static uint8_t small[2048] __attribute__((aligned(32)));   // SD_MMC moves this over DMA
+  struct Borrowed {
+    uint8_t *at = (uint8_t *)malloc(8192);
+    ~Borrowed() { free(at); }
+  } borrowed;
+  uint8_t *const out = borrowed.at ? borrowed.at : small;
+  const size_t outRoom = borrowed.at ? 8192 : sizeof small;
+
+  crumbRelay = 4;
   static HsUnpack unpack;
-  static uint8_t out[2048];
   size_t held = 0;
   uint32_t wrote = 0;
   unpack.begin();
   auto emit = [&](uint8_t b) {
     out[held++] = b;
-    if (held == sizeof out) {
+    if (held == outRoom) {
+      const uint32_t w0 = millis();
+      crumbRelay = 6;
       relayPutWrite(out, held);
+      putWriteMs += millis() - w0;
+      crumbRelay = 5;
       wrote += held;
       held = 0;
     }
   };
 
   uint32_t taken = 0, unacked = 0, waitedFrom = millis();
+  putWaitMs = putWorkMs = putAckMs = putWriteMs = 0;
   while (taken < packed && connected) {
     Piece one;
     if (xQueueReceive(bodies, &one, pdMS_TO_TICKS(RELAY_IDLE_MS)) != pdTRUE)
@@ -341,6 +433,8 @@ static void put(uint32_t id, JsonDocument &doc) {
     const uint32_t gap = millis() - waitedFrom;
     if (gap > worstGapMs)
       worstGapMs = gap;
+    putWaitMs += gap;
+    const uint32_t workFrom = millis();
     uint32_t whose = 0;
     const uint8_t *data = slots[one.slot];
     if (one.len >= 4)
@@ -353,12 +447,15 @@ static void put(uint32_t id, JsonDocument &doc) {
         for (size_t k = 0; k < n; k++)
           emit(data[4 + k]);
       taken += n;
+      putTaken = taken;
     }
     xQueueSend(freeSlots, &one.slot, 0);
-    if (++unacked >= 2 || taken >= packed) {
+    putWorkMs += millis() - workFrom;
+    if (++unacked >= 4 || taken >= packed) {
       const uint32_t t0 = millis();
       sendText("{\"k\":" + String(whose) + ",\"n\":" + String(unacked) + "}");
       const uint32_t took = millis() - t0;
+      putAckMs += took;
       if (took > worstAckMs)
         worstAckMs = took;
       acksSent++;
@@ -371,15 +468,18 @@ static void put(uint32_t id, JsonDocument &doc) {
     wrote += held;
   }
 
+  crumbRelay = 7;
   if (taken < packed || wrote != size) {
     relayPutAbort();
     pourFails++;
     answer(id, 502, "the upload broke off on the way in\n");
     return;
   }
+  crumbRelay = 8;
   String body, type;
   const int status = relayPutEnd(wrote, andPrint, path, body, type);
   answerWith(id, status, type, body);
+  crumbRelay = 9;
 }
 
 static void carry(char *raw) {
@@ -583,10 +683,12 @@ void relayBegin() {
       relayInternalKey += alphabet[esp_random() % (sizeof(alphabet) - 1)];
   }
   yandexAnswered = xSemaphoreCreateBinary();
-  bodies = xQueueCreate(RELAY_BODY_PIECES, sizeof(Piece));
-  freeSlots = xQueueCreate(RELAY_BODY_PIECES, sizeof(uint8_t));
-  for (uint8_t i = 0; i < RELAY_BODY_PIECES; i++)
+  bodies = xQueueCreate(RELAY_PUT_PIECES, sizeof(Piece));
+  freeSlots = xQueueCreate(RELAY_PUT_PIECES, sizeof(uint8_t));
+  for (uint8_t i = 0; i < RELAY_BODY_PIECES; i++) {
+    slots[i] = baseSlots[i];
     xQueueSend(freeSlots, &i, 0);
+  }
   xTaskCreatePinnedToCore(work, "relayio", 6144, nullptr, 1, &worker, 0);
 }
 

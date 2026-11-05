@@ -6,6 +6,7 @@
 #include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <esp_heap_caps.h>
+#include <soc/soc_memory_layout.h>
 #include <SD_MMC.h>
 
 #include "../ESP8266WirelessPrintAsync/BinaryTransfer.h"
@@ -17,6 +18,7 @@
 #include "webauth.h"
 #include "telegram.h"
 #include "relay.h"
+#include "journal.h"
 bool relayCarriesTelegram();
 #include "../ESP8266WirelessPrintAsync/YandexHome.h"
 
@@ -98,8 +100,19 @@ static String lastUpload;
 static bool choreShouldPrint;
 static char choreTarget[PRINTER_CARD_NAME_BYTES];
 static String choreTrouble;
+static uint32_t choreSince;
 
 static bool cardUp;
+// The relay is writing a file of its own; the web server's form must not cut in
+static volatile bool relayPutting;
+
+// Counting free space walks the FAT, so it is not done while the relay writes a file
+static uint64_t cardFree() {
+  static uint64_t known;
+  if (!relayPutting)
+    known = SD_MMC.totalBytes() - SD_MMC.usedBytes();
+  return known;
+}
 
 // The module is fed by the printer, so it comes up whenever the printer does, and the
 // card is not always ready at that moment. One attempt was losing it for the whole
@@ -157,7 +170,7 @@ static void remember(const char *text, const size_t len) {
 
 // The bot's task lives on the other core and only ever carries messages. These are
 // the three things it asks of this side.
-void logEvent(const String &text) { remember(text.c_str(), text.length()); }
+void logEvent(const String &text) { journal(text); }
 void logFlush() {}
 bool isPrinting;                 // what the bot calls it, kept in step with printing
 bool somethingIsStreaming();     // the binary sender owns the wire, so the bot waits
@@ -196,7 +209,12 @@ static bool sawTemps(const char *text) {
   return true;
 }
 
+RTC_NOINIT_ATTR volatile uint32_t crumbRelay, crumbLoop, crumbWs;   // where each was when a panic hit
+static int heardSync = -1;       // the number a printer in packet mode said it expects next
+
 static void sawLine(const char *text, const size_t len) {
+  if (text[0] == 's' && text[1] == 's' && text[2] >= '0' && text[2] <= '9')
+    heardSync = atoi(text + 2);
   const bool hadTemps = sawTemps(text);
   if (!strcmp(text, "ok") || !strncmp(text, "ok ", 3)) {
     sawOk = true;
@@ -209,8 +227,10 @@ static void sawLine(const char *text, const size_t len) {
   if (!strncmp(text, "SD printing byte ", 17)) {
     const char *slash = strchr(text + 17, '/');
     if (slash) {
-      if (!printing)
+      if (!printing) {
         printSince = millis();
+        journal("print started: " + String(selected[0] ? selected : "a file on the printer's card"));
+      }
       printing = true;
       printAt = strtoul(text + 17, NULL, 10);
       printOf = strtoul(slash + 1, NULL, 10);
@@ -219,6 +239,8 @@ static void sawLine(const char *text, const size_t len) {
   }
   if (!strcmp(text, "Not SD printing")) {
     if (printing) {
+      journal("print stopped at " + String(printOf ? printAt * 100 / printOf : 0) + "%, after " +
+              String((millis() - printSince) / 60000) + " min");
       powerArmed = autoPowerOff;
       powerSawIdle = false;
       powerReadySince = 0;
@@ -229,6 +251,7 @@ static void sawLine(const char *text, const size_t len) {
   }
   if (!strncmp(text, "Done printing file", 18)) {
     if (printing) {
+      journal("print finished: " + String(selected) + ", " + String((millis() - printSince) / 60000) + " min");
       powerArmed = autoPowerOff;
       powerSawIdle = false;
       powerReadySince = 0;
@@ -238,12 +261,20 @@ static void sawLine(const char *text, const size_t len) {
     printAt = printOf;
   }
   if (!strcmp(text, "start")) {
+    journal(printing ? "the printer restarted in the middle of a print" : "the printer started up");
     heardTemp = 0;               // its autoreport is off again, and so is what it knew
     machine[0] = 0;
     printing = false;
     selected[0] = 0;
     printAt = printOf = printSince = 0;
     printerCard.begin();
+  }
+  if (!strncmp(text, "Error:", 6) || !strncmp(text, "!!", 2)) {
+    static char lastError[64];
+    if (strncmp(lastError, text, sizeof lastError - 1)) {
+      strncpy(lastError, text, sizeof lastError - 1);
+      journal(String("printer said: ") + text);
+    }
   }
   if (!strncmp(text, "File opened: ", 13)) {
     const char *end = strstr(text + 13, " Size:");
@@ -466,7 +497,10 @@ static uint8_t upLined[2048] __attribute__((aligned(32)));   // SD_MMC moves thi
 
 // One upload onto the module's card, whoever carries it: the web server's form parser
 // or the relay, which hands over the file itself without a form around it.
+static uint32_t upSince;
+
 static bool uploadBegin(const String &filename) {
+  upSince = millis();
   metaWanted = false;
   sendTrouble = "";
   lastUpload = filename;
@@ -500,6 +534,13 @@ static bool uploadBegin(const String &filename) {
 static void uploadWrite(const uint8_t *data, const size_t len) {
   if (!upInto)
     return;
+  if (!((uintptr_t)data & 3) && esp_ptr_dma_capable(data)) {
+    if (upInto.write(data, len) != len)
+      sendTrouble = "the module's card stopped taking bytes";
+    else if (metaWanted)
+      metaScan.feed(data, len);
+    return;
+  }
   for (size_t at = 0; at < len; at += sizeof(upLined)) {
     const size_t take = len - at < sizeof(upLined) ? len - at : sizeof(upLined);
     memcpy(upLined, data + at, take);
@@ -522,6 +563,13 @@ static void uploadEnd(const uint32_t expected) {
   if (!stored || size != expected)
     sendTrouble = "the stored upload size does not match";
   stored.close();
+  {
+    const uint32_t took = millis() - upSince;
+    journal("took " + lastUpload + ", " + String(size) + " bytes in " + String(took / 1000) + "." +
+            String(took / 100 % 10) + " s" +
+            (took ? ", " + String(size / took) + " KB/s" : String("")) +
+            (sendTrouble.length() ? ", " + sendTrouble : String("")));
+  }
   if (metaWanted) {
     metaScan.finish(size);
     metaOut.picture.close();
@@ -549,8 +597,24 @@ static void uploadAbort(const char *why) {
   sendTrouble = why;
 }
 
-// The relay is writing a file of its own; the web server's form must not cut in
-static volatile bool relayPutting;
+
+// The settings pages wear the main page's colours, day and night, so moving between
+// them does not look like leaving the product.
+static String settingsHead(const char *heading) {
+  return String(
+    "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "<title>KP3S</title><style>"
+    ":root{--bg:#0d1117;--card:#161b22;--tx:#e8ebf0;--dim:#8a93a2;--acc:#5b9cff;--rim:#30363d;--onacc:#06101f}"
+    "@media(prefers-color-scheme:light){:root{--bg:#f4f6f9;--card:#fff;--tx:#14181d;--dim:#5d6672;--acc:#2f6fd0;--rim:#d5dae1;--onacc:#fff}}"
+    "body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,sans-serif}"
+    "main{max-width:40rem;margin:24px auto;padding:20px 24px;background:var(--card);border-radius:14px;box-shadow:0 4px 24px #0002}"
+    "h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:20px 0 6px}a{color:var(--acc)}p,li{color:var(--dim)}b,code{color:var(--tx)}"
+    "input,select{font:inherit;padding:8px 10px;border:1px solid var(--rim);border-radius:8px;background:var(--bg);color:var(--tx);max-width:100%;box-sizing:border-box}"
+    "button{font:inherit;padding:8px 14px;border:0;border-radius:8px;background:var(--acc);color:var(--onacc);cursor:pointer}"
+    "form{margin:10px 0}code{word-break:break-all}ul{padding-left:18px}"
+    "@media(max-width:480px){main{margin:0;border-radius:0}}"
+    "</style><main><p><a href=\"/\">\u2190 back to the printer</a></p><h1>") + heading + "</h1>";
+}
 
 static void takeUpload() {
   HTTPUpload &up = server.upload();
@@ -642,6 +706,8 @@ static bool startChore(const String &name, const bool andPrint, const uint8_t wi
   sender.windowLimit = window;
   chore = ChoreSending;
   sendAsked = true;
+  choreSince = millis();
+  journal("sending " + name + " to the printer's card" + (andPrint ? ", to print" : ""));
   return true;
 }
 
@@ -668,6 +734,10 @@ static bool putPrint;
 static String putPath, putAnswer, putType;
 static int putCode;
 static SemaphoreHandle_t putDone;
+
+// The card takes one task at a time: a file read off it for the printer while the relay
+// writes the next one onto it took the module down, and the printer with it.
+bool printerWireBusy() { return sender.running() || sendAsked || chore == ChoreSending; }
 
 static void putFinished() {
   relayPutting = false;
@@ -779,9 +849,11 @@ static void powerOffTick(const uint32_t now) {
   if (powerTries >= POWEROFF_ATTEMPTS) {
     powerArmed = false;
     remember("gave up switching the printer off", 33);
+    journal("gave up switching the printer off");
     return;
   }
   powerTries++;
+  journal("switching the printer off, attempt " + String(powerTries));
   powerRetryAt = now + POWEROFF_RETRY;
   yandexHome.request(YandexHome::PowerOff);
 }
@@ -857,11 +929,25 @@ static bool settleWire() {
       drain();
       delay(10);
     }
+    // SYNC is taken whatever its number, and the answer says which number the printer
+    // wants next. ABORT and CLOSE carry exactly that one, or they are thrown away.
+    heardSync = -1;
     loosePacket(0, 0, 1);
-    loosePacket(1, 1, 4);
-    loosePacket(2, 0, 2);
+    for (const uint32_t asked = millis(); heardSync < 0 && millis() - asked < 300;) {
+      drain();
+      delay(5);
+    }
+    const uint8_t next = heardSync < 0 ? 1 : (uint8_t)heardSync;
+    loosePacket(next, 1, 4);
+    for (const uint32_t asked = millis(); millis() - asked < 100;) {
+      drain();
+      delay(5);
+    }
+    loosePacket((uint8_t)(next + 1), 0, 2);
     delay(150);
     drain();
+    journal(heardSync < 0 ? String("the printer was deaf, packets sent blind")
+                          : "the printer was stuck in packet mode at " + String(rate) + " baud, let it out");
     if (askedBack()) {
       linkRate = rate;
       return true;
@@ -1022,7 +1108,7 @@ void setup() {
     const uint32_t ran = printing && printSince ? (millis() - printSince) / 1000 : 0;
     uint64_t freeCard = 0;
     if (cardUp)
-      freeCard = SD_MMC.totalBytes() - SD_MMC.usedBytes();
+      freeCard = cardFree();
 
     String j = "{\"bare\":true";
     j += ",\"printing\":" + String(printing ? "true" : "false");
@@ -1095,6 +1181,16 @@ void setup() {
   Printer.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
   printerRxRoom = Printer.setRxBufferSize(2048);
   mountCard();
+  configTzTime("AZT-4", "pool.ntp.org", "time.google.com");   // Baku, for the journal
+
+  route("/log", HTTP_GET, []() {
+    if (!cardUp || relayPutting) {
+      server.send(503, "text/plain", cardUp ? "the module is taking a file, try again in a moment\n"
+                                            : "the module has no card\n");
+      return;
+    }
+    journalSend(server, server.hasArg("previous"));
+  });
 
   // One line in, whatever the printer says back out. Enough to ask a printer what it is.
   route("/gcode", HTTP_GET, []() {
@@ -1181,7 +1277,7 @@ void setup() {
     uint64_t freeCard = 0;
     String j = "{\"files\":[";
     if (cardUp) {
-      freeCard = SD_MMC.totalBytes() - SD_MMC.usedBytes();
+      freeCard = cardFree();
       File dir = SD_MMC.open("/");
       bool first = true;
       for (File one = dir.openNextFile(); one; one = dir.openNextFile()) {
@@ -1307,10 +1403,7 @@ void setup() {
   // password, and a token that can be read is a token that is gone.
   route("/telegram", HTTP_GET, []() {
     String out =
-      "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
-      "<title>bot</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
-      "input,button{font:inherit;padding:.4rem .6rem}form{margin:1rem 0;display:inline-block}code{word-break:break-all}</style>"
-      "<h1>Telegram bot</h1><p><a href=\"/\">back to the printer</a></p>";
+      settingsHead("Telegram bot");
     out += "<p>Token: <b>" + String(telegramBot.hasToken() ? "set" : "not set") + "</b></p>";
     out += "<p>Last said: " + telegramBot.getStatus() + "</p>";
     out += "<form method=post action=/telegram/token><input name=token type=password size=40 "
@@ -1407,10 +1500,7 @@ void setup() {
 
   route("/relay", HTTP_GET, []() {
     String out =
-      "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
-      "<title>remote</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
-      "input,button{font:inherit;padding:.4rem .6rem}form{margin:1rem 0}code{word-break:break-all}</style>"
-      "<h1>Remote access</h1><p><a href=\"/\">back to the printer</a></p>";
+      settingsHead("Remote access");
     out += "<p>State: <b>" + relayState() + "</b></p>";
     out += "<p>Uploads: " + relayStats() + "</p>";
     if (!webAuthSet())
@@ -1445,10 +1535,7 @@ void setup() {
 
   route("/auth", HTTP_GET, []() {
     String out =
-      "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
-      "<title>password</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
-      "input,button{font:inherit;padding:.4rem .6rem}form{margin:1rem 0}code{word-break:break-all}</style>"
-      "<h1>Who may talk to this module</h1><p><a href=\"/\">back to the printer</a></p>";
+      settingsHead("Who may talk to this module");
     if (!webAuthSet())
       out += "<p><b>No password is set.</b> Anyone on this network can print, upload and "
              "reflash. Nothing will reach the module from outside the house until this "
@@ -1477,6 +1564,7 @@ void setup() {
     }
     webAuthSetPassword(given);        // straight into NVS, never logged and never shown
     relayAuthChanged();
+    journal("web password changed");
     server.sendHeader("Location", "/auth");
     server.send(303, "text/plain", "saved\n");
   });
@@ -1484,6 +1572,7 @@ void setup() {
   route("/auth/forget", HTTP_POST, []() {
     webAuthForget();
     relayAuthChanged();
+    journal("web password removed");
     server.sendHeader("Location", "/auth");
     server.send(303, "text/plain", "gone\n");
   });
@@ -1497,10 +1586,7 @@ void setup() {
 
   route("/yandex", HTTP_GET, []() {
     String out =
-      "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
-      "<title>socket</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}"
-      "input,button,select{font:inherit;padding:.4rem .6rem}form{margin:1rem 0}code{word-break:break-all}</style>"
-      "<h1>Yandex socket</h1><p><a href=\"/\">back to the printer</a></p>";
+      settingsHead("Yandex socket");
     out += "<p>Token: <b>" + String(yandexHome.hasToken() ? "set" : "not set") + "</b>";
     out += ", device: <b>" + String(yandexHome.getDeviceId() == "" ? "not chosen"
                                     : yandexHome.getDeviceName()) + "</b></p>";
@@ -1596,6 +1682,8 @@ void setup() {
       return;
     }
     server.send(200, "text/plain", "restarting\n");
+    journal("restart asked for");
+    journalFlush(true);
     delay(200);
     ESP.restart();
   });
@@ -1715,12 +1803,23 @@ void setup() {
     server.sendHeader("Connection", "close");
     server.send(good ? 200 : 500, "text/plain",
                 good ? "OK, rebooting\n" : "failed: " + (otaTrouble.length() ? otaTrouble : String("nothing was written")) + "\n");
+    journal(good ? "new firmware written, restarting into it" : "firmware upload failed: " + otaTrouble);
+    journalFlush(true);
     if (good) {
       bootGuardArm();
       delay(300);
       ESP.restart();
     }
-  }, onUpload);
+  }, []() {
+    // A restart in the middle of a file going to the printer leaves the printer reading
+    // packets, deaf to everything else, so the image waits for the wire to be free.
+    if (sender.running() || sendAsked) {
+      if (server.upload().status == UPLOAD_FILE_START)
+        otaTrouble = "a file is going to the printer, try again when it is on its card";
+      return;
+    }
+    onUpload();
+  });
 
   // The socket lives in a task of its own: a handshake takes a second or two, and in
   // the loop that would be a second or two with nobody reading the printer.
@@ -1741,6 +1840,19 @@ void setup() {
     lastRestart = keep.getString("why", "");
     keep.remove("why");
     keep.end();
+  }
+  {
+    static const char *const why[] = {"unknown", "power on", "reset pin", "software restart", "panic",
+                                      "interrupt watchdog", "task watchdog", "watchdog", "deep sleep",
+                                      "brownout, the supply sagged", "sdio"};
+    const int reason = (int)esp_reset_reason();
+    const String crumbs = reason == 4 || reason == 6 || reason == 7
+      ? ", relay task at step " + String(crumbRelay) + ", loop at step " + String(crumbLoop) +
+        ", socket at " + String(crumbWs) : String("");
+    crumbRelay = crumbLoop = crumbWs = 0;
+    journal(String("boot ") + SKETCH_VERSION + " after " + (reason >= 0 && reason <= 10 ? why[reason] : "?") +
+            (lastRestart.length() ? " (" + lastRestart + ")" : String("")) + ", " + bootGuardReport() +
+            ", card " + (cardUp ? "up" : "missing") + crumbs);
   }
   loopBeat = millis();
   xTaskCreatePinnedToCore(guardian, "guardian", 3072, nullptr, 2, nullptr, 0);
@@ -1947,6 +2059,8 @@ static void handleTelegram() {
 #define GUARD_BLOCK_MS    300000
 
 static void guardianRestart(const char *why) {
+  journal(String("restarting: ") + why);
+  journalFlush(true);
   Preferences keep;
   keep.begin("guard", false);
   keep.putString("why", why);
@@ -1988,12 +2102,34 @@ static void guardian(void *) {
 
 void loop() {
   loopBeat = millis();
+  crumbLoop = 1;
   if (putLanded) {
     putLanded = false;
     finishPut();
     xSemaphoreGive(putDone);
   }
+  crumbLoop = 2;
   server.handleClient();
+  crumbLoop = 3;
+  if (!relayPutting)
+    journalFlush();
+  crumbLoop = 4;
+  {
+    static bool wifiWas = true;
+    const bool wifiNow = WiFi.status() == WL_CONNECTED;
+    if (wifiNow != wifiWas)
+      journal(wifiNow ? "wifi back, rssi " + String(WiFi.RSSI()) : String("wifi lost"));
+    wifiWas = wifiNow;
+    static Chore choreWas;
+    if (chore != choreWas && (chore == ChoreDone || chore == ChoreFailed)) {
+      const uint32_t took = millis() - choreSince, bytes = sendBytes.size();
+      journal(chore == ChoreDone
+        ? String(sendName) + " is on the printer's card, " + String(bytes) + " bytes in " + String(took / 1000) + "." +
+            String(took / 100 % 10) + " s, " + String(took ? bytes / took : 0) + " KB/s" + (choreShouldPrint ? ", printing" : "")
+        : "could not put " + String(sendName) + " on the printer's card: " + choreTrouble);
+    }
+    choreWas = chore;
+  }
   isPrinting = printing;             // what the bot's task reads, kept in step from one place
   bootGuardWatch(WiFi.status() == WL_CONNECTED);
 
@@ -2163,7 +2299,10 @@ void loop() {
   else {
     if (!downSince)
       downSince = millis();
-    else if (millis() - downSince > JOIN_WAIT_MS)
+    else if (millis() - downSince > JOIN_WAIT_MS) {
+      journal("wifi gone too long, restarting");
+      journalFlush(true);
       ESP.restart();
+    }
   }
 }

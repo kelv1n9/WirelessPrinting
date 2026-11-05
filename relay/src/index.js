@@ -184,6 +184,18 @@ export class Relay {
     if (this.trail.length > 200) this.trail.shift();
   }
 
+  // Something that went wrong, kept in storage: the trail lives in memory and is gone
+  // the moment the object sleeps, which is usually before anybody looks. Rare by nature,
+  // so the writes cost nothing that counts.
+  incident(text) {
+    this.note(text);
+    const line = `${new Date().toISOString().slice(0, 19)} ${text}`;
+    this.state.storage.get("incidents").then((list) => {
+      list = (list || []).concat(line).slice(-100);
+      return this.state.storage.put("incidents", list);
+    }).catch(() => {});
+  }
+
   device() {
     const open = this.state.getWebSockets("device").filter((ws) => ws.readyState === 1);
     return open.length ? open[open.length - 1] : null;
@@ -203,6 +215,7 @@ export class Relay {
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1], ["device"]);
       pair[1].send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN }));
+      this.note("device connected");
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -210,7 +223,8 @@ export class Relay {
       const given = (request.headers.get("Authorization") || "").replace(/^Bearer /, "");
       if (!sameSecret(given, this.env.DEVICE_KEY))
         return new Response("no\n", { status: 403 });
-      return new Response(this.trail.join("\n") + "\n");
+      const incidents = (await this.state.storage.get("incidents")) || [];
+      return new Response("incidents:\n" + incidents.join("\n") + "\n\ntrail:\n" + this.trail.join("\n") + "\n");
     }
 
     if (url.pathname === "/.tg-setup") {
@@ -296,6 +310,7 @@ export class Relay {
     let giveSession = false;
     if (!hasBody && this.uploading > 0 && !(await this.knownSession(request))) {
       const verdict = await this.checkHere(request, url);
+      this.note(`busy, ${url.pathname} without a session: ${verdict}`);
       if (verdict === "challenge") {
         const r = new Response("<!doctype html><meta charset=utf-8><title>KP3S</title><p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. Reload the page to try again.</p>",
                                { status: 401, headers: { "content-type": "text/html", "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
@@ -400,12 +415,12 @@ export class Relay {
         // worked: the module reboots before its answer is out. Sending it again only
         // met the new firmware with yesterday's credentials.
         if (last.lost && last.sentAll && path.startsWith("/update")) {
-          this.note(`all of ${path} went down and the module dropped away, taken as flashed`);
+          this.incident(`all of ${path} went down and the module dropped away, taken as flashed`);
           return { status: 200, headers: { "content-type": "text/plain" },
                    body: new TextEncoder().encode("Sent whole; the module dropped away to reboot, which is what a good flash does. Check /api/status in a minute.\n") };
         }
         if (!last.lost && last.status !== 502 && last.status !== 504) break;
-        this.note(`attempt ${attempt} of ${path} did not get through (${last.lost ? "lost" : last.status}), ${attempt < UPLOAD_ATTEMPTS ? "trying again" : "giving up"}`);
+        this.incident(`attempt ${attempt} of ${path} did not get through (${last.lost ? "lost" : last.status}), ${attempt < UPLOAD_ATTEMPTS ? "trying again" : "giving up"}`);
       }
       return last && !last.lost ? last : null;
       } finally {
@@ -473,6 +488,14 @@ export class Relay {
 
   // "ok", "challenge" (ask for the password), or "unknown" (the module never said how)
   async checkHere(request, url) {
+    if (!this.auth) this.auth = (await this.state.storage.get("auth")) || null;
+    if (!this.auth) {
+      const ws = this.device();
+      if (ws) {
+        try { ws.send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN })); } catch (e) {}
+        for (let i = 0; i < 20 && !this.auth; i++) await new Promise((r) => setTimeout(r, 100));
+      }
+    }
     const a = this.auth;
     if (!a) return "unknown";
     if (a.open) return "ok";
@@ -593,7 +616,7 @@ export class Relay {
             // module is still busy with this one only has the two collide.
             const silentLimit = path.startsWith("/update") ? 60000 : SILENT_GIVE_UP_MS;
             if (Date.now() - (w.lastAck || w.t0) > silentLimit) {
-              this.note(`req ${id} no acknowledgement for ${silentLimit} ms after ${w.sentPieces} pieces, waiting for the module to say so`);
+              this.incident(`req ${id} no acknowledgement for ${silentLimit} ms after ${w.sentPieces} pieces, waiting for the module to say so`);
               w.timer = setTimeout(() => w.finish({ lost: true }), 45000);
               return;              // the module answers once it gives up on its side
             }
@@ -604,8 +627,9 @@ export class Relay {
           ws.send(framed(id, body.subarray(o, o + CHUNK)));
           w.sentPieces++;
           if (body.length > CHUNK) {
-            if (!this.progress || this.progress.id !== id) this.progress = { id, t0: Date.now(), sent: 0, total: body.length };
-            this.progress.sent = Math.min(body.length, w.sentPieces * CHUNK);
+            const whole = (extra && extra.size) || body.length;
+            if (!this.progress || this.progress.id !== id) this.progress = { id, t0: Date.now(), sent: 0, total: whole };
+            this.progress.sent = Math.round(Math.min(1, (w.sentPieces * CHUNK) / body.length) * whole);
           }
         }
       } catch (e) {
@@ -619,11 +643,18 @@ export class Relay {
   }
 
   async webSocketMessage(ws, message) {
+    if (!this.auth && !this.askedAuth) {
+      this.askedAuth = true;
+      this.auth = (await this.state.storage.get("auth")) || null;
+      if (!this.auth) try { ws.send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN })); } catch (e) {}
+    }
     if (typeof message === "string") {
       let m;
       try { m = JSON.parse(message); } catch { return; }
       if (m.t === "auth") {
         this.auth = m.open ? { open: true } : { user: m.user, realm: m.realm, nonce: m.nonce, ha1: m.ha1, key: m.key };
+        this.state.storage.put("auth", this.auth).catch(() => {});
+        this.note(`auth from module, ${m.open ? "open" : "password set"}`);
         return;
       }
       if (m.t === "st" && typeof m.b === "string") {
@@ -669,8 +700,13 @@ export class Relay {
           w.acks = (w.acks || 0) + 1;
           if (w.acks <= 12 || w.acks % 20 === 0)
             this.note(`ack ${w.acks} for req ${m.k} n ${m.n || 1} at ${Date.now() - w.t0} ms, sent ${w.sentPieces}, credit ${w.credit}`);
+          // The module can widen the window for one file when it has the memory for it
+          if (m.c > 0 && m.c <= 32 && m.c !== w.inFlight) {
+            w.credit += m.c - (w.inFlight || IN_FLIGHT);
+            w.inFlight = m.c;
+          }
           const most = w.inFlight || IN_FLIGHT;
-          if (w.credit < most) w.credit = Math.min(most, w.credit + (m.n || 1));
+          if (w.credit < most) w.credit = Math.min(most, w.credit + (m.n ?? 1));
           if (w.wake) { const wake = w.wake; w.wake = null; wake(true); }
         }
         return;
@@ -684,7 +720,8 @@ export class Relay {
           const body = new Uint8Array(total);
           let at = 0;
           for (const c of w.collect) { body.set(c, at); at += c.length; }
-          this.note(`req ${m.i} answered ${w.status} at ${Date.now() - w.t0} ms after ${w.sentPieces} pieces`);
+          const line = `req ${m.i} answered ${w.status} at ${Date.now() - w.t0} ms after ${w.sentPieces} pieces`;
+          if ((w.status || 502) >= 500) this.incident(line); else this.note(line);
           w.finish({ status: w.status || 502, headers: w.headers, body });
         }
         return;
@@ -714,7 +751,7 @@ export class Relay {
   }
 
   webSocketClose() {
-    this.note("device socket closed");
+    this.incident("device socket closed");
     for (const [, w] of this.waiting) {
       if (w.finish) { w.finish({ lost: true }); continue; }
       clearTimeout(w.timer);

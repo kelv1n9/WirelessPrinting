@@ -64,6 +64,8 @@ struct TestString : String {
   }
 };
 #define String TestString
+static inline void journal(const TestString &) {}
+static uint32_t upSince;
 std::map<std::string,std::shared_ptr<std::vector<uint8_t>>> disk;
 constexpr int FILE_WRITE=1;
 struct File {
@@ -123,6 +125,7 @@ std::vector<std::string> commands,listing;
 bool wireWorks=true;
 String say(const String &);
 #define META_DIR "/meta"
+static inline bool esp_ptr_dma_capable(const void *) { return false; }
 HELPERS
 static GcodeMetaScan metaScan;
 static MetaOut metaOut;

@@ -50,8 +50,24 @@ void delay(unsigned ms) { testClock+=ms; }
 unsigned chirps=0;
 void chirp(int times) { chirps+=times; }
 uint32_t linkRate=PRINTER_BAUD;
-struct { void updateBaudRate(uint32_t) {} size_t write(const uint8_t *, size_t n) { return n; } } Printer;
-void drain() {}
+std::vector<std::vector<uint8_t>> packetsSent;
+int heardSync=-1;
+bool wedged=false;
+struct {
+  void updateBaudRate(uint32_t) {}
+  size_t write(const uint8_t *data, size_t n) { packetsSent.emplace_back(data, data + n); return n; }
+} Printer;
+void drain() {
+  // A printer stuck in packet mode answers SYNC with the number it wants next, and
+  // leaves packet mode only for a CLOSE that carries the number after the ABORT's.
+  if (!wedged || packetsSent.empty()) return;
+  const auto &last = packetsSent.back();
+  if (last.size()==8 && last[3]==0x01) heardSync=212;
+  if (packetsSent.size()>=3) {
+    const auto &a = packetsSent[packetsSent.size()-2], &c = packetsSent.back();
+    if (a.size()==8 && a[3]==0x14 && a[2]==212 && c.size()==8 && c[3]==0x02 && c[2]==213) wedged=false;
+  }
+}
 struct CompletionString : String {
   using String::String;
   CompletionString(const String &value):String(value) {}
@@ -95,11 +111,12 @@ void require(bool good,const char *message) {
 struct {
   bool remove(const String &) { ++deletions;return true; }
 } SD_MMC;
+void journal(const String &) {}
 String say(const String &text) {
   const std::string cmd=text.c_str();
   commands.push_back(cmd);
   if (cmd=="M105") {
-    sawOk=wireWorks;
+    sawOk=wireWorks && !wedged;
     return wireWorks ? "ok" : "";
   }
   if (cmd=="M21") {
@@ -163,6 +180,11 @@ void failed() {
 }
 int main(int argc,char **) {
   (void)SD_MMC;
+  scenario="rescue from packet mode";
+  wedged=true;
+  require(settleWire(),"a printer stuck in packet mode must be let out");
+  require(!wedged,"ABORT and CLOSE must carry the number the printer gave after SYNC");
+  packetsSent.clear();
   if (argc>1) finish=complete_without_bin_mount;
   reset("Robin_nano35.bin",true);
   finish();

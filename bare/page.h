@@ -188,6 +188,7 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
     <span><a href="/auth">password</a></span>
     <span><a href="/telegram">bot</a></span>
     <span><a href="/relay">remote</a></span>
+    <span><a href="/log">journal</a></span>
   </div>
   <div class="row">
     <button id="btheme" title="day, night, or whatever the system says">auto</button>
