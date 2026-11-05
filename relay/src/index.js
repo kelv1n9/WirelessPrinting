@@ -46,6 +46,63 @@ export default {
   },
 };
 
+// Digest uses MD5 and WebCrypto has none, so it is here: the module checks its password
+// this way, and the Worker has to answer the same while the module is busy.
+function md5(text) {
+  const bytes = new TextEncoder().encode(text);
+  const words = new Uint32Array(((bytes.length + 8 >> 6) + 1) * 16);
+  for (let i = 0; i < bytes.length; i++) words[i >> 2] |= bytes[i] << (i % 4 * 8);
+  words[bytes.length >> 2] |= 0x80 << (bytes.length % 4 * 8);
+  words[words.length - 2] = bytes.length * 8;
+  const K = new Uint32Array(64), S = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  for (let off = 0; off < words.length; off += 16) {
+    let a = a0, b = b0, c = c0, d = d0;
+    for (let i = 0; i < 64; i++) {
+      let f, g;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+      const t = d; d = c; c = b;
+      const x = (a + f + K[i] + words[off + g]) | 0;
+      const sh = S[(i >> 4) * 4 + i % 4];
+      b = (b + ((x << sh) | (x >>> (32 - sh)))) | 0;
+      a = t;
+    }
+    a0 = (a0 + a) | 0; b0 = (b0 + b) | 0; c0 = (c0 + c) | 0; d0 = (d0 + d) | 0;
+  }
+  return [a0, b0, c0, d0].map((v) => [0, 8, 16, 24].map((s) => ((v >>> s) & 255).toString(16).padStart(2, "0")).join("")).join("");
+}
+
+async function sha256hex(text) {
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  return [...h].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function field(header, name) {
+  const m = new RegExp(`(?:^|[\\s,])${name}=(?:"([^"]*)"|([^,\\s]*))`).exec(header);
+  return m ? (m[1] !== undefined ? m[1] : m[2]) : "";
+}
+
+// What a person sees when the module cannot answer: the page's own colours, and it
+// tries again by itself, instead of a bare line of text.
+function personPage(title, line, retrySeconds) {
+  const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<meta http-equiv=refresh content="${retrySeconds}"><title>KP3S</title>
+<style>:root{--bg:#0d1117;--card:#161b22;--tx:#e8ebf0;--dim:#8a93a2;--acc:#5b9cff}
+@media(prefers-color-scheme:light){:root{--bg:#f4f6f9;--card:#fff;--tx:#14181d;--dim:#5d6672;--acc:#2f6fd0}}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--tx);font:16px/1.5 system-ui,sans-serif}
+.c{background:var(--card);padding:28px 32px;border-radius:14px;max-width:26rem;margin:16px;box-shadow:0 4px 24px #0003}
+h1{font-size:20px;margin:0 0 8px}p{margin:0;color:var(--dim)}.s{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--acc);margin-right:8px;animation:p 1.2s infinite}
+@keyframes p{50%{opacity:.3}}</style>
+<div class=c><h1><span class=s></span>${title}</h1><p>${line}</p></div>`;
+  return new Response(html, { status: 503, headers: { "content-type": "text/html; charset=utf-8", "retry-after": String(retrySeconds), "cache-control": "no-store" } });
+}
+
+const wantsPage = (request) => (request.headers.get("accept") || "").includes("text/html");
+
 function sameSecret(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length || !a.length)
     return false;
@@ -161,8 +218,10 @@ export class Relay {
 
     const ws = this.device();
     if (!ws)
-      return new Response("The printer module is not connected right now.\n",
-                          { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
+      return wantsPage(request)
+        ? personPage("Printer module is starting up", "It is not connected to Cloudflare at the moment, usually because it is restarting or the printer is switched off. This page checks again every few seconds.", 5)
+        : new Response("The printer module is not connected right now.\n",
+                       { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
 
     const hasBody = request.method !== "GET" && request.method !== "HEAD" && request.body;
     let length = Number(request.headers.get("content-length") || 0);
@@ -192,9 +251,20 @@ export class Relay {
     // The status it last gave is handed out instead, and the rest is told to wait.
     // The cache answers without asking the module, so it answers only a browser that
     // has already got past the module's password and been given a session for it.
-    if (!hasBody && this.uploading > 0 && !(await this.knownSession(request)))
-      return new Response("The module is busy taking a file. Try again when it is done.\n",
-                          { status: 503, headers: { "retry-after": "5" } });
+    let giveSession = false;
+    if (!hasBody && this.uploading > 0 && !(await this.knownSession(request))) {
+      const verdict = await this.checkHere(request, url);
+      if (verdict === "challenge") {
+        const r = new Response("<!doctype html><meta charset=utf-8><title>KP3S</title><p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. Reload the page to try again.</p>",
+                               { status: 401, headers: { "content-type": "text/html", "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
+        return r;
+      }
+      if (verdict !== "ok")
+        return wantsPage(request)
+          ? personPage("Printer module is taking a file", "It answers again in a moment. This page checks by itself.", 3)
+          : new Response("The module is busy taking a file. Try again when it is done.\n", { status: 503, headers: { "retry-after": "5" } });
+      giveSession = true;
+    }
     if (!hasBody && this.uploading > 0) {
       const key = cacheKey(url);
       let cached = this.cache.get(key);
@@ -215,10 +285,12 @@ export class Relay {
             body = new TextEncoder().encode(JSON.stringify(d));
           } catch (e) {}
         }
+        if (giveSession) await this.giveSession(request, h);
         return new Response(body, { status: 200, headers: h });
       }
-      return new Response("The module is busy taking a file. Try again when it is done.\n",
-                          { status: 503, headers: { "retry-after": "5" } });
+      return wantsPage(request)
+        ? personPage("Printer module is taking a file", "It answers again in a moment. This page checks by itself.", 3)
+        : new Response("The module is busy taking a file. Try again when it is done.\n", { status: 503, headers: { "retry-after": "5" } });
     }
     if (!hasBody && request.method === "GET" && url.pathname !== "/download") {
       const last = await this.sendBody(ws, request.method, url.pathname + url.search, headers, new Uint8Array(0));
@@ -338,6 +410,34 @@ export class Relay {
     if (answer && answer.status < 300)
       return say(`Saved \u2014 ${m.name}\n\nSize       ${kb} KB\nTransfer   ${seconds} s\n\nGoing on to the printer's card now. I will say when it is there.`);
     return say(`Could not save ${m.name} \u2014 ${said || "it did not get through"}`);
+  }
+
+  // "ok", "challenge" (ask for the password), or "unknown" (the module never said how)
+  async checkHere(request, url) {
+    const a = this.auth;
+    if (!a) return "unknown";
+    if (a.open) return "ok";
+    const key = request.headers.get("x-api-key");
+    if (key && a.key && (await sha256hex(key)) === a.key) return "ok";
+    const h = request.headers.get("authorization") || "";
+    if (h.startsWith("Basic ")) {
+      let pair = "";
+      try { pair = atob(h.slice(6).trim()); } catch (e) {}
+      const at = pair.indexOf(":");
+      if (at > 0 && pair.slice(0, at) === a.user && md5(`${a.user}:${a.realm}:${pair.slice(at + 1)}`) === a.ha1) return "ok";
+      return "challenge";
+    }
+    if (h.startsWith("Digest ")) {
+      const d = h.slice(7);
+      if (field(d, "username") !== a.user || field(d, "nonce") !== a.nonce) return "challenge";
+      const ha2 = md5(`${request.method}:${field(d, "uri")}`);
+      const qop = field(d, "qop");
+      const want = qop === "auth"
+        ? md5(`${a.ha1}:${a.nonce}:${field(d, "nc")}:${field(d, "cnonce")}:auth:${ha2}`)
+        : md5(`${a.ha1}:${a.nonce}:${ha2}`);
+      return want === field(d, "response").toLowerCase() ? "ok" : "challenge";
+    }
+    return "challenge";
   }
 
   async loadSessions() {
@@ -463,6 +563,10 @@ export class Relay {
     if (typeof message === "string") {
       let m;
       try { m = JSON.parse(message); } catch { return; }
+      if (m.t === "auth") {
+        this.auth = m.open ? { open: true } : { user: m.user, realm: m.realm, nonce: m.nonce, ha1: m.ha1, key: m.key };
+        return;
+      }
       if (m.t === "st" && typeof m.b === "string") {
         // The module's own status, sent just before it starts taking a file
         this.cache.set("/api/status", { status: 200, headers: { "content-type": "application/json" },

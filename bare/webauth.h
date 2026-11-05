@@ -20,6 +20,7 @@
 #include <WebServer.h>
 #include <MD5Builder.h>
 #include <base64.h>
+#include <mbedtls/sha256.h>
 
 // No comma and no colon in here. The challenge header separates its parameters with
 // commas, and although a quoted value may hold one, Safari splits on them anyway and
@@ -165,6 +166,26 @@ static bool webAuthLets() {
       "<p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. "
       "Reload the page to try again.</p>"));
   return false;
+}
+
+// What the relay's Worker needs to check a request the same way this module does, so it
+// can answer from its cache while the module is busy: the digest hash of user, realm
+// and password (the password itself cannot be got back from it), the nonce in use, and
+// a SHA-256 of the slicer's key. Never shown anywhere, sent only down the relay.
+inline String webAuthForWorker() {
+  if (!webAuthSet())
+    return "{\"t\":\"auth\",\"open\":true}";
+  uint8_t digest[32];
+  mbedtls_sha256((const unsigned char *)webAuthApiKey.c_str(), webAuthApiKey.length(), digest, 0);
+  String keyHash;
+  for (uint8_t b : digest) {
+    if (b < 16) keyHash += '0';
+    keyHash += String(b, HEX);
+  }
+  return String("{\"t\":\"auth\",\"user\":\"" WEBAUTH_USER "\",\"realm\":\"" WEBAUTH_REALM "\",\"nonce\":\"") +
+         webAuthNonce + "\",\"ha1\":\"" +
+         webAuthMd5(String(WEBAUTH_USER) + ":" + WEBAUTH_REALM + ":" + webAuthPassword) +
+         "\",\"key\":\"" + keyHash + "\"}";
 }
 
 inline String webAuthMakeOnce() {

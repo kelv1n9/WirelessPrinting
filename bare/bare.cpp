@@ -547,6 +547,8 @@ static void takeUpload() {
 // Says no rather than half doing it, with the reason left in choreTrouble.
 bool somethingIsStreaming() { return otaActive.load() || sender.running(); }
 
+String relayAuthHello() { return webAuthForWorker(); }
+
 // The printer's buzzer, for the two things worth hearing from across the room: a file
 // that reached the printer's card whole, and the module coming back on new firmware.
 // Kept behind a setting because test runs go by the dozen in a lived in room.
@@ -1362,18 +1364,21 @@ void setup() {
       return;
     }
     webAuthSetPassword(given);        // straight into NVS, never logged and never shown
+    relayAuthChanged();
     server.sendHeader("Location", "/auth");
     server.send(303, "text/plain", "saved\n");
   });
 
   route("/auth/forget", HTTP_POST, []() {
     webAuthForget();
+    relayAuthChanged();
     server.sendHeader("Location", "/auth");
     server.send(303, "text/plain", "gone\n");
   });
 
   route("/auth/key", HTTP_POST, []() {
     webAuthNewKey();
+    relayAuthChanged();
     server.sendHeader("Location", "/auth");
     server.send(303, "text/plain", "made\n");
   });

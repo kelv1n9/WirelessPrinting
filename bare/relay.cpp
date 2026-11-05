@@ -189,6 +189,10 @@ static void answer(uint32_t id, int status, const char *message) {
   sendText("{\"i\":" + String(id) + ",\"e\":1}");
 }
 
+String relayAuthHello();
+
+void relayAuthChanged() { sendText(relayAuthHello()); }
+
 bool relayCarriesTelegram() { return connected && workerHasBot; }
 
 bool relayYandexReady() { return connected; }
@@ -280,6 +284,7 @@ static void carry(char *raw) {
   const char *kind = doc["t"] | "";
   if (!strcmp(kind, "hello")) {
     workerHasBot = doc["tg"] | false;
+    sendText(relayAuthHello());
     return;
   }
   if (!strcmp(kind, "tgdoc")) {
