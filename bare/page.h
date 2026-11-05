@@ -61,6 +61,13 @@ section h2{margin:0 0 14px;font-size:12px;text-transform:uppercase;letter-spacin
 .wide{grid-column:1/-1}
 .job{display:flex;gap:18px;align-items:flex-start}
 .thumb{width:118px;height:118px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);object-fit:contain;flex:none}
+#jbox{position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--dim)}
+#jbox img{width:100%;height:100%;object-fit:contain}
+#jbox .ph{display:none;flex-direction:column;align-items:center;gap:6px;font-size:11px;text-align:center;line-height:1.25}
+#jbox[data-v=cube] .cube,#jbox[data-v=drop] .drop{display:flex}
+#jbox[data-v=cube] img,#jbox[data-v=drop] img{display:none}
+#jbox[data-v=drop]{border:1.5px dashed color-mix(in srgb,var(--dim) 55%,transparent);cursor:pointer;transition:border-color .15s,color .15s}
+#jbox[data-v=drop]:hover,#jbox.over{border-color:var(--acc);color:var(--acc)}
 .noimg{visibility:hidden}
 .jobmain{flex:1;min-width:0}
 .fname{font-size:15px;font-weight:600;word-break:break-all;margin-bottom:12px}
@@ -203,7 +210,11 @@ upload and reflash. <a href="/auth">Set one</a>.</p>
   <section class="wide" id="jobsec">
     <h2 id="jobtitle">Job</h2>
     <div class="job">
-      <img class="thumb" id="jthumb" alt="" onerror="this.classList.add('noimg')">
+      <div class="thumb" id="jbox" data-v="drop" title="drop a G-code file here, or click to pick one">
+        <img id="jthumb" alt="" onerror="this.parentNode.dataset.v='cube'">
+        <svg class="ph cube" width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4z"/><path d="M4 7.4 12 12l8-4.6M12 12v9.2"/></svg>
+        <div class="ph drop"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>Drop G-code<br>or click</div>
+      </div>
       <div class="jobmain">
         <div class="fname" id="jname">—</div>
         <div class="pct"><span id="jpct">0</span><small>%</small></div>
@@ -326,8 +337,7 @@ function render(d){
     const u = d.relayUpload, pct = u.total ? Math.round(u.sent * 100 / u.total) : 0;
     $('xfer').classList.remove('hide');
     $('xfer').textContent = 'upload ' + pct + '%';
-    $('xline').textContent = 'to the module, ' + kib(u.sent) + ' of ' + kib(u.total) +
-      (u.rate ? ', ' + kib(u.rate) + '/s' : '');
+    $('xline').textContent = '';
   }
   $('unlocked').classList.toggle('hide', d.locked !== false);
   conPrinting = d.printing;
@@ -385,7 +395,7 @@ function render(d){
   const th = $('jthumb'), want = j.file && j.file !== '—' ? '/thumbnail?name=' + encodeURIComponent(j.file) + (d.of ? '&s=' + d.of : '') : '';
   if (th.dataset.src !== want || th.dataset.printing !== String(d.printing)) {
     th.dataset.src = want; th.dataset.printing = String(d.printing);
-    th.className = want ? 'thumb' : 'thumb noimg';
+    $('jbox').dataset.v = want ? 'img' : 'drop';
     if (want) th.src = want; else th.removeAttribute('src');
   }
   $('kgram').classList.toggle('hide', !(d.energy.grams > 0));
@@ -515,6 +525,19 @@ function pick(andPrint){
   $('file').click();
 }
 $('bpick').onclick = () => pick(false);
+$('jbox').onclick = () => $('jbox').dataset.v === 'drop' && pick(false);
+$('jbox').ondragover = e => { if ($('jbox').dataset.v !== 'drop') return; e.preventDefault(); $('jbox').classList.add('over'); };
+$('jbox').ondragleave = () => $('jbox').classList.remove('over');
+$('jbox').ondrop = e => {
+  e.preventDefault(); $('jbox').classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (!f) return;
+  if (!/\.(gcode|gco|g)$/i.test(f.name)) { toast('only G-code files'); return; }
+  if (busy) { toast('a transfer is running, upload when it finishes'); return; }
+  if (conPrinting) { toast('a print is running, the wire is not free'); return; }
+  uploadThenPrint = false;
+  upload(f);
+};
 $('bpickp').onclick = () => pick(true);
 
 $('bfw').onclick = () => $('fwfile').click();

@@ -9,6 +9,7 @@
 #include "telegram.h"
 #include "relaypour.h"
 #include "hsunpack.h"
+#include "inflate.h"
 
 void logEvent(const String &text);
 bool printerWireBusy();
@@ -317,9 +318,10 @@ static void answerWith(uint32_t id, int status, const String &type, const String
   sendText("{\"i\":" + String(id) + ",\"e\":1}");
 }
 
-// A file the Worker took out of the browser's or the slicer's form and packed with
-// heatshrink. It goes straight onto the card: no loopback, no form parser, and half
-// the bytes across the internet. The loop keeps running meanwhile.
+// A file the Worker took out of the browser's or the slicer's form and packed, with
+// deflate when this firmware said it can unpack it, else heatshrink. It goes straight
+// onto the card: no loopback, no form parser, and a third of the bytes across the
+// internet. The loop keeps running meanwhile.
 static void put(uint32_t id, JsonDocument &doc) {
   const String path = doc["p"] | "/api/files/local";
   const String name = doc["name"] | "upload.gcode";
@@ -327,6 +329,7 @@ static void put(uint32_t id, JsonDocument &doc) {
   const uint32_t size = doc["size"] | 0;
   const bool andPrint = doc["print"] | false;
   const bool z = doc["z"] | false;
+  const bool deflated = doc["d"] | false;
   JsonObject h = doc["h"];
   const String said = h["authorization"] | "";
   const String key = h["x-api-key"] | "";
@@ -348,13 +351,28 @@ static void put(uint32_t id, JsonDocument &doc) {
     return;
   }
 
+  // Taken first: the Worker has packed the file already, so without this there is no
+  // reading it, and the answer asks for it the old way. Its 15 KB stand in for the
+  // wider window: both at once took the heap low enough that wifi dropped and the
+  // interrupt watchdog restarted the module (05.11.2026).
+  static Inflate inflate;
+  struct Unpacker {
+    bool on;
+    ~Unpacker() { if (on) inflate.end(); }
+  } unpacker{deflated && inflate.begin()};
+  if (deflated && !unpacker.on) {
+    relayPutAbort();
+    answer(id, 507, "no room to unpack this file, send it packed the old way\n");
+    return;
+  }
+
   crumbRelay = 2;
   // A wider window for this file only: more pieces in flight is what the speed across
   // the internet comes down to. The extra pieces are one allocation, so handing it back
   // leaves the heap as it was; pieces allocated one by one left it in bits.
   static uint8_t *extra;
   const uint8_t room = RELAY_PUT_PIECES - RELAY_BODY_PIECES;
-  if (!extra && ESP.getFreeHeap() >= RELAY_PUT_HEAP_KEEP + room * RELAY_SLOT_BYTES &&
+  if (!deflated && !extra && ESP.getFreeHeap() >= RELAY_PUT_HEAP_KEEP + room * RELAY_SLOT_BYTES &&
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= room * RELAY_SLOT_BYTES + 12 * 1024) {
     extra = (uint8_t *)malloc(room * RELAY_SLOT_BYTES);
     if (extra)
@@ -399,10 +417,11 @@ static void put(uint32_t id, JsonDocument &doc) {
   // Big card writes for this file only. The buffer is borrowed while it lasts and handed
   // back before the extra pieces are, so the heap ends up as it was found.
   static uint8_t small[2048] __attribute__((aligned(32)));   // SD_MMC moves this over DMA
+  // A deflated file is written from the unpacker's own window and needs none of this.
   struct Borrowed {
-    uint8_t *at = (uint8_t *)malloc(8192);
+    uint8_t *at;
     ~Borrowed() { free(at); }
-  } borrowed;
+  } borrowed{deflated ? nullptr : (uint8_t *)malloc(8192)};
   uint8_t *const out = borrowed.at ? borrowed.at : small;
   const size_t outRoom = borrowed.at ? 8192 : sizeof small;
 
@@ -423,10 +442,19 @@ static void put(uint32_t id, JsonDocument &doc) {
       held = 0;
     }
   };
+  auto writeOut = [&](const uint8_t *span, size_t n) {
+    const uint32_t w0 = millis();
+    crumbRelay = 6;
+    relayPutWrite(span, n);
+    putWriteMs += millis() - w0;
+    crumbRelay = 5;
+    wrote += n;
+  };
+  bool good = true;
 
   uint32_t taken = 0, unacked = 0, waitedFrom = millis();
   putWaitMs = putWorkMs = putAckMs = putWriteMs = 0;
-  while (taken < packed && connected) {
+  while (taken < packed && connected && good) {
     Piece one;
     if (xQueueReceive(bodies, &one, pdMS_TO_TICKS(RELAY_IDLE_MS)) != pdTRUE)
       break;
@@ -441,7 +469,9 @@ static void put(uint32_t id, JsonDocument &doc) {
       memcpy(&whose, data, 4);
     if (one.len >= 4 && whose == id) {
       const size_t n = one.len - 4;
-      if (z)
+      if (deflated)
+        good = inflate.feed(data + 4, n, taken + n >= packed, writeOut);
+      else if (z)
         unpack.feed(data + 4, n, emit);
       else
         for (size_t k = 0; k < n; k++)
@@ -469,7 +499,7 @@ static void put(uint32_t id, JsonDocument &doc) {
   }
 
   crumbRelay = 7;
-  if (taken < packed || wrote != size) {
+  if (taken < packed || !good || (deflated && !inflate.finished()) || wrote != size) {
     relayPutAbort();
     pourFails++;
     answer(id, 502, "the upload broke off on the way in\n");

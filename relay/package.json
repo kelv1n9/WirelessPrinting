@@ -1,0 +1,7 @@
+{
+  "name": "kp3s-relay",
+  "private": true,
+  "dependencies": {
+    "pako": "2.1.0"
+  }
+}

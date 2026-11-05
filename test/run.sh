@@ -93,6 +93,11 @@ $CXX $FLAGS -I /tmp/hs_marlin -o /tmp/hs_unpack hs_unpack.cpp /tmp/hs_marlin/Mar
 echo "=== the module's unpacker against the Worker's packer ==="
 $CXX $FLAGS -o /tmp/hsunpack hsunpack_main.cpp && node test_hsunpack.mjs /tmp/hsunpack || fail=1
 
+echo "=== the module's inflater, on the miniz decoder the ROM holds, against the Worker's deflate ==="
+MINIZ=~/.platformio/packages/tool-esptoolpy/flasher_stub
+cc -O2 -I $MINIZ/include -c $MINIZ/miniz.c -o /tmp/miniz.o &&
+  $CXX $FLAGS -I $MINIZ/include -o /tmp/inflate inflate_main.cpp /tmp/miniz.o && node test_inflate.mjs /tmp/inflate || fail=1
+
 echo "=== relay pour ==="
 $CXX $FLAGS -std=c++17 -Wall -o /tmp/test_relaypour test_relaypour.cpp && /tmp/test_relaypour || fail=1
 

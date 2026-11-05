@@ -14,6 +14,7 @@
 // connection: {"t":"tg","c":chat,"x":text} in either direction.
 
 import { heatshrinkEncode } from "./heatshrink.js";
+import { deflateRaw } from "pako";
 
 const UPLOAD_LIMIT = 64 * 1024 * 1024;
 const CHUNK = 2040;                       // plus four bytes of number, one module buffer
@@ -224,7 +225,9 @@ export class Relay {
       if (!sameSecret(given, this.env.DEVICE_KEY))
         return new Response("no\n", { status: 403 });
       const incidents = (await this.state.storage.get("incidents")) || [];
-      return new Response("incidents:\n" + incidents.join("\n") + "\n\ntrail:\n" + this.trail.join("\n") + "\n");
+      let where = "";
+      try { where = (await (await fetch("https://cloudflare.com/cdn-cgi/trace")).text()).match(/colo=\w+/)[0]; } catch (e) {}
+      return new Response("object runs at " + where + "\nincidents:\n" + incidents.join("\n") + "\n\ntrail:\n" + this.trail.join("\n") + "\n");
     }
 
     if (url.pathname === "/.tg-setup") {
@@ -380,19 +383,20 @@ export class Relay {
     // A body is sent again if it did not get through: an upload overwrites the same
     // file and a firmware image starts over, so trying twice is harmless, and a print
     // asked for alongside starts only once the whole file has landed.
-    let extra = null, payload = buffered;
+    let extra = null, file = null;
     if (request.method === "POST" && (url.pathname === "/api/files/local" || url.pathname === "/upload")) {
       const form = takeForm(request.headers.get("content-type"), buffered);
       const safe = form && /^[^\/\\\x00-\x1f"]{1,120}$/.test(form.file.name);
       if (safe) {
         const asked = url.searchParams.get("print") || form.fields.print || "";
-        payload = heatshrinkEncode(form.file.bytes);
+        file = form.file.bytes;
         extra = { t: "put", name: form.file.name, size: form.file.bytes.length,
-                  print: asked === "true" || asked === "1", z: true };
-        this.note(`put ${form.file.name}: ${form.file.bytes.length} packed to ${payload.length}`);
+                  print: asked === "true" || asked === "1" };
       }
     }
-    const last = await this.deliver(request.method, url.pathname + url.search, headers, payload, extra);
+    const last = extra
+      ? await this.putFile(request.method, url.pathname + url.search, headers, file, extra)
+      : await this.deliver(request.method, url.pathname + url.search, headers, buffered);
     if (!last)
       return new Response("The upload did not get through the relay. Try again.\n", { status: 503 });
     const h = new Headers(last.headers || {});
@@ -402,6 +406,22 @@ export class Relay {
 
   // A body, tried up to three times, one body at a time. Resolves with the module's
   // whole answer, or null when it never got through.
+  // Deflate with a 4 KB window when the module said it can unpack that, a third fewer
+  // bytes than heatshrink. A module without the room for it just then answers 507, and
+  // gets the file again in heatshrink.
+  async putFile(method, path, headers, bytes, extra) {
+    const tries = this.auth && this.auth.inflate ? [true, false] : [false];
+    let last = null;
+    for (const deflate of tries) {
+      const body = deflate ? deflateRaw(bytes, { level: 9, windowBits: 12 }) : heatshrinkEncode(bytes);
+      const put = { ...extra, z: true, d: deflate };
+      this.note(`put ${extra.name}: ${bytes.length} packed to ${body.length} with ${deflate ? "deflate" : "heatshrink"}`);
+      last = await this.deliver(method, path, headers, body, put);
+      if (!last || last.status !== 507) break;
+    }
+    return last;
+  }
+
   deliver(method, path, headers, body, extra = null) {
     const turn = this.bodies.then(async () => {
       this.uploading++;
@@ -470,8 +490,7 @@ export class Relay {
           "content-type": `multipart/form-data; boundary=${boundary}`,
           "x-relay-once": m.token,
         }, body)
-      : await this.deliver("POST", m.route, { "x-relay-once": m.token }, heatshrinkEncode(file),
-                           { t: "put", name: safeName, size: file.length, print: false, z: true });
+      : await this.putFile("POST", m.route, { "x-relay-once": m.token }, file, { t: "put", name: safeName, size: file.length, print: false });
     const seconds = Math.round((Date.now() - started) / 1000);
     const kb = Math.round(file.length / 1024);
     const said = answer ? new TextDecoder().decode(answer.body).trim() : "";
@@ -643,16 +662,19 @@ export class Relay {
   }
 
   async webSocketMessage(ws, message) {
-    if (!this.auth && !this.askedAuth) {
+    // Asked once each time the object wakes: what is kept in storage may be from an
+    // older firmware that could not unpack deflate, or before a password change.
+    if (!this.askedAuth) {
       this.askedAuth = true;
-      this.auth = (await this.state.storage.get("auth")) || null;
-      if (!this.auth) try { ws.send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN })); } catch (e) {}
+      if (!this.auth) this.auth = (await this.state.storage.get("auth")) || null;
+      try { ws.send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN })); } catch (e) {}
     }
     if (typeof message === "string") {
       let m;
       try { m = JSON.parse(message); } catch { return; }
       if (m.t === "auth") {
         this.auth = m.open ? { open: true } : { user: m.user, realm: m.realm, nonce: m.nonce, ha1: m.ha1, key: m.key };
+        this.auth.inflate = !!m.inflate;
         this.state.storage.put("auth", this.auth).catch(() => {});
         this.note(`auth from module, ${m.open ? "open" : "password set"}`);
         return;
