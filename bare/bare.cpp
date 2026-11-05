@@ -794,6 +794,25 @@ static String openPrinterFile(const char *name) {
   return say("M23 " + String(entry->dos));
 }
 
+// Starts a file that is already on the printer's card. Empty when it started, the
+// reason when it did not. listed says the card was asked for a moment ago.
+static String printOnPrinter(const String &name, const bool listed = false) {
+  if (sender.running())
+    return "a transfer owns the wire";
+  if (printing || sendAsked)
+    return "the printer is busy";
+  if (name == "")
+    return "name is empty";
+  if (!listed && !askPrinterCard())
+    return "the printer did not finish a listing";
+  const String opened = openPrinterFile(name.c_str());
+  if (opened.indexOf("File opened") < 0)
+    return "the printer would not open it";
+  say("M27 S3");                 // It reports on its own from idle(), so a full queue cannot delay it
+  say("M24");
+  return "";
+}
+
 static const char *phaseName(const BinaryPhase p) {
   switch (p) {
     case BinaryIdle:      return "idle";
@@ -820,21 +839,6 @@ static bool portal;
 static String slot() {
   const esp_partition_t *running = esp_ota_get_running_partition();
   return running ? String(running->label) : String("?");
-}
-
-static String page() {
-  return "<!doctype html><meta charset=utf-8><title>KP3S</title>"
-         "<style>body{font:16px system-ui;margin:2rem;max-width:34rem}"
-         "input,button{font:inherit;padding:.4rem}</style>"
-         "<h1>KP3S module</h1>"
-         "<p>Bare firmware. Slot " + slot() +
-         ", ip " + WiFi.localIP().toString() +
-         ", rssi " + String(WiFi.RSSI()) +
-         ", up " + String(millis() / 1000) + "s"
-         ", heap " + String(ESP.getFreeHeap()) + "</p>"
-         "<h2>Flash</h2>"
-         "<form method=POST action=/update enctype=multipart/form-data>"
-         "<input type=file name=firmware required><button>Send</button></form>";
 }
 
 static void startPortal() {
@@ -1083,18 +1087,6 @@ void setup() {
     server.send(200, "application/json", j);
   });
 
-  // Choosing a file is remembered here and acted on when the print is asked for: the
-  // printer cannot hold a selection for a file that is not on its card yet.
-  route("/select", HTTP_POST, []() {
-    if (printing || sender.running() || sendAsked) {
-      server.send(409, "text/plain", "the printer is busy\n");
-      return;
-    }
-    snprintf(selected, sizeof selected, "%s", server.arg("name").c_str());
-    printAt = printOf = printSince = 0;
-    server.send(200, "text/plain", "selected\n");
-  });
-
   route("/delete", HTTP_POST, []() {
     if (!cardUp) {
       server.send(503, "text/plain", "the module has no card\n");
@@ -1105,18 +1097,6 @@ void setup() {
       return;
     }
     server.send(200, "text/plain", "gone\n");
-  });
-
-  route("/api/rename", HTTP_POST, []() {
-    if (!cardUp) {
-      server.send(503, "text/plain", "the module has no card\n");
-      return;
-    }
-    if (!SD_MMC.rename("/" + server.arg("from"), "/" + server.arg("to"))) {
-      server.send(400, "text/plain", "the card would not rename it\n");
-      return;
-    }
-    server.send(200, "text/plain", "renamed\n");
   });
 
   // start takes the selected file the whole way, since it may not be over there yet
@@ -1134,11 +1114,13 @@ void setup() {
       server.send(400, "text/plain", "start or cancel\n");
       return;
     }
-    if (!startChore(String(selected), true)) {
-      server.send(409, "text/plain", choreTrouble + "\n");
+    // The selected file is the one the printer last opened, so it is on its card already
+    const String trouble = printOnPrinter(String(selected));
+    if (trouble != "") {
+      server.send(409, "text/plain", trouble + "\n");
       return;
     }
-    server.send(200, "text/plain", "taken as " + String(choreTarget) + "\n");
+    server.send(200, "text/plain", "printing " + String(selected) + "\n");
   });
 
   route("/api/command", HTTP_POST, []() {
@@ -1483,28 +1465,12 @@ void setup() {
     server.send(200, "text/plain", autoPowerOff ? "will switch off after a print\n" : "will stay on\n");
   });
 
-  route("/yandex/power", HTTP_POST, []() {
-    if (!yandexHome.request(YandexHome::PowerDraw)) {
-      server.send(409, "text/plain", "the socket is busy\n");
-      return;
-    }
-    server.send(200, "text/plain", "asking\n");
-  });
-
   route("/yandex/off", HTTP_POST, []() {
     if (!yandexHome.request(YandexHome::PowerOff)) {
       server.send(409, "text/plain", "the socket is busy\n");
       return;
     }
     server.send(200, "text/plain", "switching off\n");
-  });
-
-  route("/yandex/on", HTTP_POST, []() {
-    if (!yandexHome.request(YandexHome::PowerOn)) {
-      server.send(409, "text/plain", "the socket is busy\n");
-      return;
-    }
-    server.send(200, "text/plain", "switching on\n");
   });
 
   route("/restart", HTTP_POST, []() {
@@ -1578,51 +1544,13 @@ void setup() {
   });
 
   route("/printer/print", HTTP_POST, []() {
-    if (sender.running()) {
-      server.send(409, "text/plain", "a transfer owns the wire\n");
-      return;
-    }
-    if (printing || sendAsked) {
-      server.send(409, "text/plain", "the printer is busy\n");
-      return;
-    }
     const String name = server.arg("name");
-    if (name == "") {
-      server.send(400, "text/plain", "name is empty\n");
+    const String trouble = printOnPrinter(name);
+    if (trouble != "") {
+      server.send(trouble.startsWith("the printer would not") ? 404 : 409, "text/plain", trouble + "\n");
       return;
     }
-    if (!askPrinterCard()) {
-      server.send(502, "text/plain", "the printer did not finish a listing\n");
-      return;
-    }
-    const String opened = openPrinterFile(name.c_str());
-    if (opened.indexOf("File opened") < 0) {
-      server.send(404, "text/plain", "the printer would not open it:\n" + opened);
-      return;
-    }
-    say("M27 S3");            // It reports on its own from idle(), so a full queue cannot delay it
-    say("M24");
     server.send(200, "text/plain", "printing " + name + "\n");
-  });
-
-  route("/printer/cancel", HTTP_POST, []() {
-    if (sender.running()) {
-      server.send(409, "text/plain", "a transfer owns the wire\n");
-      return;
-    }
-    server.send(200, "text/plain", say("M524"));
-  });
-
-  route("/printer/progress", HTTP_GET, []() {
-    String out;
-    if (printOf)
-      out = "SD printing byte " + String(printAt) + "/" + String(printOf) + "\n";
-    if (!printing)
-      out += "Not SD printing\n";
-    saidLog[saidHeld] = 0;
-    out += saidLog;
-    saidHeld = 0;                // Lines are handed over once; the figures above are not
-    server.send(200, "text/plain", out);
   });
 
   // Both ends have to move together. M575 is not saved, so a power cycle undoes a mistake.
@@ -1837,14 +1765,8 @@ static void handleTelegram() {
       else {
         const PrinterCardEntry &e = printerCard.at(which - 1);
         const String name = e.name[0] ? e.name : e.dos;
-        const String opened = openPrinterFile(name.c_str());
-        if (opened.indexOf("File opened") < 0)
-          telegramBot.send(chat, "The printer would not open " + name + ".");
-        else {
-          say("M27 S3");
-          say("M24");
-          telegramBot.send(chat, "Printing " + name + ".");
-        }
+        const String trouble = printOnPrinter(name, true);
+        telegramBot.send(chat, trouble == "" ? "Printing " + name + "." : "Not printing " + name + ": " + trouble + ".");
       }
     }
 

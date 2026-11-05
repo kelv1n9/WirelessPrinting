@@ -28,7 +28,7 @@ helpers = '\n'.join(extract(marker) + (';' if marker.startswith('struct ') else 
     'static void sawLine(', 'static String metaPath(', 'static String metaReadPath(',
     'struct MetaOut :', 'static bool metaHead(', 'static uint32_t metaLayerAt(',
     'static int metaFanAt(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard() {',
-    'static String openPrinterFile('))
+    'static String openPrinterFile(', 'static String printOnPrinter('))
 upload = extract('static void takeUpload()')
 list_route = extract('route("/printer/files",').split('[]() ', 1)[1]
 thumb_route = extract('route("/thumbnail",').split('[]() ', 1)[1]
@@ -56,6 +56,7 @@ struct TestString : String {
   using String::String;
   TestString(const String &v):String(v) {}
   int toInt() const { return std::atoi(c_str()); }
+  bool startsWith(const char *v) const { return s.rfind(v, 0) == 0; }
   int indexOf(const char *v) const {
     auto at=s.find(v); return at==std::string::npos ? -1 : int(at);
   }

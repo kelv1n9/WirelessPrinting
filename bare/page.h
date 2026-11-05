@@ -637,4 +637,3 @@ printerCard().catch(()=>{});
 </script>
 )PAGE";
 
-static String pageHtml() { return String(PAGE_HTML); }

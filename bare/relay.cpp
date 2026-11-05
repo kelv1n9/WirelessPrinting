@@ -307,6 +307,10 @@ static void carry(char *raw) {
     answer(id, 502, "the module's own web server did not take the connection\n");
     return;
   }
+  // Each piece is 2040 bytes, a full segment and a short one. With Nagle on, the short
+  // one waits for the full one to be acknowledged, and that acknowledgement is delayed:
+  // tens of milliseconds a piece, most of the time an upload took.
+  local.setNoDelay(true);
   String head = String(method) + " " + path + " HTTP/1.0\r\nHost: kp3s\r\nConnection: close\r\n";
   JsonObject h = doc["h"];
   for (JsonPair kv : h)
