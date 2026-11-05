@@ -461,86 +461,114 @@ static int metaFanAt(const char *target, const uint32_t count, const uint32_t by
 }
 
 // One body for both upload routes: the module's own and the one a slicer speaks.
-static void takeUpload() {
-  static File into;
-  static uint8_t lined[2048] __attribute__((aligned(32)));   // SD_MMC moves this over DMA
-  HTTPUpload &up = server.upload();
+static File upInto;
+static uint8_t upLined[2048] __attribute__((aligned(32)));   // SD_MMC moves this over DMA
 
-  if (up.status == UPLOAD_FILE_START) {
-    metaWanted = false;
-    sendTrouble = "";
-    lastUpload = up.filename;
-    if (!cardUp) {
-      sendTrouble = "the module has no card";
-      return;
-    }
-    into = SD_MMC.open("/" + up.filename, FILE_WRITE);
-    if (!into) {
-      sendTrouble = "the module's card would not take the file";
-      return;
-    }
+// One upload onto the module's card, whoever carries it: the web server's form parser
+// or the relay, which hands over the file itself without a form around it.
+static bool uploadBegin(const String &filename) {
+  metaWanted = false;
+  sendTrouble = "";
+  lastUpload = filename;
+  if (!cardUp) {
+    sendTrouble = "the module has no card";
+    return false;
+  }
+  upInto = SD_MMC.open("/" + filename, FILE_WRITE);
+  if (!upInto) {
+    sendTrouble = "the module's card would not take the file";
+    return false;
+  }
 
-    // Read once, while it goes past. Reading it again afterwards would be a second
-    // pass over megabytes for something that is right here.
-    metaWanted = printerCardIsGcode(up.filename.c_str()) &&
-                 printerCardTarget(up.filename.c_str(), metaTarget, sizeof metaTarget);
-    if (metaWanted) {
-      SD_MMC.mkdir(META_DIR);
-      SD_MMC.remove(metaPath(metaTarget, ".hdr"));
-      SD_MMC.remove(metaPath(metaTarget, ".png"));
-      metaOut.into = SD_MMC.open(metaPath(metaTarget, ".idx"), FILE_WRITE);
-      metaOut.fans = SD_MMC.open(metaPath(metaTarget, ".fan"), FILE_WRITE);
-      metaOut.tmp = metaPath(metaTarget, ".new");
-      metaOut.keepAs = metaPath(metaTarget, ".png");
-      metaScan.begin(&metaOut);
-    }
+  // Read once, while it goes past. Reading it again afterwards would be a second
+  // pass over megabytes for something that is right here.
+  metaWanted = printerCardIsGcode(filename.c_str()) &&
+               printerCardTarget(filename.c_str(), metaTarget, sizeof metaTarget);
+  if (metaWanted) {
+    SD_MMC.mkdir(META_DIR);
+    SD_MMC.remove(metaPath(metaTarget, ".hdr"));
+    SD_MMC.remove(metaPath(metaTarget, ".png"));
+    metaOut.into = SD_MMC.open(metaPath(metaTarget, ".idx"), FILE_WRITE);
+    metaOut.fans = SD_MMC.open(metaPath(metaTarget, ".fan"), FILE_WRITE);
+    metaOut.tmp = metaPath(metaTarget, ".new");
+    metaOut.keepAs = metaPath(metaTarget, ".png");
+    metaScan.begin(&metaOut);
   }
-  else if (up.status == UPLOAD_FILE_WRITE && into) {
-    loopBeat = millis();
-    for (size_t at = 0; at < up.currentSize; at += sizeof(lined)) {
-      const size_t take = up.currentSize - at < sizeof(lined) ? up.currentSize - at : sizeof(lined);
-      memcpy(lined, up.buf + at, take);
-      if (into.write(lined, take) != take) {
-        sendTrouble = "the module's card stopped taking bytes";
-        break;
-      }
-      if (metaWanted)
-        metaScan.feed(lined, take);
+  return true;
+}
+
+static void uploadWrite(const uint8_t *data, const size_t len) {
+  if (!upInto)
+    return;
+  for (size_t at = 0; at < len; at += sizeof(upLined)) {
+    const size_t take = len - at < sizeof(upLined) ? len - at : sizeof(upLined);
+    memcpy(upLined, data + at, take);
+    if (upInto.write(upLined, take) != take) {
+      sendTrouble = "the module's card stopped taking bytes";
+      break;
     }
+    if (metaWanted)
+      metaScan.feed(upLined, take);
   }
-  else if (up.status == UPLOAD_FILE_END && into) {
-    into.flush();
-    into.close();
-    File stored = SD_MMC.open("/" + lastUpload);
-    const uint32_t size = stored ? stored.size() : 0;
-    if (!stored || size != up.totalSize)
-      sendTrouble = "the stored upload size does not match";
-    stored.close();
-    if (metaWanted) {
-      metaScan.finish(size);
-      metaOut.picture.close();
-      if (metaOut.into)
-        metaOut.into.close();
-      if (metaOut.fans)
-        metaOut.fans.close();
-      File head;
-      if (sendTrouble == "" && size == up.totalSize)
-        head = SD_MMC.open(metaPath(metaTarget, ".hdr"), FILE_WRITE);
-      if (head) {
-        head.write((const uint8_t *)&metaScan.head, sizeof metaScan.head);
-        head.close();
-      }
-      metaWanted = false;
-    }
-  }
-  else if (up.status == UPLOAD_FILE_ABORTED) {
-    into.close();
-    metaOut.into.close();
-    metaOut.fans.close();
+}
+
+static void uploadEnd(const uint32_t expected) {
+  if (!upInto)
+    return;
+  upInto.flush();
+  upInto.close();
+  File stored = SD_MMC.open("/" + lastUpload);
+  const uint32_t size = stored ? stored.size() : 0;
+  if (!stored || size != expected)
+    sendTrouble = "the stored upload size does not match";
+  stored.close();
+  if (metaWanted) {
+    metaScan.finish(size);
     metaOut.picture.close();
+    if (metaOut.into)
+      metaOut.into.close();
+    if (metaOut.fans)
+      metaOut.fans.close();
+    File head;
+    if (sendTrouble == "" && size == expected)
+      head = SD_MMC.open(metaPath(metaTarget, ".hdr"), FILE_WRITE);
+    if (head) {
+      head.write((const uint8_t *)&metaScan.head, sizeof metaScan.head);
+      head.close();
+    }
     metaWanted = false;
-    sendTrouble = "upload aborted";
   }
+}
+
+static void uploadAbort(const char *why) {
+  upInto.close();
+  metaOut.into.close();
+  metaOut.fans.close();
+  metaOut.picture.close();
+  metaWanted = false;
+  sendTrouble = why;
+}
+
+// The relay is writing a file of its own; the web server's form must not cut in
+static volatile bool relayPutting;
+
+static void takeUpload() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    if (relayPutting) {
+      sendTrouble = "a file is coming in through the relay";
+      return;
+    }
+    uploadBegin(up.filename);
+  }
+  else if (up.status == UPLOAD_FILE_WRITE && upInto && !relayPutting) {
+    loopBeat = millis();
+    uploadWrite(up.buf, up.currentSize);
+  }
+  else if (up.status == UPLOAD_FILE_END && upInto && !relayPutting)
+    uploadEnd(up.totalSize);
+  else if (up.status == UPLOAD_FILE_ABORTED && !relayPutting)
+    uploadAbort("upload aborted");
 }
 
 // Takes a file on the module's card all the way to the printer, and onto it if asked.
@@ -616,6 +644,103 @@ static bool startChore(const String &name, const bool andPrint, const uint8_t wi
   sendAsked = true;
   return true;
 }
+
+// The module's card is a place to pass through, not a place to keep things, so an
+// upload goes on to the printer's card either way. andPrint only says whether to start
+// it when it lands. Answers as the slicer expects.
+static String fileLanded(const bool andPrint) {
+  String said = andPrint ? "printing" : "sending";
+  if (!startChore(lastUpload, andPrint))
+    said = choreTrouble.length() ? choreTrouble : "the printer is busy";
+  else if (fileChat != "") {
+    choreChat = fileChat;            // it came from the bot, so the bot says how it ended
+    choreFile = fileName;
+    fileChat = "";
+  }
+  return "{\"done\":true,\"name\":\"" + lastUpload + "\",\"said\":\"" + said + "\"}";
+}
+
+// A file the relay writes straight onto the card, with no form and no loopback around
+// it. The writing happens on the relay's task; what comes after, starting the transfer
+// to the printer, belongs to the loop, so the relay hands over and waits for the answer.
+static volatile bool putLanded;
+static bool putPrint;
+static String putPath, putAnswer, putType;
+static int putCode;
+static SemaphoreHandle_t putDone;
+
+static void putFinished() {
+  relayPutting = false;
+  uploadActive = false;
+}
+
+int relayPutBegin(const String &said, const String &key, const String &once, const String &name, String &why) {
+  if (!webAuthAllowsWith("POST", said, key, once, "")) {
+    why = "the password was not right";
+    return 401;
+  }
+  if (relayPutting || uploadActive || otaActive.load()) {
+    why = "another upload is under way";
+    return 409;
+  }
+  relayPutting = true;
+  uploadActive = true;
+  if (!uploadBegin(name)) {
+    why = sendTrouble;
+    sendTrouble = "";
+    putFinished();
+    return 503;
+  }
+  return 0;
+}
+
+void relayPutWrite(const uint8_t *data, const size_t len) {
+  uploadWrite(data, len);
+}
+
+void relayPutAbort() {
+  uploadAbort("the upload broke off");
+  sendTrouble = "";
+  putFinished();
+}
+
+int relayPutEnd(const uint32_t size, const bool andPrint, const String &path, String &body, String &type) {
+  uploadEnd(size);
+  putPrint = andPrint;
+  putPath = path;
+  xSemaphoreTake(putDone, 0);
+  putLanded = true;
+  const bool answered = xSemaphoreTake(putDone, pdMS_TO_TICKS(10000)) == pdTRUE;
+  putFinished();
+  if (!answered) {
+    type = "text/plain";
+    body = "the file is on the card, the loop did not answer\n";
+    return 504;
+  }
+  body = putAnswer;
+  type = putType;
+  return putCode;
+}
+
+static void finishPut() {
+  if (sendTrouble != "") {
+    putCode = putPath.startsWith("/api/files/local") ? 500 : 400;
+    putType = "text/plain";
+    putAnswer = sendTrouble + "\n";
+    sendTrouble = "";
+  }
+  else if (putPath.startsWith("/api/files/local")) {
+    putCode = 201;
+    putType = "application/json";
+    putAnswer = fileLanded(putPrint);
+  }
+  else {
+    putCode = 200;
+    putType = "text/plain";
+    putAnswer = "stored\n";
+  }
+}
+
 
 // A transfer leaves the printer a moment short of reading gcode again, and anything
 // sent into that gap is swallowed as packet bytes rather than answered. So the wire is
@@ -1011,21 +1136,8 @@ void setup() {
       server.send(500, "application/json", "{\"error\":\"" + why + "\"}");
       return;
     }
-    // The module's card is a place to pass through, not a place to keep things, so
-    // an upload goes on to the printer's card either way. print only says whether to
-    // start it when it lands.
     const String wanted = server.arg("print");
-    const bool andPrint = wanted == "true" || wanted == "1";
-    String said = andPrint ? "printing" : "sending";
-    if (!startChore(lastUpload, andPrint))
-      said = choreTrouble.length() ? choreTrouble : "the printer is busy";
-    else if (fileChat != "") {
-      choreChat = fileChat;            // it came from the bot, so the bot says how it ended
-      choreFile = fileName;
-      fileChat = "";
-    }
-    server.send(201, "application/json",
-      "{\"done\":true,\"name\":\"" + lastUpload + "\",\"said\":\"" + said + "\"}");
+    server.send(201, "application/json", fileLanded(wanted == "true" || wanted == "1"));
   }, takeUpload);
 
 
@@ -1619,6 +1731,7 @@ void setup() {
     autoPowerOff = settings.getBool("autooff", false);
     settings.end();
   }
+  putDone = xSemaphoreCreateBinary();
   relayBegin();                      // first: the bot and Yandex size their stacks by whether the relay is set up
   yandexHome.begin();
   telegramBot.begin();
@@ -1875,6 +1988,11 @@ static void guardian(void *) {
 
 void loop() {
   loopBeat = millis();
+  if (putLanded) {
+    putLanded = false;
+    finishPut();
+    xSemaphoreGive(putDone);
+  }
   server.handleClient();
   isPrinting = printing;             // what the bot's task reads, kept in step from one place
   bootGuardWatch(WiFi.status() == WL_CONNECTED);

@@ -102,7 +102,7 @@ static const char *webAuthVerb() {
 // for a page and its icon and its data at the same time: each refusal overwrites the
 // nonce the others were answered with, every answer then fails to add up, and a right
 // password reads as a wrong one. This nonce is made once and left alone.
-static bool webAuthDigestFits(const String &said) {
+static bool webAuthDigestFits(const String &said, const char *verb) {
   if (webAuthField(said, "username") != WEBAUTH_USER)
     return false;
   if (webAuthField(said, "nonce") != webAuthNonce)
@@ -113,7 +113,7 @@ static bool webAuthDigestFits(const String &said) {
     return false;
 
   const String ha1 = webAuthMd5(String(WEBAUTH_USER) + ":" + WEBAUTH_REALM + ":" + webAuthPassword);
-  const String ha2 = webAuthMd5(String(webAuthVerb()) + ":" + uri);
+  const String ha2 = webAuthMd5(String(verb) + ":" + uri);
 
   const String qop = webAuthField(said, "qop");
   String ours;
@@ -133,26 +133,31 @@ static bool webAuthBasicFits(const String &said) {
 
 // Whether this request may go through, without saying anything back. The upload path
 // needs the answer long before there is a reply to put a refusal in.
-static bool webAuthAllows() {
+// The check itself, given what a request carried. The web server's requests and the
+// files the relay writes straight to the card both come through here.
+static bool webAuthAllowsWith(const char *verb, const String &said, const String &key,
+                              const String &once, const String &internal) {
   if (!webAuthSet())
     return true;
-  if (webAuthApiKey != "" && server.hasHeader("X-Api-Key")
-      && server.header("X-Api-Key") == webAuthApiKey)
+  if (relayInternalKey.length() == 32 && internal == relayInternalKey)
     return true;
-  if (relayInternalKey.length() == 32 && server.hasHeader("X-Relay-Internal") &&
-      server.header("X-Relay-Internal") == relayInternalKey)
+  if (webAuthOnceToken != "" && (int32_t)(webAuthOnceUntil - millis()) > 0 && once == webAuthOnceToken)
     return true;
-  if (webAuthOnceToken != "" && (int32_t)(webAuthOnceUntil - millis()) > 0 &&
-      server.hasHeader("X-Relay-Once") && server.header("X-Relay-Once") == webAuthOnceToken)
+  if (webAuthApiKey != "" && key == webAuthApiKey)
     return true;
-  if (!server.hasHeader("Authorization"))
-    return false;
-  String said = server.header("Authorization");
   if (said.startsWith("Digest "))
-    return webAuthDigestFits(said.substring(7));
+    return webAuthDigestFits(said.substring(7), verb);
   if (said.startsWith("Basic "))
     return webAuthBasicFits(said.substring(6));
   return false;
+}
+
+static bool webAuthAllows() {
+  return webAuthAllowsWith(webAuthVerb(),
+                           server.hasHeader("Authorization") ? server.header("Authorization") : String(),
+                           server.hasHeader("X-Api-Key") ? server.header("X-Api-Key") : String(),
+                           server.hasHeader("X-Relay-Once") ? server.header("X-Relay-Once") : String(),
+                           server.hasHeader("X-Relay-Internal") ? server.header("X-Relay-Internal") : String());
 }
 
 static bool webAuthLets() {

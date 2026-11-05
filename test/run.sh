@@ -87,6 +87,12 @@ CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_transfer_completion.py || fail=1
 CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_ui_metadata.py || fail=1
 node test_page_ui.js || fail=1
 
+echo "=== heatshrink, the Worker's packer against Marlin's decoder ==="
+$CXX $FLAGS -I /tmp/hs_marlin -o /tmp/hs_unpack hs_unpack.cpp /tmp/hs_marlin/Marlin/src/libs/heatshrink/heatshrink_decoder.cpp && node test_hs_js.mjs /tmp/hs_unpack || fail=1
+
+echo "=== the module's unpacker against the Worker's packer ==="
+$CXX $FLAGS -o /tmp/hsunpack hsunpack_main.cpp && node test_hsunpack.mjs /tmp/hsunpack || fail=1
+
 echo "=== relay pour ==="
 $CXX $FLAGS -std=c++17 -Wall -o /tmp/test_relaypour test_relaypour.cpp && /tmp/test_relaypour || fail=1
 

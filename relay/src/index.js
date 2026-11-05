@@ -13,6 +13,8 @@
 // Telegram goes through here too, because the module cannot hold a second encrypted
 // connection: {"t":"tg","c":chat,"x":text} in either direction.
 
+import { heatshrinkEncode } from "./heatshrink.js";
+
 const UPLOAD_LIMIT = 64 * 1024 * 1024;
 const CHUNK = 2040;                       // plus four bytes of number, one module buffer
 const IN_FLIGHT = 5;                      // one fewer than the module has slots for pieces
@@ -102,6 +104,46 @@ h1{font-size:20px;margin:0 0 8px}p{margin:0;color:var(--dim)}.s{display:inline-b
 }
 
 const wantsPage = (request) => (request.headers.get("accept") || "").includes("text/html");
+
+function indexOfBytes(hay, needle, from) {
+  outer: for (let i = from; i <= hay.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+// Takes a multipart form apart: the one file in it and its other fields. Null when
+// the form is anything other than that, and then it goes down as it came.
+function takeForm(contentType, body) {
+  const m = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType || "");
+  if (!m) return null;
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const sep = enc.encode("--" + (m[1] || m[2]));
+  const crlf2 = enc.encode("\r\n\r\n");
+  const fields = {};
+  let file = null;
+  let at = indexOfBytes(body, sep, 0);
+  while (at >= 0) {
+    at += sep.length;
+    if (body[at] === 45 && body[at + 1] === 45) break;          // "--" ends the form
+    const headEnd = indexOfBytes(body, crlf2, at);
+    if (headEnd < 0) return null;
+    const head = dec.decode(body.subarray(at, headEnd));
+    const next = indexOfBytes(body, enc.encode("\r\n--" + (m[1] || m[2])), headEnd + 4);
+    if (next < 0) return null;
+    const value = body.subarray(headEnd + 4, next);
+    const name = /name="([^"]*)"/i.exec(head);
+    const filename = /filename="([^"]*)"/i.exec(head);
+    if (filename) {
+      if (file) return null;                                   // two files is not ours
+      file = { name: filename[1], bytes: value };
+    }
+    else if (name) fields[name[1]] = dec.decode(value);
+    at = next + 2;
+  }
+  return file ? { file, fields } : null;
+}
 
 function sameSecret(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length || !a.length)
@@ -323,7 +365,19 @@ export class Relay {
     // A body is sent again if it did not get through: an upload overwrites the same
     // file and a firmware image starts over, so trying twice is harmless, and a print
     // asked for alongside starts only once the whole file has landed.
-    const last = await this.deliver(request.method, url.pathname + url.search, headers, buffered);
+    let extra = null, payload = buffered;
+    if (request.method === "POST" && (url.pathname === "/api/files/local" || url.pathname === "/upload")) {
+      const form = takeForm(request.headers.get("content-type"), buffered);
+      const safe = form && /^[^\/\\\x00-\x1f"]{1,120}$/.test(form.file.name);
+      if (safe) {
+        const asked = url.searchParams.get("print") || form.fields.print || "";
+        payload = heatshrinkEncode(form.file.bytes);
+        extra = { t: "put", name: form.file.name, size: form.file.bytes.length,
+                  print: asked === "true" || asked === "1", z: true };
+        this.note(`put ${form.file.name}: ${form.file.bytes.length} packed to ${payload.length}`);
+      }
+    }
+    const last = await this.deliver(request.method, url.pathname + url.search, headers, payload, extra);
     if (!last)
       return new Response("The upload did not get through the relay. Try again.\n", { status: 503 });
     const h = new Headers(last.headers || {});
@@ -333,7 +387,7 @@ export class Relay {
 
   // A body, tried up to three times, one body at a time. Resolves with the module's
   // whole answer, or null when it never got through.
-  deliver(method, path, headers, body) {
+  deliver(method, path, headers, body, extra = null) {
     const turn = this.bodies.then(async () => {
       this.uploading++;
       try {
@@ -341,7 +395,7 @@ export class Relay {
       for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
         const device = await this.waitForDevice(RECONNECT_WAIT_MS);
         if (!device) break;
-        last = await this.sendBody(device, method, path, headers, body);
+        last = await this.sendBody(device, method, path, headers, body, extra);
         // A firmware image that went down whole and then lost the module is a flash that
         // worked: the module reboots before its answer is out. Sending it again only
         // met the new firmware with yesterday's credentials.
@@ -394,10 +448,15 @@ export class Relay {
     const body = new Uint8Array(head.length + file.length + tail.length);
     body.set(head, 0); body.set(file, head.length); body.set(tail, head.length + file.length);
 
-    const answer = await this.deliver("POST", m.route, {
-      "content-type": `multipart/form-data; boundary=${boundary}`,
-      "x-relay-once": m.token,
-    }, body);
+    // A file for the printer goes straight onto the card, packed; firmware still goes
+    // through the module's flash route, which needs the form.
+    const answer = m.route === "/update"
+      ? await this.deliver("POST", m.route, {
+          "content-type": `multipart/form-data; boundary=${boundary}`,
+          "x-relay-once": m.token,
+        }, body)
+      : await this.deliver("POST", m.route, { "x-relay-once": m.token }, heatshrinkEncode(file),
+                           { t: "put", name: safeName, size: file.length, print: false, z: true });
     const seconds = Math.round((Date.now() - started) / 1000);
     const kb = Math.round(file.length / 1024);
     const said = answer ? new TextDecoder().decode(answer.body).trim() : "";
@@ -502,7 +561,7 @@ export class Relay {
   }
 
   // One try at a body: resolves with the module's whole answer, or { lost: true }
-  sendBody(ws, method, path, headers, body) {
+  sendBody(ws, method, path, headers, body, extra = null) {
     const id = this.newId();
     return new Promise(async (done) => {
       // A firmware image goes one piece at a time: the module is short of memory while it
@@ -520,7 +579,7 @@ export class Relay {
       this.waiting.set(id, w);
       this.note(`req ${id} ${method} ${path} length ${body.length}`);
       try {
-        ws.send(JSON.stringify({ i: id, m: method, p: path, h: headers, l: body.length }));
+        ws.send(JSON.stringify(Object.assign({ i: id, m: method, p: path, h: headers, l: body.length }, extra || {})));
         for (let o = 0; o < body.length; o += CHUNK) {
           while (w.credit <= 0) {
             const more = await new Promise((r) => {

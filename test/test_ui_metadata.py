@@ -29,7 +29,9 @@ helpers = '\n'.join(extract(marker) + (';' if marker.startswith('struct ') else 
     'struct MetaOut :', 'static bool metaHead(', 'static uint32_t metaLayerAt(',
     'static int metaFanAt(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard() {',
     'static String openPrinterFile(', 'static String printOnPrinter('))
-upload = extract('static void takeUpload()')
+upload = '\n'.join(['File upInto;', 'uint8_t upLined[2048];', 'static volatile bool relayPutting = false;'] +
+                   [extract(m) for m in ('static bool uploadBegin(', 'static void uploadWrite(', 'static void uploadEnd(',
+                                         'static void uploadAbort(', 'static void takeUpload()')])
 list_route = extract('route("/printer/files",').split('[]() ', 1)[1]
 thumb_route = extract('route("/thumbnail",').split('[]() ', 1)[1]
 print_route = extract('route("/printer/print",').split('[]() ', 1)[1]

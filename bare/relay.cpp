@@ -7,6 +7,7 @@
 #include "relayroots.h"
 #include "telegram.h"
 #include "relaypour.h"
+#include "hsunpack.h"
 
 #define RELAY_FRAME_LIMIT   (24 * 1024)   // a request, body and all, as the Worker sends it
 #define RELAY_CHUNK         2044          // plus four bytes of number makes one 2048 byte buffer, one frame
@@ -277,6 +278,110 @@ void relaySendTelegramFetch(const String &chat, const String &fileId, const Stri
   sendText(out);
 }
 
+int relayPutBegin(const String &said, const String &key, const String &once, const String &name, String &why);
+void relayPutWrite(const uint8_t *data, size_t len);
+void relayPutAbort();
+int relayPutEnd(uint32_t size, bool andPrint, const String &path, String &body, String &type);
+
+static void answerWith(uint32_t id, int status, const String &type, const String &body) {
+  sendText("{\"i\":" + String(id) + ",\"s\":" + String(status) + ",\"h\":{\"Content-Type\":\"" + type + "\"}}");
+  static uint8_t frame[4 + RELAY_CHUNK];
+  memcpy(frame, &id, 4);
+  for (size_t at = 0; at < body.length(); at += RELAY_CHUNK) {
+    const size_t n = body.length() - at < RELAY_CHUNK ? body.length() - at : RELAY_CHUNK;
+    memcpy(frame + 4, body.c_str() + at, n);
+    esp_websocket_client_send_bin(ws, (const char *)frame, 4 + n, pdMS_TO_TICKS(5000));
+  }
+  sendText("{\"i\":" + String(id) + ",\"e\":1}");
+}
+
+// A file the Worker took out of the browser's or the slicer's form and packed with
+// heatshrink. It goes straight onto the card: no loopback, no form parser, and half
+// the bytes across the internet. The loop keeps running meanwhile.
+static void put(uint32_t id, JsonDocument &doc) {
+  const String path = doc["p"] | "/api/files/local";
+  const String name = doc["name"] | "upload.gcode";
+  const uint32_t packed = doc["l"] | 0;
+  const uint32_t size = doc["size"] | 0;
+  const bool andPrint = doc["print"] | false;
+  const bool z = doc["z"] | false;
+  JsonObject h = doc["h"];
+  const String said = h["authorization"] | "";
+  const String key = h["x-api-key"] | "";
+  const String once = h["x-relay-once"] | "";
+  doc.clear();
+
+  pushStatus();
+  String why;
+  const int refused = relayPutBegin(said, key, once, name, why);
+  if (refused) {
+    answer(id, refused, (why + "\n").c_str());
+    return;
+  }
+
+  static HsUnpack unpack;
+  static uint8_t out[2048];
+  size_t held = 0;
+  uint32_t wrote = 0;
+  unpack.begin();
+  auto emit = [&](uint8_t b) {
+    out[held++] = b;
+    if (held == sizeof out) {
+      relayPutWrite(out, held);
+      wrote += held;
+      held = 0;
+    }
+  };
+
+  uint32_t taken = 0, unacked = 0, waitedFrom = millis();
+  while (taken < packed && connected) {
+    Piece one;
+    if (xQueueReceive(bodies, &one, pdMS_TO_TICKS(RELAY_IDLE_MS)) != pdTRUE)
+      break;
+    const uint32_t gap = millis() - waitedFrom;
+    if (gap > worstGapMs)
+      worstGapMs = gap;
+    uint32_t whose = 0;
+    const uint8_t *data = slots[one.slot];
+    if (one.len >= 4)
+      memcpy(&whose, data, 4);
+    if (one.len >= 4 && whose == id) {
+      const size_t n = one.len - 4;
+      if (z)
+        unpack.feed(data + 4, n, emit);
+      else
+        for (size_t k = 0; k < n; k++)
+          emit(data[4 + k]);
+      taken += n;
+    }
+    xQueueSend(freeSlots, &one.slot, 0);
+    if (++unacked >= 2 || taken >= packed) {
+      const uint32_t t0 = millis();
+      sendText("{\"k\":" + String(whose) + ",\"n\":" + String(unacked) + "}");
+      const uint32_t took = millis() - t0;
+      if (took > worstAckMs)
+        worstAckMs = took;
+      acksSent++;
+      unacked = 0;
+    }
+    waitedFrom = millis();
+  }
+  if (held) {
+    relayPutWrite(out, held);
+    wrote += held;
+  }
+
+  if (taken < packed || wrote != size) {
+    relayPutAbort();
+    pourFails++;
+    answer(id, 502, "the upload broke off on the way in\n");
+    return;
+  }
+  String body, type;
+  const int status = relayPutEnd(wrote, andPrint, path, body, type);
+  answerWith(id, status, type, body);
+}
+
 static void carry(char *raw) {
   DynamicJsonDocument doc(strlen(raw) + 512);
   if (deserializeJson(doc, raw))
@@ -291,6 +396,12 @@ static void carry(char *raw) {
     TelegramBot::fromRelay(String((const char *)(doc["c"] | "")),
                            String("/__file ") + (const char *)(doc["id"] | "") + " " +
                            String((uint32_t)(doc["size"] | 0)) + " " + (const char *)(doc["name"] | "file"));
+    return;
+  }
+  if (!strcmp(kind, "put")) {
+    const uint32_t pid = doc["i"] | 0;
+    if (pid)
+      put(pid, doc);
     return;
   }
   if (!strcmp(kind, "tg")) {
