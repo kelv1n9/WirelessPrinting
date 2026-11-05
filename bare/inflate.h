@@ -5,31 +5,25 @@
 #include <stdlib.h>
 #ifdef ARDUINO
 #include <rom/miniz.h>
-#include <esp_heap_caps.h>
 #else
 #include "miniz.h"
 #endif
 
-// Unpacks raw deflate with a window of at most 4 KB, as the Worker packs a file it
-// carries down the relay: a third fewer bytes than heatshrink, and across the internet
-// the bytes are the speed. The decoder is the one in ROM. Its 11 KB of state and the
-// window are taken for one file and handed back after it. The window doubles as the
-// card buffer, so the file comes out 4 KB at a time from memory the card can DMA from.
+// Unpacks a zlib stream, as the Worker packs a file it carries down the relay: across
+// the internet the bytes are the speed. The zlib wrapper is what makes it safe: the
+// decoder refuses a file packed with a wider window than it is given, and checks the
+// Adler-32 of everything it wrote against the one the packer put at the end. The decoder is the one in ROM. Its 11 KB of
+// state are taken for one file and handed back after it. The window is the caller's,
+// a power of two no smaller than the one the file was packed with, and doubles as the
+// card buffer: the file comes out a window at a time from memory the card can DMA from.
 class Inflate {
 public:
-  static const size_t Window = 4096;
-
-  bool begin() {
+  bool begin(uint8_t *windowAt, size_t windowSize) {
+    window = windowAt;
+    Window = windowSize;
     state = (tinfl_decompressor *)malloc(sizeof *state);
-#ifdef ARDUINO
-    window = (uint8_t *)heap_caps_malloc(Window, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-#else
-    window = (uint8_t *)malloc(Window);
-#endif
-    if (!state || !window) {
-      end();
+    if (!state)
       return false;
-    }
     tinfl_init(state);
     at = 0;
     done = bad = false;
@@ -38,9 +32,7 @@ public:
 
   void end() {
     free(state);
-    free(window);
     state = nullptr;
-    window = nullptr;
   }
 
   // Last says no more is coming. Write gets the file a window at a time.
@@ -49,7 +41,8 @@ public:
     while (!done && !bad) {
       size_t in = len, room = Window - at;
       const tinfl_status s = tinfl_decompress(state, data, &in, window, window + at, &room,
-                                              last ? 0 : TINFL_FLAG_HAS_MORE_INPUT);
+                                              TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32 |
+                                                  (last ? 0 : TINFL_FLAG_HAS_MORE_INPUT));
       data += in;
       len -= in;
       at += room;
@@ -72,6 +65,6 @@ public:
 private:
   tinfl_decompressor *state = nullptr;
   uint8_t *window = nullptr;
-  size_t at = 0;
+  size_t Window = 0, at = 0;
   bool done = false, bad = false;
 };

@@ -179,7 +179,7 @@ static bool webAuthLets() {
 // a SHA-256 of the slicer's key. Never shown anywhere, sent only down the relay.
 inline String webAuthForWorker() {
   if (!webAuthSet())
-    return "{\"t\":\"auth\",\"inflate\":true,\"open\":true}";
+    return "{\"t\":\"auth\",\"inflate\":14,\"open\":true}";
   uint8_t digest[32];
   mbedtls_sha256((const unsigned char *)webAuthApiKey.c_str(), webAuthApiKey.length(), digest, 0);
   String keyHash;
@@ -187,7 +187,7 @@ inline String webAuthForWorker() {
     if (b < 16) keyHash += '0';
     keyHash += String(b, HEX);
   }
-  return String("{\"t\":\"auth\",\"inflate\":true,\"user\":\"" WEBAUTH_USER "\",\"realm\":\"" WEBAUTH_REALM "\",\"nonce\":\"") +
+  return String("{\"t\":\"auth\",\"inflate\":14,\"user\":\"" WEBAUTH_USER "\",\"realm\":\"" WEBAUTH_REALM "\",\"nonce\":\"") +
          webAuthNonce + "\",\"ha1\":\"" +
          webAuthMd5(String(WEBAUTH_USER) + ":" + WEBAUTH_REALM + ":" + webAuthPassword) +
          "\",\"key\":\"" + keyHash + "\"}";

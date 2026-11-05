@@ -29,8 +29,8 @@ helpers = '\n'.join(extract(marker) + (';' if marker.startswith('struct ') else 
     'struct MetaOut :', 'static bool metaHead(', 'static uint32_t metaLayerAt(',
     'static int metaFanAt(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard() {',
     'static String openPrinterFile(', 'static String printOnPrinter('))
-upload = '\n'.join(['File upInto;', 'uint8_t upLined[2048];', 'static volatile bool relayPutting = false;'] +
-                   [extract(m) for m in ('static bool uploadBegin(', 'static void uploadWrite(', 'static void uploadEnd(',
+upload = '\n'.join(['File upInto;', '#define UP_BLOCK 16384', 'static uint8_t upBlock[UP_BLOCK]; static size_t upHeld;', 'static volatile bool relayPutting = false;'] +
+                   [extract(m) for m in ('static bool uploadBegin(', 'static void cardWrite(', 'static void uploadWrite(', 'static void uploadEnd(',
                                          'static void uploadAbort(', 'static void takeUpload()')])
 list_route = extract('route("/printer/files",').split('[]() ', 1)[1]
 thumb_route = extract('route("/thumbnail",').split('[]() ', 1)[1]
@@ -65,7 +65,8 @@ struct TestString : String {
 };
 #define String TestString
 static inline void journal(const TestString &) {}
-static uint32_t upSince;
+static uint32_t upSince, upCardUs, upScanUs;
+static uint32_t micros() { return 0; }
 static int heardSync = -1;
 std::map<std::string,std::shared_ptr<std::vector<uint8_t>>> disk;
 constexpr int FILE_WRITE=1;
@@ -126,7 +127,6 @@ std::vector<std::string> commands,listing;
 bool wireWorks=true;
 String say(const String &, uint32_t = 0);
 #define META_DIR "/meta"
-static inline bool esp_ptr_dma_capable(const void *) { return false; }
 HELPERS
 static GcodeMetaScan metaScan;
 static MetaOut metaOut;

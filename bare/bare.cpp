@@ -8,6 +8,7 @@
 #include <esp_heap_caps.h>
 #include <soc/soc_memory_layout.h>
 #include <SD_MMC.h>
+#include "ff.h"
 
 #include "../ESP8266WirelessPrintAsync/BinaryTransfer.h"
 #include "cardbytes.h"
@@ -493,14 +494,24 @@ static int metaFanAt(const char *target, const uint32_t count, const uint32_t by
 
 // One body for both upload routes: the module's own and the one a slicer speaks.
 static File upInto;
-static uint8_t upLined[2048] __attribute__((aligned(32)));   // SD_MMC moves this over DMA
+// The card is written 16 KB at a time. Measured by itself with /bench/card (05.11.2026)
+// it takes 2200 KB/s in blocks of 16 KB and 200 to 500 KB/s in blocks of 2 to 8 KB,
+// which is what every upload used to hand it. The block is also the window a file from
+// the relay is unpacked in, so that path writes straight out of it with no copy.
+#define UP_BLOCK 16384
+static uint8_t upBlock[UP_BLOCK] __attribute__((aligned(32)));   // SD_MMC moves this over DMA
+static size_t upHeld;
+
+uint8_t *relayPutBlock() { return upBlock; }
 
 // One upload onto the module's card, whoever carries it: the web server's form parser
 // or the relay, which hands over the file itself without a form around it.
-static uint32_t upSince;
+static uint32_t upSince, upCardUs, upScanUs;
 
 static bool uploadBegin(const String &filename) {
   upSince = millis();
+  upCardUs = upScanUs = 0;
+  upHeld = 0;
   metaWanted = false;
   sendTrouble = "";
   lastUpload = filename;
@@ -531,31 +542,43 @@ static bool uploadBegin(const String &filename) {
   return true;
 }
 
-static void uploadWrite(const uint8_t *data, const size_t len) {
+static void cardWrite(const uint8_t *from, const size_t take) {
+  const uint32_t t0 = micros();
+  if (upInto.write(from, take) != take)
+    sendTrouble = "the module's card stopped taking bytes";
+  const uint32_t t1 = micros();
+  if (metaWanted)
+    metaScan.feed(from, take);
+  upCardUs += t1 - t0;
+  upScanUs += micros() - t1;
+}
+
+static void uploadWrite(const uint8_t *data, size_t len) {
   if (!upInto)
     return;
-  if (!((uintptr_t)data & 3) && esp_ptr_dma_capable(data)) {
-    if (upInto.write(data, len) != len)
-      sendTrouble = "the module's card stopped taking bytes";
-    else if (metaWanted)
-      metaScan.feed(data, len);
+  if (data == upBlock) {              // unpacked in place by the relay
+    cardWrite(data, len);
     return;
   }
-  for (size_t at = 0; at < len; at += sizeof(upLined)) {
-    const size_t take = len - at < sizeof(upLined) ? len - at : sizeof(upLined);
-    memcpy(upLined, data + at, take);
-    if (upInto.write(upLined, take) != take) {
-      sendTrouble = "the module's card stopped taking bytes";
-      break;
+  while (len) {
+    const size_t take = len < UP_BLOCK - upHeld ? len : UP_BLOCK - upHeld;
+    memcpy(upBlock + upHeld, data, take);
+    upHeld += take;
+    data += take;
+    len -= take;
+    if (upHeld == UP_BLOCK) {
+      cardWrite(upBlock, UP_BLOCK);
+      upHeld = 0;
     }
-    if (metaWanted)
-      metaScan.feed(upLined, take);
   }
 }
 
 static void uploadEnd(const uint32_t expected) {
   if (!upInto)
     return;
+  if (upHeld)
+    cardWrite(upBlock, upHeld);
+  upHeld = 0;
   upInto.flush();
   upInto.close();
   File stored = SD_MMC.open("/" + lastUpload);
@@ -568,6 +591,7 @@ static void uploadEnd(const uint32_t expected) {
     journal("took " + lastUpload + ", " + String(size) + " bytes in " + String(took / 1000) + "." +
             String(took / 100 % 10) + " s" +
             (took ? ", " + String(size / took) + " KB/s" : String("")) +
+            " (card " + String(upCardUs / 1000) + " ms, scan " + String(upScanUs / 1000) + " ms)" +
             (sendTrouble.length() ? ", " + sendTrouble : String("")));
   }
   if (metaWanted) {
@@ -1122,7 +1146,7 @@ void setup() {
     j += ",\"at\":" + String(printAt) + ",\"of\":" + String(printOf);
     j += ",\"slot\":\"" + slot() + "\"";
     j += ",\"uptime\":" + String(millis() / 1000);
-    j += ",\"heap\":" + String(ESP.getFreeHeap());
+    j += ",\"heap\":" + String(heap_caps_get_free_size(MALLOC_CAP_8BIT));
     j += ",\"block\":" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     j += ",\"card\":" + String(cardUp ? "true" : "false");
     j += ",\"guard\":\"" + bootGuardReport() + "\"";
@@ -1491,6 +1515,90 @@ void setup() {
     }
     server.send(mountCard() ? 200 : 503, "text/plain",
                 cardUp ? "mounted\n" : "the card would not come up\n");
+  });
+
+  // Where the free memory is: every free block of 2 KB and over, largest first, with
+  // its address. Found by taking them one after another and handing them all back.
+  route("/bench/heap", HTTP_GET, []() {
+    static void *got[24];
+    static uint32_t size[24];
+    int n = 0;
+    for (; n < 24; n++) {
+      size[n] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      if (size[n] < 2048 || !(got[n] = malloc(size[n])))
+        break;
+    }
+    const uint32_t rest = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    for (int i = 0; i < n; i++)
+      free(got[i]);
+    (void)rest;
+    // Only the first figure is memory a malloc can have. The second is spare room
+    // for code, which the usual "free heap" counts in and nothing here can use.
+    String out = "data memory free " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)) +
+                 ", lowest ever " + String(heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)) +
+                 "; code memory free " + String(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) - heap_caps_get_free_size(MALLOC_CAP_8BIT)) +
+                 "; tasks " + String(uxTaskGetNumberOfTasks()) + "\n";
+    for (int i = 0; i < n; i++)
+      out += String((uint32_t)got[i], HEX) + "  " + String(size[i]) + "\n";
+    server.send(200, "text/plain", out);
+  });
+
+  // The card measured by itself, so it is never blamed or cleared by guesswork:
+  // /bench/card?block=4096&kb=2048 writes that much in blocks of that size and says
+  // how long it took. The file is removed afterwards.
+  route("/bench/card", HTTP_POST, []() {
+    const size_t block = constrain(server.arg("block").toInt(), 512, UP_BLOCK);
+    const size_t kb = constrain(server.arg("kb").toInt(), 64, 8192);
+    if (!cardUp || printing || sender.running() || uploadActive) {
+      server.send(409, "text/plain", "the card is busy or not there\n");
+      return;
+    }
+    uint8_t *const buf = upBlock;      // free: no upload is running
+    File out = SD_MMC.open("/zz_bench.bin", FILE_WRITE);
+    if (!out) {
+      server.send(503, "text/plain", "the card refused the file\n");
+      return;
+    }
+    memset(buf, 0x55, block);
+    // pre=1 has the whole file given its clusters first, so that the writes that are
+    // timed touch nothing but the file's own data
+    uint32_t preMs = 0;
+    if (server.arg("pre") == "1") {
+      const uint32_t p0 = millis();
+      out.seek(kb * 1024 - 1);
+      out.write((uint8_t)0);
+      out.flush();
+      out.seek(0);
+      preMs = millis() - p0;
+    }
+    uint32_t worst = 0;
+    bool good = true;
+    String slow;
+    const uint32_t t0 = millis();
+    for (size_t done = 0; done < kb * 1024 && good; done += block) {
+      const uint32_t w0 = millis();
+      good = out.write(buf, block) == block;
+      const uint32_t one = millis() - w0;
+      worst = max(worst, one);
+      if (one > 60 && slow.length() < 200)
+        slow += " " + String(done / 1024) + "K:" + String(one);
+      loopBeat = millis();
+    }
+    const uint32_t c0 = millis();
+    out.close();
+    slow += " close:" + String(millis() - c0) + " pre:" + String(preMs);
+    {
+      FATFS *fs = nullptr;
+      DWORD freeClusters = 0;
+      if (f_getfree("0:", &freeClusters, &fs) == FR_OK && fs)
+        slow += " cluster:" + String(fs->csize * 512) + " free:" + String((uint32_t)(freeClusters / 1024 * fs->csize / 2)) + "MB of " +
+                String((uint32_t)((fs->n_fatent - 2) / 1024 * fs->csize / 2)) + "MB";
+    }
+    const uint32_t took = millis() - t0;
+    SD_MMC.remove("/zz_bench.bin");
+    server.send(good ? 200 : 500, "text/plain", "block " + String(block) + ", " + String(kb) + " KB in " +
+                String(took) + " ms, " + String(took ? kb * 1000 / took : 0) + " KB/s, worst write " +
+                String(worst) + " ms, slow:" + slow + (good ? "\n" : ", a write failed\n"));
   });
 
   route("/sound", HTTP_POST, []() {
@@ -1968,7 +2076,7 @@ static void handleTelegram() {
       out += "Bed        " + String(bedNow, 1) + " of " + String(bedSet, 0) + "\n";
       if (yandexHome.hasToken() && yandexHome.getDeviceId() != "")
         out += "Socket     " + powerOffState() + "\n";
-      out += "Module     up " + String(millis() / 1000) + " s, heap " + String(ESP.getFreeHeap());
+      out += "Module     up " + String(millis() / 1000) + " s, heap " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT));
       telegramBot.send(chat, out);
     }
 

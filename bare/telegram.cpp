@@ -44,8 +44,10 @@ extern void relaySendTelegram(const String &chat, const String &text);
 // to take the module down: the handshake fails, the failure leaves rubbish behind, the
 // next one has less to work with, and a few rounds of that end in a panic.
 #define TELEGRAM_BLOCK_FLOOR 20000
-#define TELEGRAM_HEAP_FLOOR 80000
-#define TELEGRAM_HEAP_FLOOR_PRINTING 95000
+// Data memory, the kind a malloc can have. These were 80000 and 95000 while the figure
+// they were held against still counted 63 KB of spare code memory in.
+#define TELEGRAM_HEAP_FLOOR 17000
+#define TELEGRAM_HEAP_FLOOR_PRINTING 32000
 #define TELEGRAM_COOLING 300000        // Stand off this long after a run of failures
 
 // api.telegram.org is signed under this one, which stands until 2038. Pinning it means
@@ -350,7 +352,7 @@ bool TelegramBot::call(const String path, String &body, const uint32_t timeout) 
     return false;
   }
 
-  const size_t room = ESP.getFreeHeap();
+  const size_t room = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   const size_t block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   if (block < TELEGRAM_BLOCK_FLOOR ||
       room < (isPrinting ? TELEGRAM_HEAP_FLOOR_PRINTING : TELEGRAM_HEAP_FLOOR)) {
@@ -400,7 +402,7 @@ bool TelegramBot::call(const String path, String &body, const uint32_t timeout) 
 
   if (code != 200) {
     trail("telegram: " + String(code < 0 ? HTTPClient::errorToString(code) : "HTTP " + String(code))
-          + ", heap " + String(ESP.getFreeHeap())
+          + ", heap " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT))
           + " block " + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     if (code < 0 && ++refusals >= 3) {
       refusals = 0;

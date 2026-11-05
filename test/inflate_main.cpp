@@ -6,8 +6,10 @@ int main(int argc, char **argv) {
   const size_t chunk = argc > 1 ? atoi(argv[1]) : 2040;
   std::vector<uint8_t> in; int c;
   while ((c = getchar()) != EOF) in.push_back((uint8_t)c);
+  const size_t window = argc > 2 ? atoi(argv[2]) : 16384;
+  std::vector<uint8_t> room(window);
   Inflate z;
-  if (!z.begin()) return 3;
+  if (!z.begin(room.data(), window)) return 3;
   bool good = true;
   for (size_t at = 0; at < in.size() && good; at += chunk) {
     const size_t n = in.size() - at < chunk ? in.size() - at : chunk;
