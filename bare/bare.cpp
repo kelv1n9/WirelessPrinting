@@ -100,7 +100,7 @@ static String lastUpload;
 static bool choreShouldPrint;
 static char choreTarget[PRINTER_CARD_NAME_BYTES];
 static String choreTrouble;
-static uint32_t choreSince;
+static uint32_t choreSince, choreLinked, choreSent;
 
 static bool cardUp;
 // The relay is writing a file of its own; the web server's form must not cut in
@@ -321,7 +321,7 @@ static void drain() {
 // released after every binary transfer, so M21 goes first every time.
 static bool askPrinterCard();
 
-static String say(const String line) {
+static String say(const String line, const uint32_t wait = REPLY_WAIT_MS) {
   if (sender.running())
     return "a transfer owns the wire\n";
 
@@ -331,7 +331,7 @@ static String say(const String line) {
   printerLine(line);
 
   String out;
-  const uint32_t until = millis() + REPLY_WAIT_MS;
+  const uint32_t until = millis() + wait;
   while ((int32_t)(millis() - until) < 0) {
     while (Printer.available() && out.length() < 3000) {
       const int ch = Printer.read();
@@ -893,9 +893,11 @@ static void loosePacket(const uint8_t number, const uint8_t protocol, const uint
   Printer.write(one, sizeof one);
 }
 
+// M105 comes back in about 10 ms. Waiting the full reply time on it is what made a
+// rescue stand the loop still for 50 s, and every change of rate cost 4 s.
 static bool askedBack() {
   for (int tries = 0; tries < 3; tries++) {
-    say("M105");
+    say("M105", 600);
     if (sawOk)
       return true;
     delay(100);
@@ -969,6 +971,8 @@ static bool moveLink(const uint32_t rate) {
   Printer.updateBaudRate(rate);
   linkRate = rate;
   delay(200);
+  printerLine("");               // ends whatever half line the change left in the printer
+  delay(20);
   drain();
   return askedBack();
 }
@@ -1846,9 +1850,13 @@ void setup() {
                                       "interrupt watchdog", "task watchdog", "watchdog", "deep sleep",
                                       "brownout, the supply sagged", "sdio"};
     const int reason = (int)esp_reset_reason();
-    const String crumbs = reason == 4 || reason == 6 || reason == 7
+    const bool stranger = reason == 3 && journalOwnRestart != JOURNAL_OWN && !lastRestart.length();
+    journalOwnRestart = 0;
+    const String crumbs = reason == 4 || reason == 6 || reason == 7 || stranger
       ? ", relay task at step " + String(crumbRelay) + ", loop at step " + String(crumbLoop) +
         ", socket at " + String(crumbWs) : String("");
+    if (stranger)
+      journal("the restart before this one was not asked for by this firmware");
     crumbRelay = crumbLoop = crumbWs = 0;
     journal(String("boot ") + SKETCH_VERSION + " after " + (reason >= 0 && reason <= 10 ? why[reason] : "?") +
             (lastRestart.length() ? " (" + lastRestart + ")" : String("")) + ", " + bootGuardReport() +
@@ -2125,7 +2133,9 @@ void loop() {
       const uint32_t took = millis() - choreSince, bytes = sendBytes.size();
       journal(chore == ChoreDone
         ? String(sendName) + " is on the printer's card, " + String(bytes) + " bytes in " + String(took / 1000) + "." +
-            String(took / 100 % 10) + " s, " + String(took ? bytes / took : 0) + " KB/s" + (choreShouldPrint ? ", printing" : "")
+            String(took / 100 % 10) + " s, " + String(took ? bytes / took : 0) + " KB/s" + (choreShouldPrint ? ", printing" : "") +
+            " (link " + String(choreLinked - choreSince) + " ms, wire " + String(choreSent - choreLinked) +
+            " ms, check " + String(millis() - choreSent) + " ms)"
         : "could not put " + String(sendName) + " on the printer's card: " + choreTrouble);
     }
     choreWas = chore;
@@ -2140,6 +2150,7 @@ void loop() {
     sendAsked = false;
     if (!printing && !moveLink(PRINTER_FAST))
       moveLink(PRINTER_BAUD);          // the fast rate did not answer, so the plain one carries it
+    choreLinked = millis();
     sender.start(&sendBytes, choreTarget, millis(), worthPacking(choreTarget));
   }
   if (!sender.running())
@@ -2147,8 +2158,10 @@ void loop() {
 
   if (sender.running()) {
     sender.service(millis());
-    if (!sender.running())
+    if (!sender.running()) {
       sendBytes.shut();
+      choreSent = millis();
+    }
   }
 
   // The transfer is over. Nothing is believed until the printer's own card says so.

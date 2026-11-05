@@ -21,6 +21,10 @@ static char journalHeld[JOURNAL_HELD];
 static size_t journalLen;
 static uint32_t journalLost, journalAt;
 static portMUX_TYPE journalLock = portMUX_INITIALIZER_UNLOCKED;
+// Set just before a restart this firmware chose, so the next boot can tell those from
+// a restart that came from somewhere else
+RTC_NOINIT_ATTR static volatile uint32_t journalOwnRestart;
+#define JOURNAL_OWN 0x4A4F5552
 
 inline void journal(const String &text) {
   char line[JOURNAL_LINE + 24];
@@ -50,6 +54,8 @@ inline void journal(const String &text) {
 
 // From the loop only. Now is for a restart, which would take the lines with it.
 inline void journalFlush(const bool now = false) {
+  if (now)
+    journalOwnRestart = JOURNAL_OWN;
   if (!journalLen || (!now && (int32_t)(millis() - journalAt) < 0))
     return;
   journalAt = millis() + JOURNAL_EVERY;

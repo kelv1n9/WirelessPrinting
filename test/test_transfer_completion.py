@@ -112,7 +112,7 @@ struct {
   bool remove(const String &) { ++deletions;return true; }
 } SD_MMC;
 void journal(const String &) {}
-String say(const String &text) {
+String say(const String &text, uint32_t = 0) {
   const std::string cmd=text.c_str();
   commands.push_back(cmd);
   if (cmd=="M105") {

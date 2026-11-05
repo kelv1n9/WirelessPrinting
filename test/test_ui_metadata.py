@@ -66,6 +66,7 @@ struct TestString : String {
 #define String TestString
 static inline void journal(const TestString &) {}
 static uint32_t upSince;
+static int heardSync = -1;
 std::map<std::string,std::shared_ptr<std::vector<uint8_t>>> disk;
 constexpr int FILE_WRITE=1;
 struct File {
@@ -123,7 +124,7 @@ bool sawTemps(const char *) { return false; }
 void remember(const char *,size_t) {}
 std::vector<std::string> commands,listing;
 bool wireWorks=true;
-String say(const String &);
+String say(const String &, uint32_t = 0);
 #define META_DIR "/meta"
 static inline bool esp_ptr_dma_capable(const void *) { return false; }
 HELPERS
@@ -141,7 +142,7 @@ struct { String text;void send(const String &,const String &message) { text=mess
 void telegramFiles() TELEGRAM_FILES
 void telegramPrint() TELEGRAM_PRINT
 void line(const std::string &s) { sawLine(s.c_str(),s.size()); }
-String say(const String &cmd) {
+String say(const String &cmd, uint32_t) {
   commands.push_back(cmd.s);
   if (cmd=="M105") sawOk=wireWorks;
   if (cmd=="M20 L") for (const auto &s:listing) line(s);
