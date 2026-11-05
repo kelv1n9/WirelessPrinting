@@ -33,6 +33,11 @@ static volatile bool connected;
 static String url, key, auth, state = "off";
 static uint32_t nextTry;
 
+// For the relay's own call to the status just before an upload. Made at boot, known only
+// here and to the password check, and refused from anywhere but the loopback because
+// nothing outside the module ever learns it.
+String relayInternalKey;
+
 // What the upload path has been doing, so the next problem is read and not guessed
 static volatile uint32_t piecesIn, piecesDropped, acksSent, worstAckMs, worstGapMs, pourFails;
 static volatile bool workerHasBot;      // the Worker said it holds a bot token
@@ -222,6 +227,32 @@ void relaySendTelegram(const String &chat, const String &text) {
   sendText(out);
 }
 
+// The module answers nothing else while a file goes down, so the status the page keeps
+// asking for is handed to the Worker first, to be shown from there meanwhile.
+static void pushStatus() {
+  WiFiClient local;
+  if (!local.connect(IPAddress(127, 0, 0, 1), 80, 2000))
+    return;
+  local.print("GET /api/status HTTP/1.0\r\nHost: kp3s\r\nX-Relay-Internal: " + relayInternalKey + "\r\n\r\n");
+  String reply;
+  const uint32_t started = millis();
+  while (millis() - started < 3000 && (local.connected() || local.available())) {
+    while (local.available() && reply.length() < 4096)
+      reply += (char)local.read();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  local.stop();
+  const int at = reply.indexOf("\r\n\r\n");
+  if (!reply.startsWith("HTTP/1.") || reply.indexOf(" 200 ") < 0 || at < 0)
+    return;
+  DynamicJsonDocument doc(reply.length() + 128);
+  doc["t"] = "st";
+  doc["b"] = reply.substring(at + 4);
+  String out;
+  serializeJson(doc, out);
+  sendText(out);
+}
+
 static bool pour(WiFiClient &local, const uint8_t *data, size_t n) {
   return relayPourAll(local, data, n, 30000, [] { return (uint32_t)millis(); },
                       [] { vTaskDelay(pdMS_TO_TICKS(5)); });
@@ -267,6 +298,9 @@ static void carry(char *raw) {
   const uint32_t bodyLen = doc["l"] | 0;
   if (!id)
     return;
+
+  if (bodyLen)
+    pushStatus();
 
   WiFiClient local;
   if (!local.connect(IPAddress(127, 0, 0, 1), 80, 3000)) {
@@ -422,6 +456,12 @@ static void stopSocket() {
 void relayBegin() {
   loadSettings();
   inbox = xQueueCreate(6, sizeof(char *));
+  {
+    static const char alphabet[] = "abcdefghijkmnpqrstuvwxyz23456789";
+    relayInternalKey = "";
+    for (int i = 0; i < 32; i++)
+      relayInternalKey += alphabet[esp_random() % (sizeof(alphabet) - 1)];
+  }
   yandexAnswered = xSemaphoreCreateBinary();
   bodies = xQueueCreate(RELAY_BODY_PIECES, sizeof(Piece));
   freeSlots = xQueueCreate(RELAY_BODY_PIECES, sizeof(uint8_t));

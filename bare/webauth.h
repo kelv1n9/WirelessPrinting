@@ -33,6 +33,7 @@
 WebServer server(80);
 extern volatile uint32_t loopBeat;
 extern volatile bool uploadActive;
+extern String relayInternalKey;     // made at boot by the relay, never leaves the module
 
 static String webAuthPassword, webAuthApiKey, webAuthNonce;
 
@@ -137,6 +138,9 @@ static bool webAuthAllows() {
   if (webAuthApiKey != "" && server.hasHeader("X-Api-Key")
       && server.header("X-Api-Key") == webAuthApiKey)
     return true;
+  if (relayInternalKey.length() == 32 && server.hasHeader("X-Relay-Internal") &&
+      server.header("X-Relay-Internal") == relayInternalKey)
+    return true;
   if (webAuthOnceToken != "" && (int32_t)(webAuthOnceUntil - millis()) > 0 &&
       server.hasHeader("X-Relay-Once") && server.header("X-Relay-Once") == webAuthOnceToken)
     return true;
@@ -213,8 +217,8 @@ inline void webAuthBegin() {
   }
   keep.end();
 
-  static const char *wanted[] = {"X-Api-Key", "X-Relay-Once"};
-  server.collectHeaders(wanted, 2);
+  static const char *wanted[] = {"X-Api-Key", "X-Relay-Once", "X-Relay-Internal"};
+  server.collectHeaders(wanted, 3);
 }
 
 // Every route goes on through here, so there is nothing to remember per route. The

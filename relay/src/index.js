@@ -26,6 +26,7 @@ const LOST = Symbol("lost");
 // What the page asks for is kept, so the page still works while the module is busy
 // taking a file. The console is not: handed out again it would repeat its lines.
 const CACHE_ITEMS = 64;
+const SESSION_DAYS = 30;
 const CACHE_ITEM_LIMIT = 64 * 1024;
 const cacheKey = (url) => url.pathname + url.search;
 const wentAway = () => new Response("The printer module went away.\n", { status: 503 });
@@ -189,6 +190,11 @@ export class Relay {
     // While a file is going down the module's web server is busy with it and answers
     // nothing else, so the page would see every poll time out and the module look dead.
     // The status it last gave is handed out instead, and the rest is told to wait.
+    // The cache answers without asking the module, so it answers only a browser that
+    // has already got past the module's password and been given a session for it.
+    if (!hasBody && this.uploading > 0 && !(await this.knownSession(request)))
+      return new Response("The module is busy taking a file. Try again when it is done.\n",
+                          { status: 503, headers: { "retry-after": "5" } });
     if (!hasBody && this.uploading > 0) {
       const key = cacheKey(url);
       let cached = this.cache.get(key);
@@ -214,7 +220,10 @@ export class Relay {
         while (this.cache.size > CACHE_ITEMS) this.cache.delete(this.cache.keys().next().value);
         if (url.pathname === "/") this.state.storage.put("page", last).catch(() => {});
       }
-      return new Response(last.body, { status: last.status, headers: new Headers(last.headers || {}) });
+      const answer = new Headers(last.headers || {});
+      if (last.status === 200 && (headers.authorization || headers["x-api-key"]))
+        await this.giveSession(request, answer);
+      return new Response(last.body, { status: last.status, headers: answer });
     }
 
     if (!hasBody) {
@@ -320,6 +329,29 @@ export class Relay {
     return say(`Could not save ${m.name} \u2014 ${said || "it did not get through"}`);
   }
 
+  async loadSessions() {
+    if (!this.sessions) this.sessions = (await this.state.storage.get("sessions")) || {};
+    return this.sessions;
+  }
+
+  async knownSession(request) {
+    const m = /(?:^|;\s*)kp3s=([0-9a-f-]{36})/.exec(request.headers.get("cookie") || "");
+    if (!m) return false;
+    const sessions = await this.loadSessions();
+    return !!sessions[m[1]] && sessions[m[1]] > Date.now();
+  }
+
+  async giveSession(request, headers) {
+    if (await this.knownSession(request)) return;
+    const sessions = await this.loadSessions();
+    const now = Date.now();
+    for (const [k, until] of Object.entries(sessions)) if (until < now) delete sessions[k];
+    const id = crypto.randomUUID();
+    sessions[id] = now + SESSION_DAYS * 86400000;
+    await this.state.storage.put("sessions", sessions);
+    headers.append("set-cookie", `kp3s=${id}; Path=/; Max-Age=${SESSION_DAYS * 86400}; Secure; HttpOnly; SameSite=Strict`);
+  }
+
   async waitForDevice(limitMs) {
     const until = Date.now() + limitMs;
     for (;;) {
@@ -416,6 +448,12 @@ export class Relay {
     if (typeof message === "string") {
       let m;
       try { m = JSON.parse(message); } catch { return; }
+      if (m.t === "st" && typeof m.b === "string") {
+        // The module's own status, sent just before it starts taking a file
+        this.cache.set("/api/status", { status: 200, headers: { "content-type": "application/json" },
+                                        body: new TextEncoder().encode(m.b) });
+        return;
+      }
       if (m.t === "yx") {
         // A request the module would make to Yandex itself if it had the memory for a
         // second encrypted connection. Its own token comes with it and is not kept or
