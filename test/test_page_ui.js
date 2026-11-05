@@ -70,11 +70,9 @@ const status={system:{machine:'KP3S',rssi:-60,version:'test'},printing:true,conn
     const rows=elements.ptab.rows;
     await run('printerCard()');
     assert.equal(elements.ptab.rows,rows);
-    assert(elements.pnote.textContent.length);
   }
   response={ok:true,text:async()=> 'cached: last complete printer listing; refresh when idle\nBOATWI~1.GCO  123  Boat with spaces.gcode\n'};
   await run('printerCard()');
-  assert(elements.pnote.textContent.startsWith('cached:'));
   assert(elements.ptab.querySelectorAll('button').every(b=>b.disabled));
   status.printing=false;run('render(status)');
   assert(elements.ptab.querySelectorAll('button').every(b=>!b.disabled));
@@ -83,7 +81,7 @@ const status={system:{machine:'KP3S',rssi:-60,version:'test'},printing:true,conn
   const emptyRows=elements.ptab.rows;
   response=new Error('offline');await run('printerCard()');assert.equal(elements.ptab.rows,emptyRows);
   run('havePrinterList=false');await run('printerCard()');
-  assert.equal(elements.ptab.rows.length,0);assert.equal(elements.pnote.textContent,'offline');
+  assert(elements.ptab.innerHTML.includes('not readable'));
   status.job={file:'—',completion:0,layer:0,layers:0,z:0,elapsed:0,remaining:-1,fan:-1};
   run('render(status)');assert.equal(elements.jlayer.textContent,'—');assert.equal(elements.jthumb.src,undefined);
   assert(!requests.some(([url])=>url==='/api/files' || url.startsWith('/select')));

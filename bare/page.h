@@ -190,7 +190,6 @@ progress{width:190px;height:7px;accent-color:var(--acc)}
   <span class="badge busy hide" id="xfer"></span>
   <span class="badge warn hide" id="soon"></span>
   <div class="meta">
-    <span id="build"></span>
     <span><a href="/yandex">socket</a></span>
     <span><a href="/auth">password</a></span>
     <span><a href="/telegram">bot</a></span>
@@ -243,7 +242,6 @@ upload and reflash. <a href="/auth">Set one</a>.</p>
 
   <section id="filesec">
     <h2>On the printer</h2>
-    <p class="dim" id="pnote" role="status"></p>
     <table><tbody id="ptab"><tr><td class="dim">asking the printer</td></tr></tbody></table>
     <div class="foot">
       <div class="row">
@@ -294,9 +292,6 @@ upload and reflash. <a href="/auth">Set one</a>.</p>
       <input type="file" id="fwfile" accept=".bin" hidden>
       <progress id="fwprog" class="hide" max="100" value="0"></progress>
     </div>
-    <p class="dim" style="margin:10px 0 0;font-size:12px">The module keeps the image it
-    is running and goes back to it if the new one does not settle, so a bad flash is not
-    the end. The printer keeps printing throughout.</p>
   </section>
   </div>
 
@@ -317,9 +312,12 @@ const kib = b => b >= 1073741824 ? (b/1073741824).toFixed(1)+' GB'
 
 function toast(t){ const e = $('toast'); e.textContent = t; e.classList.add('on'); setTimeout(()=>e.classList.remove('on'), 2600); }
 
+// A sentence the module wrote is shown as it is; a page, a code or nothing becomes the fallback.
+const said = (t, fallback) => (t = (t || '').trim()) && t[0] !== '<' && t.length < 140 && / /.test(t) ? t : fallback;
+
 async function call(url, opt){
   const r = await fetch(url, opt);
-  if (!r.ok) { toast(await r.text() || ('HTTP ' + r.status)); throw 0; }
+  if (!r.ok) { toast(said(await r.text(), 'the module said no')); throw 0; }
   return r;
 }
 
@@ -336,7 +334,7 @@ function render(d){
   if (relayUploading) {
     const u = d.relayUpload, pct = u.total ? Math.round(u.sent * 100 / u.total) : 0;
     $('xfer').classList.remove('hide');
-    $('xfer').textContent = 'upload ' + pct + '%';
+    $('xfer').textContent = 'Uploading ' + pct + '%';
     $('xline').textContent = '';
   }
   $('unlocked').classList.toggle('hide', d.locked !== false);
@@ -350,7 +348,7 @@ function render(d){
   bars.setAttribute('class', strength >= 2 ? '' : strength === 1 ? 'weak' : 'gone');   // an svg className is not a string
   bars.querySelectorAll('rect').forEach((r, i) => r.classList.toggle('on', i < Math.max(strength, 1)));
   bars.querySelector('title').textContent = rssi + ' dBm';
-  $('build').textContent = d.system.version;
+  $('machine').title = 'module firmware ' + d.system.version;
 
   const j = d.job;
   $('jobtitle').textContent = d.printing ? 'Printing' : 'Selected';
@@ -423,9 +421,8 @@ async function pollTransfer(){
   const pct = +w[2] ? Math.round(+w[0] * 100 / +w[2]) : 0;
   const chore = (of('as').split(', chore ')[1] || '');
   $('xfer').classList.toggle('hide', !busy);
-  if (busy) $('xfer').textContent = phase + ' ' + pct + '%';
-  $('xline').textContent = busy ? 'to the printer card, ' + pct + '% of ' + w[2] + ' bytes'
-    : (chore.indexOf('failed') === 0 ? chore : '');
+  if (busy) $('xfer').textContent = 'To printer ' + pct + '%';
+  $('xline').textContent = !busy && chore.indexOf('failed') === 0 ? chore : '';
 }
 
 function btn(text, cls, fn){ const b = document.createElement('button'); b.textContent = text; if (cls) b.className = cls; b.onclick = fn; return b; }
@@ -462,7 +459,7 @@ async function printerCard(){
     const text = await r.text();
     if (!r.ok) throw new Error(text.trim() || ('HTTP ' + r.status));
     const lines = text.split('\n').filter(l => l.trim());
-    const note = lines.find(l => l.startsWith('cached:')) || '';
+    const note = lines.find(l => l.startsWith('cached:'));
     const entries = [];
     for (const line of lines) {
       if (line === note || line === "nothing on the printer's card") continue;
@@ -474,7 +471,6 @@ async function printerCard(){
       throw new Error('Incomplete printer listing; previous list kept');
     const tb = $('ptab');
     tb.textContent = '';
-    $('pnote').textContent = note;
     havePrinterList = true;
     for (const m of entries) {
       const tr = tb.insertRow();
@@ -505,8 +501,7 @@ async function printerCard(){
       cell.textContent = 'nothing on the printer card';
     }
   } catch (e) {
-    $('pnote').textContent = e.message || 'Printer list unavailable; previous list kept';
-    if (!havePrinterList) $('ptab').textContent = '';
+    if (!havePrinterList) $('ptab').innerHTML = '<tr><td class="dim">the printer card is not readable right now</td></tr>';
   } finally { asking = false; }
 }
 $('bpcard').onclick = () => printerCard().catch(()=>{});
@@ -552,7 +547,7 @@ function flash(f){
   x.upload.onprogress = e => { if (e.lengthComputable) p.value = e.loaded * 100 / e.total; };
   x.onloadend = () => {
     p.classList.add('hide');
-    toast(x.status === 200 ? 'flashed, the module is rebooting' : ('flash failed: ' + (x.responseText || x.status)));
+    toast(x.status === 200 ? 'flashed, the module is rebooting' : said(x.responseText, 'flash failed'));
   };
   x.open('POST', '/update');
   x.send(form);
@@ -567,7 +562,7 @@ function upload(f){
   x.upload.onprogress = e => { if (e.lengthComputable) p.value = e.loaded * 100 / e.total; };
   x.onloadend = () => {
     p.classList.add('hide');
-    toast(x.status === 201 ? 'uploaded, going to the printer card' : ('upload failed: ' + (x.responseText || x.status)));
+    toast(x.status === 201 ? 'uploaded, going to the printer card' : said(x.responseText, 'upload failed'));
     pollTransfer().catch(()=>{});
   };
   if (uploadThenPrint)
@@ -600,7 +595,7 @@ async function pollConsole(){
 
 async function send(cmd){
   const r = await fetch('/api/command', {method:'POST', body: new URLSearchParams({cmd})});
-  if (!r.ok) toast('rejected: ' + r.status);
+  if (!r.ok) toast('the printer did not take that command');
   return r.ok;
 }
 
