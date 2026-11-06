@@ -10,6 +10,7 @@
 #include <soc/soc_memory_layout.h>
 #include <SD_MMC.h>
 #include "ff.h"
+static_assert(FF_MAX_SS == 512, "lib/fatfs must be found before the core's own fatfs headers");
 
 #include "../ESP8266WirelessPrintAsync/BinaryTransfer.h"
 #include "cardbytes.h"

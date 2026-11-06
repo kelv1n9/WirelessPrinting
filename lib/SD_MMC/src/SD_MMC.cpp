@@ -126,7 +126,7 @@ uint64_t SDMMCFS::totalBytes()
 	if(f_getfree("0:",&fre_clust,&fsinfo)!= 0) return 0;
     uint64_t size = ((uint64_t)(fsinfo->csize))*(fsinfo->n_fatent - 2)
 #if _MAX_SS != 512
-        *(fsinfo->ssize);
+        *(FF_MAX_SS);
 #else
         *512;
 #endif
@@ -140,7 +140,7 @@ uint64_t SDMMCFS::usedBytes()
 	if(f_getfree("0:",&fre_clust,&fsinfo)!= 0) return 0;
 	uint64_t size = ((uint64_t)(fsinfo->csize))*((fsinfo->n_fatent - 2) - (fsinfo->free_clst))
 #if _MAX_SS != 512
-        *(fsinfo->ssize);
+        *(FF_MAX_SS);
 #else
         *512;
 #endif

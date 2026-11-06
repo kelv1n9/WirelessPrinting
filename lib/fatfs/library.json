@@ -1,0 +1,5 @@
+{
+  "name": "fatfs",
+  "version": "3.3.5",
+  "build": { "libArchive": false }
+}
