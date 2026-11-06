@@ -536,9 +536,12 @@ export class Relay {
     return turn;
   }
 
-  tgSay(chat, text) {
-    return this.telegram("sendMessage", { chat_id: chat, text: tgHtml(text), parse_mode: "HTML",
-                                          link_preview_options: { is_disabled: true } });
+  async tgSay(chat, text) {
+    const said = await this.telegram("sendMessage", { chat_id: chat, text: tgHtml(text), parse_mode: "HTML",
+                                                      link_preview_options: { is_disabled: true } });
+    if (said.ok) this.note("telegram took a message");
+    else this.incident(`telegram refused a message: ${said.description || "no answer"}`);
+    return said;
   }
 
   async socketState() {
