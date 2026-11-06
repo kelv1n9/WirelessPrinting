@@ -2464,7 +2464,7 @@ static void guardian(void *) {
     const uint32_t now = millis();
     if (otaActive.load())
       continue;
-    if (now - loopBeat > GUARD_LOOP_MS)
+    if ((int32_t)(now - loopBeat) > GUARD_LOOP_MS)
       guardianRestart(1);
 
     const bool relayWanted = relayConfigured() && webAuthSet() && WiFi.status() == WL_CONNECTED;

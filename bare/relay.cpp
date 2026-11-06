@@ -817,7 +817,7 @@ static void beat() {
   if (!connected || millis() - beatAt < RELAY_BEAT_MS)
     return;
   beatAt = millis();
-  const uint32_t silent = millis() - heardAt;
+  const int32_t silent = (int32_t)(millis() - heardAt);
   if (silent < RELAY_SILENT_MS) {
     sendText("p");
     return;
