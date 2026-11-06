@@ -26,7 +26,7 @@
 // commas, and although a quoted value may hold one, Safari splits on them anyway and
 // falls back to basic. The hint about the user name goes in the body instead.
 #define WEBAUTH_REALM    "KP3S"
-#define WEBAUTH_USER     "print"
+#define WEBAUTH_USER     "KP3S"
 #define WEBAUTH_KEY_LEN  32
 
 // The one server, declared here because the guard below is what every route
@@ -168,7 +168,7 @@ static bool webAuthLets() {
     "\", opaque=\"0\"");
   server.send(401, "text/html",
     F("<!doctype html><meta charset=utf-8><title>KP3S</title>"
-      "<p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. "
+      "<p style='font:15px system-ui;padding:1rem'>The user name is <b>" WEBAUTH_USER "</b>. "
       "Reload the page to try again.</p>"));
   return false;
 }

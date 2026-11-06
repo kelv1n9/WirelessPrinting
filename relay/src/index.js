@@ -363,7 +363,7 @@ export class Relay {
       const verdict = await this.checkHere(request, url);
       this.note(`busy, ${url.pathname} without a session: ${verdict}`);
       if (verdict === "challenge") {
-        const r = new Response("<!doctype html><meta charset=utf-8><title>KP3S</title><p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. Reload the page to try again.</p>",
+        const r = new Response(`<!doctype html><meta charset=utf-8><title>KP3S</title><p style='font:15px system-ui;padding:1rem'>The user name is <b>${this.auth.user}</b>. Reload the page to try again.</p>`,
                                { status: 401, headers: { "content-type": "text/html", "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
         return r;
       }
@@ -423,7 +423,7 @@ export class Relay {
     if (!hasBody && url.pathname === "/download") {
       const verdict = await this.checkHere(request, url);
       if (verdict === "challenge")
-        return new Response("The user name is print.\n", { status: 401, headers: { "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
+        return new Response(`The user name is ${this.auth.user}.\n`, { status: 401, headers: { "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
       // In the same line as the uploads: the module does one of them at a time, and an
       // upload sent into a running download waited for acknowledgements that could not come
       let free;
@@ -485,19 +485,23 @@ export class Relay {
       const last = await this.deliver(method, path, headers, body, { ...extra, d: true });
       if (!last || last.status !== 507) return last;
     }
-    return this.deliver(method, path, form.headers, form.body);
+    return this.deliver(method, path, form.headers, form.body, null, extra.print ? 1 : UPLOAD_ATTEMPTS);
   }
 
   // A body, tried up to three times, one body at a time. Resolves with the module's
   // whole answer, or null when it never got through.
-  deliver(method, path, headers, body, extra = null) {
+  deliver(method, path, headers, body, extra = null, tries = UPLOAD_ATTEMPTS) {
     const turn = this.bodies.then(async () => {
       this.uploading++;
       try {
       let last = null;
-      for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
+      for (let attempt = 1; attempt <= tries; attempt++) {
         const device = await this.waitForDevice(RECONNECT_WAIT_MS);
         if (!device) break;
+        if (attempt > 1 && extra && extra.print) {
+          extra = { ...extra, print: false };
+          this.incident(`${extra.name} is sent again without the print: the module dropped away on the first try`);
+        }
         last = await this.sendBody(device, method, path, headers, body, extra);
         // A firmware image that went down whole and then lost the module is a flash that
         // worked: the module reboots before its answer is out. Sending it again only
@@ -508,7 +512,7 @@ export class Relay {
                    body: new TextEncoder().encode("Sent whole; the module dropped away to reboot, which is what a good flash does. Check /api/status in a minute.\n") };
         }
         if (!last.lost && last.status !== 502 && last.status !== 504) break;
-        this.incident(`attempt ${attempt} of ${path} did not get through (${last.lost ? "lost" : last.status}), ${attempt < UPLOAD_ATTEMPTS ? "trying again" : "giving up"}`);
+        this.incident(`attempt ${attempt} of ${path} did not get through (${last.lost ? "lost" : last.status}), ${attempt < tries ? "trying again" : "giving up"}`);
       }
       return last && !last.lost ? last : null;
       } finally {
@@ -622,7 +626,7 @@ export class Relay {
   }
 
   challenge() {
-    return new Response("<!doctype html><meta charset=utf-8><title>KP3S</title><p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. Reload the page to try again.</p>",
+    return new Response(`<!doctype html><meta charset=utf-8><title>KP3S</title><p style='font:15px system-ui;padding:1rem'>The user name is <b>${this.auth.user}</b>. Reload the page to try again.</p>`,
                         { status: 401, headers: { "content-type": "text/html", "cache-control": "no-store",
                                                   "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
   }
