@@ -23,6 +23,7 @@ const UPLOAD_ATTEMPTS = 3;
 const RECONNECT_WAIT_MS = 90000;
 const SILENT_GIVE_UP_MS = 10000;
 const ANSWER_TIMEOUT_MS = 30000;
+const SILENT_MS = 35000;              // three of the module's beats missed
 const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match", "x-relay-once"];
 const LOST = Symbol("lost");
 // What the page asks for is kept, so the page still works while the module is busy
@@ -90,16 +91,17 @@ function field(header, name) {
 
 // What a person sees when the module cannot answer: the page's own colours, and it
 // tries again by itself, instead of a bare line of text.
-function personPage(title, line, retrySeconds) {
+function personPage(title, line, retrySeconds, more = "") {
   const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <meta http-equiv=refresh content="${retrySeconds}"><title>KP3S</title>
 <style>:root{--bg:#0d1117;--card:#161b22;--tx:#e8ebf0;--dim:#8a93a2;--acc:#5b9cff}
 @media(prefers-color-scheme:light){:root{--bg:#f4f6f9;--card:#fff;--tx:#14181d;--dim:#5d6672;--acc:#2f6fd0}}
 body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--tx);font:16px/1.5 system-ui,sans-serif}
 .c{background:var(--card);padding:28px 32px;border-radius:14px;max-width:26rem;margin:16px;box-shadow:0 4px 24px #0003}
-h1{font-size:20px;margin:0 0 8px}p{margin:0;color:var(--dim)}.s{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--acc);margin-right:8px;animation:p 1.2s infinite}
+h1{font-size:20px;margin:0 0 8px}p{margin:0;color:var(--dim)}form{margin:18px 0 0}
+button{font:inherit;padding:10px 18px;border:0;border-radius:8px;background:var(--acc);color:#fff;cursor:pointer}.s{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--acc);margin-right:8px;animation:p 1.2s infinite}
 @keyframes p{50%{opacity:.3}}</style>
-<div class=c><h1><span class=s></span>${title}</h1><p>${line}</p></div>`;
+<div class=c><h1><span class=s></span>${title}</h1><p>${line}</p>${more}</div>`;
   return new Response(html, { status: 503, headers: { "content-type": "text/html; charset=utf-8", "retry-after": String(retrySeconds), "cache-control": "no-store" } });
 }
 
@@ -176,6 +178,8 @@ export class Relay {
     this.trail = [];
     this.cache = new Map();
     this.uploading = 0;
+    // The module's beat, answered without waking this object
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("p", "q"));
   }
 
   note(text) {
@@ -196,8 +200,16 @@ export class Relay {
     }).catch(() => {});
   }
 
+  // A module whose power was cut says no goodbye, and its socket stays open here for
+  // minutes. So a socket counts only while the module's beat is heard on it; one that
+  // has never sent a beat is an older firmware and is taken on trust, as before.
   device() {
-    const open = this.state.getWebSockets("device").filter((ws) => ws.readyState === 1);
+    const now = Date.now();
+    const open = this.state.getWebSockets("device").filter((ws) => {
+      if (ws.readyState !== 1) return false;
+      const beat = this.state.getWebSocketAutoResponseTimestamp(ws);
+      return !beat || now - Math.max(beat.getTime(), this.heard || 0) < SILENT_MS;
+    });
     return open.length ? open[open.length - 1] : null;
   }
 
@@ -217,6 +229,17 @@ export class Relay {
       pair[1].send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN }));
       this.note("device connected");
       return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+
+    // The module's socket closed from this end, the way Cloudflare closes it now and
+    // then, so that how fast the module comes back can be measured and not waited for
+    if (url.pathname === "/.kick") {
+      const given = (request.headers.get("Authorization") || "").replace(/^Bearer /, "");
+      if (!sameSecret(given, this.env.DEVICE_KEY))
+        return new Response("no\n", { status: 403 });
+      for (const old of this.state.getWebSockets("device")) old.close(1012, "kicked");
+      this.note("device socket kicked");
+      return new Response("kicked\n");
     }
 
     if (url.pathname === "/.trace") {
@@ -289,9 +312,11 @@ export class Relay {
     }
 
     const ws = this.device();
+    if (url.pathname === "/.power-on" && request.method === "POST")
+      return this.powerOn(request, url, !!ws);
     if (!ws)
       return wantsPage(request)
-        ? personPage("Printer module is starting up", "It is not connected to Cloudflare at the moment, usually because it is restarting or the printer is switched off. This page checks again every few seconds.", 5)
+        ? this.awayPage(request, url)
         : new Response("The printer module is not connected right now.\n",
                        { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
 
@@ -572,6 +597,80 @@ export class Relay {
     return "challenge";
   }
 
+  // The printer is off or starting, and the module with it. Someone who has signed in
+  // is told which, and can switch it on: the module cannot be asked, so the password is
+  // checked here, against what the module last said about it. Nobody else gets more
+  // than the plain page. Only "on" is ever sent, and only to the printer's own socket:
+  // switching off stays with the module, which knows whether a print is running.
+  canPower() {
+    return !!(this.env.YANDEX_TOKEN && this.auth && !this.auth.open && this.auth.socket);
+  }
+
+  async signedIn(request, url) {
+    if (await this.knownSession(request)) return "ok";
+    return this.checkHere(request, url);
+  }
+
+  challenge() {
+    return new Response("<!doctype html><meta charset=utf-8><title>KP3S</title><p style='font:15px system-ui;padding:1rem'>The user name is <b>print</b>. Reload the page to try again.</p>",
+                        { status: 401, headers: { "content-type": "text/html", "cache-control": "no-store",
+                                                  "www-authenticate": `Digest realm="${this.auth.realm}", qop="auth", nonce="${this.auth.nonce}", opaque="0"` } });
+  }
+
+  async yandex(path, body = null) {
+    const r = await fetch("https://api.iot.yandex.net" + path, {
+      method: body ? "POST" : "GET",
+      headers: body ? { authorization: "Bearer " + this.env.YANDEX_TOKEN, "content-type": "application/json" }
+                    : { authorization: "Bearer " + this.env.YANDEX_TOKEN },
+      body: body || undefined,
+      signal: AbortSignal.timeout(8000),
+    }).catch(() => null);
+    if (!r || !r.ok) return null;
+    return r.json().catch(() => null);
+  }
+
+  async awayPage(request, url) {
+    const plain = () => personPage("Printer module is starting up", "It is not connected to Cloudflare at the moment, usually because it is restarting or the printer is switched off. This page checks again every few seconds.", 5);
+    if (!this.auth) this.auth = (await this.state.storage.get("auth")) || null;
+    if (!this.canPower()) return plain();
+    const verdict = await this.signedIn(request, url);
+    if (verdict === "challenge") return this.challenge();
+    if (verdict !== "ok") return plain();
+    const d = await this.yandex("/v1.0/devices/" + this.auth.socket);
+    const onOff = d && (d.capabilities || []).find((c) => c.type === "devices.capabilities.on_off");
+    let page;
+    if (!d || d.state !== "online" || !onOff || !onOff.state)
+      page = personPage("Printer module is not connected", "Its socket did not answer either, so it cannot be switched on from here right now. This page checks again every few seconds.", 10);
+    else if (onOff.state.value)
+      page = personPage("Printer is on, the module is starting", "The socket is on. The module connects about a quarter of a minute after power comes. This page checks again every few seconds.", 4);
+    else
+      page = personPage("Printer is switched off", "Its socket is off, so the module has no power.", 20,
+                        "<form method=post action=/.power-on><button>Switch the printer on</button></form>");
+    const h = new Headers(page.headers);
+    await this.giveSession(request, h);
+    return new Response(page.body, { status: page.status, headers: h });
+  }
+
+  async powerOn(request, url, connected) {
+    const back = () => new Response(null, { status: 303, headers: { location: "/", "cache-control": "no-store" } });
+    if (connected) return back();
+    if (!this.auth) this.auth = (await this.state.storage.get("auth")) || null;
+    if (!this.canPower()) return new Response("Not set up.\n", { status: 404 });
+    // A form on another site must not be able to press this for a signed-in browser
+    const origin = request.headers.get("origin");
+    if (origin && origin !== url.origin) return new Response("no\n", { status: 403 });
+    const verdict = await this.signedIn(request, url);
+    if (verdict === "challenge") return this.challenge();
+    if (verdict !== "ok") return new Response("no\n", { status: 403 });
+    const last = (await this.state.storage.get("poweredAt")) || 0;
+    if (Date.now() - last < 20000) return back();
+    await this.state.storage.put("poweredAt", Date.now());
+    const said = await this.yandex("/v1.0/devices/actions", JSON.stringify({ devices: [{ id: this.auth.socket,
+      actions: [{ type: "devices.capabilities.on_off", state: { instance: "on", value: true } }] }] }));
+    this.incident(`power on asked from the web page: ${said ? said.status : "yandex did not answer"}`);
+    return back();
+  }
+
   async loadSessions() {
     if (!this.sessions) this.sessions = (await this.state.storage.get("sessions")) || {};
     return this.sessions;
@@ -711,6 +810,7 @@ export class Relay {
   }
 
   async webSocketMessage(ws, message) {
+    this.heard = Date.now();
     // Asked once each time the object wakes: what is kept in storage may be from an
     // older firmware that could not unpack deflate, or before a password change.
     if (!this.askedAuth) {
@@ -723,6 +823,8 @@ export class Relay {
       try { m = JSON.parse(message); } catch { return; }
       if (m.t === "auth") {
         this.auth = m.open ? { open: true } : { user: m.user, realm: m.realm, nonce: m.nonce, ha1: m.ha1, key: m.key };
+        // Which Yandex socket the printer is on, for the button that switches it on
+        this.auth.socket = typeof m.socket === "string" && /^[\w-]{8,64}$/.test(m.socket) ? m.socket : "";
         // The window the module unpacks zlib in, in bits. A firmware that only said yes
         // took raw deflate, which is no longer sent: it gets the form.
         this.auth.inflate = Number.isInteger(m.inflate) && m.inflate >= 9 && m.inflate <= 15 ? m.inflate : 0;

@@ -720,7 +720,16 @@ static void takeUpload() {
 // Says no rather than half doing it, with the reason left in choreTrouble.
 bool somethingIsStreaming() { return otaActive.load() || sender.running(); }
 
-String relayAuthHello() { return webAuthForWorker(); }
+// Which socket the printer is on goes with it. The Worker can then switch the printer
+// on for someone who has signed in while this module is still without power. The
+// token for that is not sent: the owner gives it to the Worker himself.
+String relayAuthHello() {
+  String hello = webAuthForWorker();
+  const String socket = YandexHome::getDeviceId();
+  if (socket.length() && socket.indexOf('"') < 0 && socket.indexOf('\\') < 0)
+    hello = hello.substring(0, hello.length() - 1) + ",\"socket\":\"" + socket + "\"}";
+  return hello;
+}
 
 // The printer's buzzer, for the two things worth hearing from across the room: a file
 // that reached the printer's card whole, and the module coming back on new firmware.
@@ -1715,6 +1724,11 @@ void setup() {
   route("/bench/heap", HTTP_GET, []() {
     static void *got[24];
     static uint32_t size[24];
+    // Taking every block is what this does, so after its first run the lowest figure
+    // the heap keeps is this bench's own doing. The one from before that run is kept.
+    static uint32_t lowest;
+    if (!lowest)
+      lowest = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
     int n = 0;
     for (; n < 24; n++) {
       size[n] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -1728,7 +1742,7 @@ void setup() {
     // Only the first figure is memory a malloc can have. The second is spare room
     // for code, which the usual "free heap" counts in and nothing here can use.
     String out = "data memory free " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)) +
-                 ", lowest ever " + String(heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)) +
+                 ", lowest before this bench first ran " + String(lowest) +
                  "; code memory free " + String(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) - heap_caps_get_free_size(MALLOC_CAP_8BIT)) +
                  "; tasks " + String(uxTaskGetNumberOfTasks()) + "\n";
     for (int i = 0; i < n; i++)

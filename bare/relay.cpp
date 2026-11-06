@@ -27,12 +27,27 @@ extern volatile uint32_t crumbRelay, crumbWs;   // RTC, survives a panic: which 
 #define RELAY_BLOCK_FLOOR   (20 * 1024)
 #define RELAY_HEAP_FLOOR    (80 * 1024)
 #define RELAY_RETRY_MS      15000
+#define RELAY_BEAT_MS       10000
+#define RELAY_SILENT_MS     35000
 #define RELAY_BODY_PIECES   4             // chunks of an upload waiting to be written or poured
 #define RELAY_WINDOW        16384         // what a file is unpacked in: the card's block, 14 bits
 #define RELAY_PUT_CREDIT    24            // pieces the Worker may have on the way to a file for the card
 #define RELAY_SLOT_WAIT_MS  15000         // the socket waits this long for a slot: the card has been seen to stop for 4.5 s
 
 static esp_websocket_client_handle_t ws;
+static volatile uintptr_t wsBorn;      // which client the events are believed from: the newest
+static char redialMark[1];             // put in the inbox when a live link is lost
+static portMUX_TYPE wsLock = portMUX_INITIALIZER_UNLOCKED;
+
+// The socket is taken out of use by whoever asks first, and only they shut it down:
+// the loop does when the network goes, the relay's own task when the link is lost.
+static esp_websocket_client_handle_t takeSocket() {
+  portENTER_CRITICAL(&wsLock);
+  const esp_websocket_client_handle_t had = ws;
+  ws = nullptr;
+  portEXIT_CRITICAL(&wsLock);
+  return had;
+}
 static QueueHandle_t inbox;
 // Upload pieces live in a few fixed slots that go round, rather than a fresh allocation
 // for each: a thousand 2 KB mallocs in a row left the largest free block at 7 KB.
@@ -133,9 +148,11 @@ static void noDelay() {
 static volatile uint32_t stopId;      // the download the Worker has called off
 static volatile uint32_t heardAt;     // when anything last came from the Worker, a pong included
 
-static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
+static void onEvent(void *born, esp_event_base_t, int32_t id, void *data) {
+  if ((uintptr_t)born != wsBorn)
+    return;                                  // the last words of a client already replaced
   esp_websocket_event_data_t *e = (esp_websocket_event_data_t *)data;
-  if (id == WEBSOCKET_EVENT_DATA || id == WEBSOCKET_EVENT_CONNECTED)
+  if ((id == WEBSOCKET_EVENT_DATA && e->op_code != 0x8) || id == WEBSOCKET_EVENT_CONNECTED)
     heardAt = millis();
   if (id == WEBSOCKET_EVENT_CONNECTED) {
     noDelay();
@@ -145,9 +162,22 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
     logEvent("remote access connected");
     return;
   }
-  if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_ERROR) {
-    if (connected)
-      logEvent("remote access lost, last heard " + String((millis() - heardAt) / 1000) + " s ago");
+  // A close said in words counts as a close. The library reads the frame and goes on
+  // as if nothing had been said, and the link then looked alive for the seventy
+  // seconds its ping takes to give up (found 06.11.2026 by closing it from the Worker).
+  const bool closed = id == WEBSOCKET_EVENT_DATA && e->op_code == 0x8;
+  if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_ERROR || closed) {
+    const bool wasUp = connected;
+    connected = false;
+    if (wasUp) {
+      logEvent(closed ? String("remote access closed by the other end")
+                      : "remote access lost, last heard " + String((millis() - heardAt) / 1000) + " s ago");
+      // The library waits ten seconds before it dials again and there is no setting
+      // for it. A link that was up and is gone is dialled again at once, by a fresh
+      // client, while this one is left to sit its ten seconds out and be put away.
+      char *mark = redialMark;
+      xQueueSend(inbox, &mark, 0);
+    }
     connected = false;
     workerHasBot = false;
     state = "reconnecting";
@@ -216,6 +246,8 @@ static void onEvent(void *, esp_event_base_t, int32_t id, void *data) {
     }
     return;
   }
+  if (e->payload_len == 1 && e->data_ptr[0] == 'q')
+    return;                                  // the Worker's answer to a beat
   if (e->payload_len > RELAY_FRAME_LIMIT)
     return;
   if (e->payload_offset == 0) {
@@ -742,22 +774,76 @@ static void carry(char *raw) {
   sendText("{\"i\":" + String(id) + ",\"e\":1}");
 }
 
+static std::atomic<uint8_t> puttingAway;  // old clients not yet shut, each still holding its memory
+
+static void putAway(void *old) {
+  const bool ownTask = xTaskGetCurrentTaskHandle() != worker;
+  esp_websocket_client_stop((esp_websocket_client_handle_t)old);
+  esp_websocket_client_destroy((esp_websocket_client_handle_t)old);
+  puttingAway--;
+  if (ownTask)
+    vTaskDelete(nullptr);
+}
+
+// A link that is down is dialled again by a fresh client, at once
+static void redial() {
+  const esp_websocket_client_handle_t old = connected ? nullptr : takeSocket();
+  if (!old)
+    return;
+  wsBorn++;                            // nothing more is believed from it
+  nextTry = millis() + 500;            // the loop starts the new one
+  puttingAway++;
+  // Put away on a task of its own: stopping it takes the ten seconds it sleeps,
+  // and the requests on the new link must not wait behind that
+  if (xTaskCreatePinnedToCore(putAway, "wsold", 4096, old, 1, nullptr, 0) != pdPASS)
+    putAway(old);
+}
+
+// A beat every ten seconds, which the Worker answers without waking. It is how the
+// Worker knows this module is there: a module whose power is cut says no goodbye, and
+// Cloudflare went on holding its socket open for minutes, with every visitor waiting
+// half a minute for an answer that could not come. It is also how this end knows the
+// Worker is there, sooner than the seventy seconds the library's own ping takes.
+static void beat() {
+  static uint32_t beatAt;
+  if (!connected || millis() - beatAt < RELAY_BEAT_MS)
+    return;
+  beatAt = millis();
+  const uint32_t silent = millis() - heardAt;
+  if (silent < RELAY_SILENT_MS) {
+    sendText("p");
+    return;
+  }
+  connected = false;
+  workerHasBot = false;
+  state = "reconnecting";
+  logEvent("remote access silent for " + String(silent / 1000) + " s, dialling again");
+  redial();
+}
+
 static void work(void *) {
   for (;;) {
     char *raw = nullptr;
-    if (xQueueReceive(inbox, &raw, portMAX_DELAY) == pdTRUE && raw) {
-      carry(raw);
-      free(raw);
+    const bool got = xQueueReceive(inbox, &raw, pdMS_TO_TICKS(RELAY_BEAT_MS)) == pdTRUE;
+    beat();
+    if (!got || !raw)
+      continue;
+    if (raw == redialMark) {
+      redial();
+      continue;
     }
+    carry(raw);
+    free(raw);
   }
 }
 
 static void stopSocket() {
-  if (!ws)
+  const esp_websocket_client_handle_t had = takeSocket();
+  if (!had)
     return;
-  esp_websocket_client_stop(ws);
-  esp_websocket_client_destroy(ws);
-  ws = nullptr;
+  wsBorn++;                                  // nothing more is believed from it
+  esp_websocket_client_stop(had);
+  esp_websocket_client_destroy(had);
   connected = false;
 }
 
@@ -790,7 +876,9 @@ void relayTick(const bool allowed) {
   if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < RELAY_BLOCK_FLOOR ||
       heap_caps_get_free_size(MALLOC_CAP_8BIT) < RELAY_HEAP_FLOOR) {
     state = "waiting for memory";
-    nextTry = millis() + RELAY_RETRY_MS;
+    // An old client being put away still holds its encrypted session, tens of
+    // kilobytes that come back within a second or so: asked again soon, not in 15 s
+    nextTry = millis() + (puttingAway ? 500 : RELAY_RETRY_MS);
     return;
   }
 
@@ -810,7 +898,7 @@ void relayTick(const bool allowed) {
     nextTry = millis() + RELAY_RETRY_MS;
     return;
   }
-  esp_websocket_register_events(ws, WEBSOCKET_EVENT_ANY, onEvent, nullptr);
+  esp_websocket_register_events(ws, WEBSOCKET_EVENT_ANY, onEvent, (void *)++wsBorn);
   esp_websocket_client_start(ws);
   state = "connecting";
 }
