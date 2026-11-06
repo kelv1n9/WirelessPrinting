@@ -449,7 +449,7 @@ $('btheme').onclick = () => {
 
 // The printer's card is asked for on purpose: it costs the wire two commands, and
 // during a print those would wait behind every move already queued.
-let asking = false, havePrinterList = false;
+let asking = false, havePrinterList = false, askAgainIn = 5000;
 
 async function printerCard(){
   if (asking) return;
@@ -504,7 +504,11 @@ async function printerCard(){
       cell.textContent = 'nothing on the printer card';
     }
   } catch (e) {
-    if (!havePrinterList) $('ptab').innerHTML = '<tr><td class="dim">the printer card is not readable right now</td></tr>';
+    if (!havePrinterList) {
+      $('ptab').innerHTML = '<tr><td class="dim">the printer card is not readable right now, asking again</td></tr>';
+      setTimeout(() => printerCard().catch(()=>{}), askAgainIn);
+      askAgainIn = Math.min(askAgainIn * 2, 60000);
+    }
   } finally { asking = false; }
 }
 $('bpcard').onclick = () => printerCard().catch(()=>{});

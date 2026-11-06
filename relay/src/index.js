@@ -465,7 +465,8 @@ export class Relay {
     }
     const last = extra
       ? await this.putFile(request.method, url.pathname + url.search, headers, file, extra, { headers, body: buffered })
-      : await this.deliver(request.method, url.pathname + url.search, headers, buffered);
+      : await this.deliver(request.method, url.pathname + url.search, headers, buffered, null,
+                           /^\/(update|upload|api\/files\/local)/.test(url.pathname) ? UPLOAD_ATTEMPTS : 1);
     if (!last)
       return new Response("The upload did not get through the relay. Try again.\n", { status: 503 });
     const h = new Headers(last.headers || {});
@@ -506,10 +507,13 @@ export class Relay {
         // A firmware image that went down whole and then lost the module is a flash that
         // worked: the module reboots before its answer is out. Sending it again only
         // met the new firmware with yesterday's credentials.
-        if (last.lost && last.sentAll && path.startsWith("/update")) {
-          this.incident(`all of ${path} went down and the module dropped away, taken as flashed`);
+        if (last.lost && last.sentAll && (path.startsWith("/update") || path.startsWith("/restart"))) {
+          const flashed = path.startsWith("/update");
+          this.incident(`all of ${path} went down and the module dropped away, taken as ${flashed ? "flashed" : "restarted"}`);
           return { status: 200, headers: { "content-type": "text/plain" },
-                   body: new TextEncoder().encode("Sent whole; the module dropped away to reboot, which is what a good flash does. Check /api/status in a minute.\n") };
+                   body: new TextEncoder().encode(flashed
+                     ? "Sent whole; the module dropped away to reboot, which is what a good flash does. Check /api/status in a minute.\n"
+                     : "restarting\n") };
         }
         if (!last.lost && last.status !== 502 && last.status !== 504) break;
         this.incident(`attempt ${attempt} of ${path} did not get through (${last.lost ? "lost" : last.status}), ${attempt < tries ? "trying again" : "giving up"}`);
