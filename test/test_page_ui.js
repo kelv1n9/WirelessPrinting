@@ -53,7 +53,7 @@ const status={system:{machine:'KP3S',rssi:-60,version:'test'},printing:true,conn
   assert(elements.ptab.textContent.includes('Boat with spaces.gcode'));
   assert.equal(elements.ptab.querySelector('img').src,'/thumbnail?name=Boat%20with%20spaces.gcode&s=123');
   await elements.ptab.querySelectorAll('button')[0].onclick();
-  assert.equal(requests.at(-1)[0],'/printer/print?name=BOATWI~1.GCO');
+  assert.equal(requests.at(-1)[0],'/printer/print?name=Boat%20with%20spaces.gcode');
   context.status=status;run('render(status)');
   assert.equal(elements.jlayer.textContent,'2 / 9');
   assert.equal(elements.jz.textContent,'0.40 mm');

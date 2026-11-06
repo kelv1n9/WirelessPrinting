@@ -27,8 +27,8 @@ def extract(marker):
 helpers = '\n'.join(extract(marker) + (';' if marker.startswith('struct ') else '') for marker in (
     'static void sawLine(', 'static String metaPath(', 'static String metaReadPath(',
     'struct MetaOut :', 'static bool metaHead(', 'static uint32_t metaLayerAt(',
-    'static int metaFanAt(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard() {',
-    'static String openPrinterFile(', 'static String printOnPrinter('))
+    'static int metaFanAt(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard(const char *wanted, const uint16_t from) {',
+    'static String printerHandle(', 'static String openPrinterFile(', 'static String printOnPrinter('))
 upload = '\n'.join(['File upInto;', '#define UP_BLOCK 16384', 'static uint8_t upBlock[UP_BLOCK]; static size_t upHeld;', 'static volatile bool relayPutting = false;', 'static bool printerWireBusy() { return false; }', 'static char sendName[64];', 'static void wifiDropTick() {}', 'static void serviceSender() {}', 'static const char EMPTY_FILE[] = "empty";', 'static const char SAME_NAME[] = "busy";'] +
                    [extract(m) for m in ('static bool uploadBegin(', 'static void cardWrite(', 'static void uploadWrite(', 'static void uploadAbort(',
                                          'static void uploadEnd(', 'static void takeUpload()')])
@@ -118,6 +118,7 @@ struct {
 } server;
 struct { bool active=false;bool running() const { return active; } } sender;
 PrinterCard printerCard,printerListing;
+static bool askPrinterCard(const char *wanted = nullptr, const uint16_t from = 0);
 bool printing=false,sendAsked=false,listingRequested=false,sawOk=false,autoPowerOff=false,powerArmed=false,powerSawIdle=false;
 uint32_t printAt=0,printOf=0,printSince=0,heardTemp=0,powerReadySince=0,powerTries=0;
 char selected[PRINTER_CARD_NAME_BYTES]={},machine[32]={};
@@ -149,7 +150,7 @@ String say(const String &cmd, uint32_t) {
   if (cmd.s.find("M23 ")==0) {
     const PrinterCardEntry *e=printerCard.find(cmd.c_str()+4);
     assert(e);
-    std::string reply="File opened: "+std::string(e->dos)+" Size: "+std::to_string(e->size);
+    std::string reply="File opened: "+std::string(cmd.c_str()+4)+" Size: "+std::to_string(e->size);
     line(reply); return reply+"\nFile selected\n";
   }
   return "ok";
@@ -217,7 +218,7 @@ int main() {
   assert(printerCardResolve(printerCard,original,resolved,sizeof resolved) && !strcmp(target,resolved));
   listing={"Begin file list",std::string("PART~1.GCO 55 ")+target,"End file list"};assert(askPrinterCard());
   assert(printerCardResolve(printerCard,"part~1.gco",resolved,sizeof resolved) && !strcmp(target,resolved));
-  assert(openPrinterFile(original).indexOf("File opened")>=0 && commands.back()=="M23 PART~1.GCO");
+  assert(openPrinterFile(original).indexOf("File opened")>=0 && commands.back()==std::string("M23 ")+target);
   assert(!strcmp(selected,target));
   head={};head.magic=GCODEMETA_MAGIC;head.size=55;head.layers=9;
   put(std::string("/meta/")+target+".hdr",&head,sizeof head);
@@ -240,9 +241,12 @@ int main() {
   bool ambiguous=false;
   assert(!printerCard.find("SPEED~67.GCO",&ambiguous) && ambiguous);
   assert(!printerCardResolve(printerCard,"SPEED~67.GCO",resolved,sizeof resolved));
-  for (const char *name : {"SPEED~67.GCO","speed115.gcode","speed20mb.gcode"}) {
-    commands.clear();assert(openPrinterFile(name).indexOf("File opened")<0 && commands.empty());
+  commands.clear();assert(openPrinterFile("SPEED~67.GCO").indexOf("File opened")<0 && commands.empty());
+  for (const char *name : {"speed115.gcode","speed20mb.gcode"}) {
+    commands.clear();assert(openPrinterFile(name).indexOf("File opened")>=0);
+    assert(commands.size()==1 && commands.back()==std::string("M23 ")+name);
   }
+  selected[0]=0;
   for (const char *size : {"1010991","20219820"}) {
     line(std::string("File opened: SPEED~67.GCO Size: ")+size);
     assert(!selected[0] && !metaHead("SPEED~67.GCO",head));

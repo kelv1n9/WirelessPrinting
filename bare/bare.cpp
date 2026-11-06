@@ -332,7 +332,7 @@ static void drain() {
 // reads still goes through the parser, so a reply is never lost to the state.
 // Asks the printer what is on its card and fills the index from the answer. The card is
 // released after every binary transfer, so M21 goes first every time.
-static bool askPrinterCard();
+static bool askPrinterCard(const char *wanted = nullptr, const uint16_t from = 0);
 
 static String say(const String line, const uint32_t wait = REPLY_WAIT_MS) {
   if (sender.running())
@@ -1159,7 +1159,7 @@ static bool moveLink(const uint32_t rate) {
   return askedBack();
 }
 
-static bool askPrinterCard() {
+static bool askPrinterCard(const char *wanted, const uint16_t from) {
   if (sender.running() || sendAsked || printing)
     return false;
   if (!settleWire())
@@ -1169,28 +1169,46 @@ static bool askPrinterCard() {
   say("M21");
   if (printing)
     return false;
-  printerListing.begin();
+  printerListing.ask(wanted, from);
   listingRequested = true;
   say("M20 L");
   listingRequested = false;
-  if (!printerListing.complete() || printerListing.rejected() || printerListing.dropped())
+  if (!printerListing.complete() || printerListing.rejected())
     return false;
   printerCard = printerListing;
   return true;
 }
 
+static String printerHandle(const char *name, uint32_t *size = nullptr) {
+  char canonical[PRINTER_CARD_NAME_BYTES];
+  if (!printerCardResolve(printerCard, name, canonical, sizeof canonical))
+    return "";
+  const PrinterCardEntry *entry = printerCard.find(canonical);
+  if (!entry)
+    return "";
+  if (size)
+    *size = entry->size;
+  if (entry->name[0] && !strchr(entry->name, ' '))
+    return entry->name;
+  const String dos = entry->dos;
+  if (printerCard.total() > printerCard.count() && !askPrinterCard(dos.c_str()))
+    return "";
+  return printerCard.find(dos.c_str()) ? dos : String();
+}
+
 static String openPrinterFile(const char *name) {
   if (printing || sender.running() || sendAsked)
     return "the printer is busy\n";
-  char canonical[PRINTER_CARD_NAME_BYTES];
-  if (!printerCardResolve(printerCard, name, canonical, sizeof canonical))
-    return "the filename is empty or ambiguous\n";
-  const PrinterCardEntry *entry = printerCard.find(canonical);
-  if (!entry)
-    return "the file is not in the printer listing\n";
-  if (printerCard.find(entry->dos) != entry)
-    return "the printer listing has an ambiguous DOS alias\n";
-  return say("M23 " + String(entry->dos));
+  uint32_t size = 0;
+  const String handle = printerHandle(name, &size);
+  if (handle == "")
+    return "the file is not in the printer listing, or another file shares its short name\n";
+  const String said = say("M23 " + handle);
+  if (printerCardOpened(said.c_str(), handle.c_str(), size))
+    return said;
+  if (said.indexOf("File opened") >= 0)
+    say("M524");
+  return "the printer opened something else\n";
 }
 
 // Starts a file that is already on the printer's card. Empty when it started, the
@@ -1202,7 +1220,7 @@ static String printOnPrinter(const String &name, const bool listed = false) {
     return "the printer is busy";
   if (name == "")
     return "name is empty";
-  if (!listed && !askPrinterCard())
+  if (!listed && !askPrinterCard(name.c_str()))
     return "the printer did not finish a listing";
   const String opened = openPrinterFile(name.c_str());
   if (opened.indexOf("File opened") < 0)
@@ -1399,7 +1417,21 @@ void setup() {
 
   Printer.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
   printerRxRoom = Printer.setRxBufferSize(2048);
-  mountCard();
+  if (mountCard()) {
+    String empties[8];
+    uint8_t found = 0;
+    File dir = SD_MMC.open("/");
+    for (File one = dir.openNextFile(); one; one = dir.openNextFile()) {
+      if (!one.isDirectory() && !one.size() && found < 8)
+        empties[found++] = one.name();
+      one.close();
+    }
+    dir.close();
+    for (uint8_t i = 0; i < found; i++) {
+      SD_MMC.remove(empties[i].startsWith("/") ? empties[i] : "/" + empties[i]);
+      journal("removed an upload that power cut short: " + empties[i]);
+    }
+  }
   configTzTime("AZT-4", "pool.ntp.org", "time.google.com");   // Baku, for the journal
 
   route("/log", HTTP_GET, []() {
@@ -2002,6 +2034,10 @@ void setup() {
   });
 
   route("/yandex/off", HTTP_POST, []() {
+    if (printing && server.arg("force") != "1") {
+      server.send(409, "text/plain", "a print is running, say force=1 to cut the power anyway\n");
+      return;
+    }
     if (!yandexHome.request(YandexHome::PowerOff)) {
       server.send(409, "text/plain", "the socket is busy\n");
       return;
@@ -2022,7 +2058,7 @@ void setup() {
   });
 
   route("/printer/files", HTTP_GET, []() {
-    const bool fresh = askPrinterCard();
+    const bool fresh = askPrinterCard(nullptr, (uint16_t)server.arg("from").toInt());
     if (!fresh && !printerCard.complete()) {
       server.send(503, "text/plain", "no cached printer list; refresh when the printer is idle\n");
       return;
@@ -2034,6 +2070,8 @@ void setup() {
     }
     if (!printerCard.count())
       out += "nothing on the printer's card\n";
+    if (fresh && printerCard.more())
+      out += "more: " + String(printerCard.more()) + "\n";
 
     server.send(200, "text/plain", out);
   });
@@ -2072,8 +2110,16 @@ void setup() {
       server.send(400, "text/plain", "name is empty\n");
       return;
     }
-    say("M21");
-    const String said = say("M30 " + name);
+    if (!askPrinterCard(name.c_str())) {
+      server.send(503, "text/plain", "the printer did not finish a listing\n");
+      return;
+    }
+    const String handle = printerHandle(name.c_str());
+    if (handle == "") {
+      server.send(404, "text/plain", "not on the printer's card, or another file shares its short name\n");
+      return;
+    }
+    const String said = say("M30 " + handle);
     if (said.indexOf("File deleted") < 0) {
       server.send(404, "text/plain", "the printer would not delete it:\n" + said);
       return;
@@ -2300,7 +2346,9 @@ static void handleTelegram() {
     }
 
     else if (verb == "/files") {
-      const bool fresh = askPrinterCard();
+      const int first = rest.toInt() > 0 ? rest.toInt() - 1 : 0;
+      const bool fresh = askPrinterCard(nullptr, (uint16_t)first);
+      const int base = fresh ? first : printerCard.from();
       if (!fresh && !printerCard.complete())
         telegramBot.send(chat, "No cached printer list. Ask again when the printer is idle.");
       else if (!printerCard.count())
@@ -2309,9 +2357,12 @@ static void handleTelegram() {
         String out = fresh ? "On the printer's card:\n" : "Cached printer listing (refresh when idle):\n";
         for (uint8_t i = 0; i < printerCard.count(); i++) {
           const PrinterCardEntry &e = printerCard.at(i);
-          out += String(i + 1) + ". " + String(e.name[0] ? e.name : e.dos) +
+          out += String(base + i + 1) + ". " + String(e.name[0] ? e.name : e.dos) +
                  "  " + String(e.size / 1024) + " KB\n";
         }
+        if (fresh && printerCard.more())
+          out += "and " + String(printerCard.total() - printerCard.more()) + " more: /files " +
+                 String(printerCard.more() + 1) + "\n";
         out += "\n/print <number> to start one";
         telegramBot.send(chat, out);
       }
@@ -2325,10 +2376,10 @@ static void handleTelegram() {
         telegramBot.send(chat, "A transfer owns the wire, ask again in a moment.");
       else if (which <= 0)
         telegramBot.send(chat, "Say /files first, then /print with the number beside the one you want.");
-      else if (!askPrinterCard() || which > (int)printerCard.count())
+      else if (!askPrinterCard(nullptr, (uint16_t)(which - 1)) || !printerCard.count())
         telegramBot.send(chat, "There is no file with that number. Say /files again.");
       else {
-        const PrinterCardEntry &e = printerCard.at(which - 1);
+        const PrinterCardEntry &e = printerCard.at(0);
         const String name = e.name[0] ? e.name : e.dos;
         const String trouble = printOnPrinter(name, true);
         telegramBot.send(chat, trouble == "" ? "Printing " + name + "." : "Not printing " + name + ": " + trouble + ".");
@@ -2537,7 +2588,7 @@ void loop() {
         chirp(2);
       }
     }
-    else if (!askPrinterCard() && !askPrinterCard()) {   // asked twice: one listing in dozens comes back short
+    else if (!askPrinterCard(choreTarget) && !askPrinterCard(choreTarget)) {   // asked twice: one listing in dozens comes back short
       choreTrouble = "the printer did not answer with a listing";
       chore = ChoreFailed;
     }

@@ -347,8 +347,33 @@ int main() {
     lines.push_back("End file list");
     feed(card, lines);
     check(card.count() == PRINTER_CARD_SLOTS, "the index filled up");
-    check(card.dropped() == 5, "and said how many it could not keep");
+    check(card.total() == PRINTER_CARD_SLOTS + 5, "and counted every file");
+    check(card.more() == PRINTER_CARD_SLOTS, "and said where the next window starts");
     check(card.complete(), "it still finished");
+    check(!card.holds("f0035.gcode", 36), "a file past the window is not held unasked");
+
+    card.ask(nullptr, PRINTER_CARD_SLOTS);
+    feed(card, lines);
+    check(card.count() == 5 && card.more() == 0, "the second window holds the rest and is the last");
+    check(strcmp(card.at(0).name, "f0032.gcode") == 0, "and starts where the first one stopped");
+
+    card.ask("f0035.gcode", 0);
+    feed(card, lines);
+    check(card.count() == PRINTER_CARD_SLOTS + 1, "the file asked for got a seat past the window");
+    check(card.holds("f0035.gcode", 36), "at its size");
+    check(card.find("F0035.GCO") == &card.at(PRINTER_CARD_SLOTS), "and is found by either name");
+    check(card.more() == PRINTER_CARD_SLOTS, "the window itself did not move");
+
+    card.ask("f0003.gcode", 0);
+    feed(card, lines);
+    check(card.count() == PRINTER_CARD_SLOTS && card.holds("f0003.gcode", 4), "one inside the window is not seated twice");
+
+    lines.insert(lines.end() - 1, "TWIN~1.GCO 9 f0035.gcode");
+    card.ask("f0035.gcode", 0);
+    feed(card, lines);
+    bool ambiguous = false;
+    check(!card.find("f0035.gcode", &ambiguous) && ambiguous, "two files past the window with one name are ambiguous");
+    card.ask(nullptr, 0);
   }
 
   // ------------------------------------------------- a long name we could never write

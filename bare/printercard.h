@@ -54,14 +54,26 @@ inline bool printerCardIsGcode(const char *name) {
   return printerCardSame(dot, ".gco") || printerCardSame(dot, ".gcode") || printerCardSame(dot, ".g");
 }
 
+inline bool printerCardTarget(const char *moduleName, char *out, const size_t max);
+
 class PrinterCard {
 public:
   // Called the moment "M20 L" goes out, and again by "Begin file list" itself, so a
   // second listing cannot be mistaken for more of the first one.
   void begin() {
     held = filling = 0;
-    rejected_ = skipped_ = dropped_ = oversize_ = 0;
-    listing_ = complete_ = false;
+    rejected_ = skipped_ = oversize_ = seen_ = 0;
+    listing_ = complete_ = spared_ = clash_ = false;
+  }
+
+  void ask(const char *wanted, const uint16_t from) {
+    from_ = from;
+    wanted_[0] = wantedTarget_[0] = 0;
+    if (wanted && *wanted) {
+      snprintf(wanted_, sizeof wanted_, "%s", wanted);
+      printerCardTarget(wanted, wantedTarget_, sizeof wantedTarget_);
+    }
+    begin();
   }
 
   // Every line the printer sends while a listing is expected. Returns true when the line
@@ -91,6 +103,8 @@ public:
       listing_ = false;
       complete_ = true;
       held = filling;
+      if (spared_)
+        slot[held++] = slot[PRINTER_CARD_SLOTS];
       return true;
     }
     if (cut)
@@ -119,12 +133,20 @@ public:
         }
         found = &slot[i];
       }
+    if (found && spared_ && clash_ && found == &slot[held - 1]) {
+      if (ambiguous) *ambiguous = true;
+      return nullptr;
+    }
     return found;
   }
 
   uint16_t rejected() const { return rejected_; }   // lines that did not parse
   uint16_t skipped() const  { return skipped_; }    // parsed, but not a gcode file in the root
-  uint16_t dropped() const  { return dropped_; }    // good entries past the last slot
+  uint16_t total() const    { return seen_; }
+  uint16_t from() const     { return from_; }
+  uint16_t more() const {
+    return seen_ > (uint32_t)from_ + PRINTER_CARD_SLOTS ? (uint16_t)(from_ + PRINTER_CARD_SLOTS) : 0;
+  }
   uint16_t oversize() const { return oversize_; }   // long names too long to be anything of ours
 
   // The only question worth asking: is this exact file already over there? Same name and
@@ -138,10 +160,15 @@ public:
   }
 
 private:
-  PrinterCardEntry slot[PRINTER_CARD_SLOTS];
+  PrinterCardEntry slot[PRINTER_CARD_SLOTS + 1];
   uint8_t held = 0, filling = 0;
-  uint16_t rejected_ = 0, skipped_ = 0, dropped_ = 0, oversize_ = 0;
-  bool listing_ = false, complete_ = false;
+  uint16_t rejected_ = 0, skipped_ = 0, oversize_ = 0, seen_ = 0, from_ = 0;
+  bool listing_ = false, complete_ = false, spared_ = false, clash_ = false;
+  char wanted_[PRINTER_CARD_NAME_BYTES] = "", wantedTarget_[PRINTER_CARD_NAME_BYTES] = "";
+
+  bool isWanted(const char *name) const {
+    return name && (printerCardSame(name, wanted_) || printerCardSame(name, wantedTarget_));
+  }
 
   // "<8.3 name> <size>" and, because we always ask with L, " <long name>" after it.
   // Anything that is not exactly that shape is thrown away whole. A listing full of
@@ -211,12 +238,19 @@ private:
       return;
     }
 
-    if (filling >= PRINTER_CARD_SLOTS) {
-      dropped_++;
-      return;
+    const uint16_t index = seen_++;
+    const bool seated = index >= from_ && filling < PRINTER_CARD_SLOTS;
+    if (!seated) {
+      if (!isWanted(dos) && !isWanted(longName))
+        return;
+      if (spared_) {
+        clash_ = true;
+        return;
+      }
+      spared_ = true;
     }
 
-    PrinterCardEntry &e = slot[filling];
+    PrinterCardEntry &e = slot[seated ? filling : PRINTER_CARD_SLOTS];
     memcpy(e.dos, dos, dosLen + 1);
     e.size = size;
     e.name[0] = 0;
@@ -229,7 +263,8 @@ private:
       else
         oversize_++;
     }
-    filling++;
+    if (seated)
+      filling++;
   }
 };
 

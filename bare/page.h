@@ -455,19 +455,22 @@ async function printerCard(){
   if (asking) return;
   asking = true;
   try {
-    const r = await fetch('/printer/files');
-    const text = await r.text();
-    if (!r.ok) throw new Error(text.trim() || ('HTTP ' + r.status));
-    const lines = text.split('\n').filter(l => l.trim());
-    const note = lines.find(l => l.startsWith('cached:'));
     const entries = [];
-    for (const line of lines) {
-      if (line === note || line === "nothing on the printer's card") continue;
-      const m = line.match(/^(\S+)\s+(\d+)\s+(.*)$/);
-      if (!m) throw new Error('Incomplete printer listing; previous list kept');
-      entries.push(m);
+    let empty = false;
+    for (let from = 0, next = 0; from >= 0; from = next || -1, next = 0) {
+      const r = await fetch('/printer/files?from=' + from);
+      const text = await r.text();
+      if (!r.ok) throw new Error(text.trim() || ('HTTP ' + r.status));
+      for (const line of text.split('\n').filter(l => l.trim())) {
+        if (line.startsWith('cached:')) continue;
+        if (line === "nothing on the printer's card") { empty = true; continue; }
+        if (line.startsWith('more: ')) { next = +line.slice(6); continue; }
+        const m = line.match(/^(\S+)\s+(\d+)\s+(.*)$/);
+        if (!m) throw new Error('Incomplete printer listing; previous list kept');
+        entries.push(m);
+      }
     }
-    if (!entries.length && !lines.includes("nothing on the printer's card"))
+    if (!entries.length && !empty)
       throw new Error('Incomplete printer listing; previous list kept');
     const tb = $('ptab');
     tb.textContent = '';
@@ -487,10 +490,10 @@ async function printerCard(){
       const a = tr.insertCell(); a.className = 'acts';
       const box = document.createElement('div'); box.className = 'row';
       box.append(btn('Print', 'p', () => confirm('Print ' + m[3] + '?') &&
-        call('/printer/print?name=' + encodeURIComponent(m[1]), {method:'POST'})
+        call('/printer/print?name=' + encodeURIComponent(m[3]), {method:'POST'})
           .then(() => { toast('printing'); })),
         btn('Delete', 'd', () => confirm('Delete ' + m[3] + ' from the printer card?') &&
-          call('/printer/delete?name=' + encodeURIComponent(m[1]), {method:'POST'})
+          call('/printer/delete?name=' + encodeURIComponent(m[3]), {method:'POST'})
             .then(() => { toast('deleted'); printerCard().catch(()=>{}); })));
       box.querySelectorAll('button').forEach(b => b.disabled = conPrinting || busy);
       a.append(box);
@@ -508,8 +511,9 @@ $('bpcard').onclick = () => printerCard().catch(()=>{});
 
 $('cauto').onchange = e => call('/yandex/auto?on=' + (e.target.checked ? 1 : 0), {method:'POST'})
   .then(() => toast(e.target.checked ? 'will switch off after a print' : 'will stay on'));
-$('bpower').onclick = () => confirm('Cut mains to the printer? This module loses power too and cannot switch it back on.')
-  && call('/yandex/off', {method:'POST'}).then(() => toast('switching off'));
+$('bpower').onclick = () => confirm(conPrinting ? 'A PRINT IS RUNNING. Cut mains anyway? The print is lost.'
+                                               : 'Cut mains to the printer? This module loses power too.')
+  && call('/yandex/off' + (conPrinting ? '?force=1' : ''), {method:'POST'}).then(() => toast('switching off'));
 $('bcancel').onclick = () => confirm('Cancel the running print?') && job('cancel');
 $('brestart').onclick = () => confirm('Restart the module? The printer keeps running.') && call('/restart', {method:'POST'}).then(() => toast('restarting'));
 let uploadThenPrint = false;

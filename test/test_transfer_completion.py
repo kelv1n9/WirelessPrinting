@@ -30,7 +30,7 @@ completion = extract('if (chore == ChoreSending && !sender.running() && !sendAsk
 bin_branch = completion.split('else if (!worthPacking(choreTarget)) {', 1)[1].split('else if (!askPrinterCard())', 1)[0]
 assert bin_branch.count('say("M21");') == 1, 'Expected one bin remount for mutation check'
 mutant = completion.replace('say("M21");', '', 1)
-helpers = '\n'.join(extract(marker) for marker in ('static bool worthPacking(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard() {', 'static String openPrinterFile('))
+helpers = '\n'.join(extract(marker) for marker in ('static bool worthPacking(', 'static void loosePacket(', 'static bool askedBack() {', 'static bool settleWire() {', 'static bool askPrinterCard(const char *wanted, const uint16_t from) {', 'static String printerHandle(', 'static String openPrinterFile('))
 chore_enum = re.search(r'enum Chore\s*:\s*uint8_t\s*\{[^}]+\};', source).group()
 binary_header = (root / 'ESP8266WirelessPrintAsync/BinaryTransfer.h').read_text()
 binary_enum = re.search(r'enum BinaryPhase\s*:\s*uint8_t\s*\{[^}]+\};', binary_header).group()
@@ -94,6 +94,7 @@ bool choreRetried=true;           // the existing scenarios judge the second, fi
 char sendName[64]="x.gcode";
 bool startChore(const String &, bool) { return false; }
 PrinterCard printerCard, printerListing;
+static bool askPrinterCard(const char *wanted = nullptr, const uint16_t from = 0);
 bool printing=false,listingRequested=false;
 std::vector<std::string> commands;
 const char *scenario="";
