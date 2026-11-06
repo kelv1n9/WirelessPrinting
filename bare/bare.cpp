@@ -1163,11 +1163,16 @@ static bool moveLink(const uint32_t rate) {
   return askedBack();
 }
 
+static String listingTrouble;
+
 static bool askPrinterCard(const char *wanted, const uint16_t from) {
+  listingTrouble = printing ? "a print is running" : "a transfer owns the wire";
   if (sender.running() || sendAsked || printing)
     return false;
+  listingTrouble = "the printer answered at neither rate";
   if (!settleWire())
     return false;
+  listingTrouble = "a print began";
   if (printing)
     return false;
   say("M21");
@@ -1177,8 +1182,11 @@ static bool askPrinterCard(const char *wanted, const uint16_t from) {
   listingRequested = true;
   say("M20 L");
   listingRequested = false;
+  listingTrouble = !printerListing.complete() ? String("the listing did not end, ") + printerListing.total() + " files in"
+                                              : String(printerListing.rejected()) + " lines of it did not parse";
   if (!printerListing.complete() || printerListing.rejected())
     return false;
+  listingTrouble = "";
   printerCard = printerListing;
   return true;
 }
@@ -2310,7 +2318,7 @@ static void handleTelegram() {
         relaySendTelegramFetch(chat, fileId, forPrinter ? "/api/files/local" : "/update",
                                forPrinter ? "file" : "firmware", name, token);
         telegramBot.send(chat, "Taking " + name + ", " + String(size / 1024) + " KB. About " +
-                               String(size / 15000 + 10) + " s.");
+                               String(size / 60000 + 10) + " s.");
       }
     }
 
@@ -2340,7 +2348,7 @@ static void handleTelegram() {
           const float done = printAt * 100.0 / printOf;
           for (int cell = 0; cell < 10; cell++)
             out += cell < (int)(done / 10 + 0.5) ? "\u2593" : "\u2591";
-          out += " " + String(done, 0) + " %\n";
+          out += " " + String(lroundf(done)) + " %\n";
           if (cardUp && metaHead(selected, meta) && meta.found) {
             const uint32_t at = metaLayerAt(selected, meta.found, printAt, &z100, &left);
             out += "Layer: " + (at ? String(at) : String("unknown")) + " of " + String(meta.found);
@@ -2353,8 +2361,8 @@ static void handleTelegram() {
         }
         out += "\n";
       }
-      out += "Nozzle: " + String(toolNow, 0) + " / " + String(toolSet, 0) + " \u00b0C\n";
-      out += "Bed: " + String(bedNow, 0) + " / " + String(bedSet, 0) + " \u00b0C\n";
+      out += "Nozzle: " + String(lroundf(toolNow)) + " / " + String(lroundf(toolSet)) + " \u00b0C\n";
+      out += "Bed: " + String(lroundf(bedNow)) + " / " + String(lroundf(bedSet)) + " \u00b0C\n";
       if (yandexHome.hasToken() && yandexHome.getDeviceId() != "")
         out += "Power off after a print: " + powerOffState() + "\n";
       out += "Module: up " + spanWords(millis() / 1000) + " \u00b7 memory " +
@@ -2607,7 +2615,7 @@ void loop() {
       }
     }
     else if (!askPrinterCard(choreTarget) && !askPrinterCard(choreTarget)) {   // asked twice: one listing in dozens comes back short
-      choreTrouble = "the printer did not answer with a listing";
+      choreTrouble = "the printer did not answer with a listing: " + listingTrouble;
       chore = ChoreFailed;
     }
     else if (!printerCard.holds(choreTarget, was)) {

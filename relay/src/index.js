@@ -316,7 +316,13 @@ export class Relay {
         return new Response("no\n", { status: 403 });
       const update = await request.json().catch(() => null);
       const m = update && update.message;
-      const ws = this.device();
+      let ws = this.device();
+      // A module that has just asked for its own socket to go off still looks connected
+      // for a quarter of a minute. The socket itself knows better.
+      if (m && ws && Date.now() - (this.offAsked || 0) < OFF_WATCH_MS) {
+        if (!this.auth) this.auth = (await this.state.storage.get("auth")) || null;
+        if (this.auth && this.auth.socket && (await this.socketState()) === "off") ws = null;
+      }
       if (m && !ws)
         await this.tgAway(m).catch(() => {});
       if (m && ws) {
@@ -639,12 +645,12 @@ export class Relay {
 
     if (m.route === "/update") {
       if (answer && answer.status === 200)
-        return say(`Firmware flashed \u2014 ${m.name}\n\nSize       ${kb} KB\nTransfer   ${seconds} s\n\nRebooting. Send /status in a minute.`);
-      return say(`Firmware not flashed \u2014 ${said || "it did not get through"}\n\nThe module is still running what it ran before.`);
+        return say(`Firmware flashed\n\nFile: ${m.name}\nSize: ${kb} KB\nTransfer: ${seconds} s\n\nRebooting. Send /status in a minute.`);
+      return say(`Firmware not flashed\n\nFile: ${m.name}\nWhy: ${said || "it did not get through"}\n\nThe module is still running what it ran before.`);
     }
     if (answer && answer.status < 300)
-      return say(`Saved \u2014 ${m.name}\n\nSize       ${kb} KB\nTransfer   ${seconds} s\n\nGoing on to the printer's card now. I will say when it is there.`);
-    return say(`Could not save ${m.name} \u2014 ${said || "it did not get through"}`);
+      return say(`Taken by the module\n\nFile: ${m.name}\nSize: ${kb} KB\nTransfer: ${seconds} s\n\nGoing on to the printer's card now. I will say when it is there.`);
+    return say(`Not taken\n\nFile: ${m.name}\nWhy: ${said || "it did not get through"}`);
   }
 
   // "ok", "challenge" (ask for the password), or "unknown" (the module never said how)

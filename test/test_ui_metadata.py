@@ -118,6 +118,7 @@ struct {
 } server;
 struct { bool active=false;bool running() const { return active; } } sender;
 PrinterCard printerCard,printerListing;
+static String listingTrouble;
 static bool askPrinterCard(const char *wanted = nullptr, const uint16_t from = 0);
 bool printing=false,sendAsked=false,listingRequested=false,sawOk=false,autoPowerOff=false,powerArmed=false,powerSawIdle=false;
 uint32_t printAt=0,printOf=0,printSince=0,heardTemp=0,powerReadySince=0,powerTries=0;

@@ -94,6 +94,7 @@ bool choreRetried=true;           // the existing scenarios judge the second, fi
 char sendName[64]="x.gcode";
 bool startChore(const String &, bool) { return false; }
 PrinterCard printerCard, printerListing;
+static String listingTrouble;
 static bool askPrinterCard(const char *wanted = nullptr, const uint16_t from = 0);
 bool printing=false,listingRequested=false;
 std::vector<std::string> commands;
