@@ -1556,6 +1556,10 @@ void setup() {
       server.send(503, "text/plain", "the module has no card\n");
       return;
     }
+    if (relayPutting || uploadActive || printerWireBusy()) {
+      server.send(409, "text/plain", "a transfer owns the card, try again in a moment\n");
+      return;
+    }
     if (!SD_MMC.remove("/" + server.arg("name"))) {
       server.send(404, "text/plain", "no such file\n");
       return;
@@ -2100,7 +2104,7 @@ void setup() {
   // Deleting on the printer, not here. The sidecars stay: they cost a couple of
   // kilobytes and they are still right if the same file goes over again.
   route("/printer/delete", HTTP_POST, []() {
-    if (sender.running()) {
+    if (printerWireBusy()) {
       server.send(409, "text/plain", "a transfer owns the wire\n");
       return;
     }

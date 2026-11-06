@@ -267,3 +267,7 @@ with tempfile.TemporaryDirectory(prefix='ui-metadata-') as tmp:
     subprocess.run(compiler + ['-std=c++14', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                               '-I', str(root / 'test/stubs'), '-I', str(root), str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
+
+gone = extract('route("/delete"')
+assert 'relayPutting || uploadActive || printerWireBusy()' in gone, 'deleting a file that is still arriving or leaving took the module down'
+assert 'printerWireBusy()' in extract('route("/printer/delete"'), 'the printer card is not to be touched while a transfer is starting'
