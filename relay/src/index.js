@@ -24,6 +24,8 @@ const RECONNECT_WAIT_MS = 90000;
 const SILENT_GIVE_UP_MS = 10000;
 const ANSWER_TIMEOUT_MS = 30000;
 const SILENT_MS = 35000;              // three of the module's beats missed
+const OFF_SILENT_MS = 13000;
+const OFF_WATCH_MS = 180000;
 const PASS_DOWN = ["authorization", "content-type", "x-api-key", "if-none-match", "x-relay-once"];
 const LOST = Symbol("lost");
 // What the page asks for is kept, so the page still works while the module is busy
@@ -32,6 +34,8 @@ const CACHE_ITEMS = 64;
 const SESSION_DAYS = 30;
 const CACHE_ITEM_LIMIT = 64 * 1024;
 const cacheKey = (url) => url.pathname + url.search;
+const asSent = (body, status, headers) =>
+  new Response(body, { status, headers, encodeBody: headers.has("content-encoding") ? "manual" : "automatic" });
 const wentAway = () => new Response("The printer module went away.\n", { status: 503 });
 
 export default {
@@ -208,13 +212,15 @@ export class Relay {
     const open = this.state.getWebSockets("device").filter((ws) => {
       if (ws.readyState !== 1) return false;
       const beat = this.state.getWebSocketAutoResponseTimestamp(ws);
-      return !beat || now - Math.max(beat.getTime(), this.heard || 0) < SILENT_MS;
+      const limit = now - (this.offAsked || 0) < OFF_WATCH_MS ? OFF_SILENT_MS : SILENT_MS;
+      return !beat || now - Math.max(beat.getTime(), this.heard || 0) < limit;
     });
     return open.length ? open[open.length - 1] : null;
   }
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (this.offAsked === undefined) this.offAsked = (await this.state.storage.get("offAsked")) || 0;
 
     if (url.pathname === "/.device") {
       if (request.headers.get("Upgrade") !== "websocket")
@@ -224,6 +230,10 @@ export class Relay {
         return new Response("no\n", { status: 403 });
       for (const old of this.state.getWebSockets("device"))
         old.close(1000, "replaced");
+      if (this.offAsked) {
+        this.offAsked = 0;
+        await this.state.storage.delete("offAsked");
+      }
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1], ["device"]);
       pair[1].send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN }));
@@ -384,7 +394,7 @@ export class Relay {
           } catch (e) {}
         }
         if (giveSession) await this.giveSession(request, h);
-        return new Response(body, { status: 200, headers: h });
+        return asSent(body, 200, h);
       }
       return wantsPage(request)
         ? personPage("Printer module is taking a file", "It answers again in a moment. This page checks by itself.", 3)
@@ -403,7 +413,7 @@ export class Relay {
       const answer = new Headers(last.headers || {});
       if (last.status === 200 && (headers.authorization || headers["x-api-key"]))
         await this.giveSession(request, answer);
-      return new Response(last.body, { status: last.status, headers: answer });
+      return asSent(last.body, last.status, answer);
     }
 
     // A file off the module's card. Carried through the module's web server a large
@@ -460,7 +470,7 @@ export class Relay {
       return new Response("The upload did not get through the relay. Try again.\n", { status: 503 });
     const h = new Headers(last.headers || {});
     h.set("x-robots-tag", "noindex");
-    return new Response(last.body, { status: last.status, headers: h });
+    return asSent(last.body, last.status, h);
   }
 
   // A file on its own, packed as zlib with the window the module said it unpacks in,
@@ -665,8 +675,9 @@ export class Relay {
     const last = (await this.state.storage.get("poweredAt")) || 0;
     if (Date.now() - last < 20000) return back();
     await this.state.storage.put("poweredAt", Date.now());
-    const said = await this.yandex("/v1.0/devices/actions", JSON.stringify({ devices: [{ id: this.auth.socket,
-      actions: [{ type: "devices.capabilities.on_off", state: { instance: "on", value: true } }] }] }));
+    const press = JSON.stringify({ devices: [{ id: this.auth.socket,
+      actions: [{ type: "devices.capabilities.on_off", state: { instance: "on", value: true } }] }] });
+    const said = (await this.yandex("/v1.0/devices/actions", press)) || (await this.yandex("/v1.0/devices/actions", press));
     this.incident(`power on asked from the web page: ${said ? said.status : "yandex did not answer"}`);
     return back();
   }
@@ -851,6 +862,11 @@ export class Relay {
             body: m.b || undefined,
           }).catch(() => null);
           if (r) { status = r.status; text = await r.text().catch(() => ""); }
+          if (status === 200 && m.p === "/v1.0/devices/actions" && /"value"\s*:\s*false/.test(m.b || "")) {
+            this.offAsked = Date.now();
+            await this.state.storage.put("offAsked", this.offAsked);
+            this.incident("the module asked for its socket to be switched off");
+          }
         }
         try { ws.send(JSON.stringify({ t: "yxr", q: m.q, s: status, b: text })); } catch (e) {}
         return;
@@ -920,7 +936,7 @@ export class Relay {
         const { readable, writable } = length > 0 ? new FixedLengthStream(length) : new TransformStream();
         w.writer = writable.getWriter();
         h.set("x-robots-tag", "noindex");
-        w.resolve(new Response(readable, { status: m.s, headers: h }));
+        w.resolve(asSent(readable, m.s, h));
       }
       return;
     }

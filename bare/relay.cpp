@@ -64,6 +64,7 @@ static QueueHandle_t bodies, freeSlots;
 static uint8_t lastOp;
 static TaskHandle_t worker;
 static char *assembling;
+static size_t assemblingRoom;
 static volatile bool connected;
 static volatile uint32_t linkEpoch;     // counts connections, so work begun on one is not carried on over the next
 static String url, key, auth, state = "off";
@@ -87,7 +88,7 @@ static String yandexBody;
 static int yandexCode;
 
 static const char *FORWARD[] = {"Content-Type", "Cache-Control", "WWW-Authenticate",
-                                "Location", "Content-Disposition"};
+                                "Location", "Content-Disposition", "Content-Encoding"};
 
 static void loadSettings() {
   Preferences keep;
@@ -253,9 +254,16 @@ static void onEvent(void *born, esp_event_base_t, int32_t id, void *data) {
   if (e->payload_offset == 0) {
     free(assembling);
     assembling = (char *)malloc(e->payload_len + 1);
+    assemblingRoom = e->payload_len;
   }
   if (!assembling)
     return;
+  if (e->payload_len != (int)assemblingRoom || e->payload_offset < 0 || e->data_len < 0 ||
+      (size_t)e->payload_offset + (size_t)e->data_len > assemblingRoom) {
+    free(assembling);
+    assembling = nullptr;
+    return;
+  }
   memcpy(assembling + e->payload_offset, e->data_ptr, e->data_len);
   if (e->payload_offset + e->data_len >= e->payload_len) {
     assembling[e->payload_len] = 0;
@@ -842,9 +850,9 @@ static void stopSocket() {
   if (!had)
     return;
   wsBorn++;                                  // nothing more is believed from it
+  connected = false;
   esp_websocket_client_stop(had);
   esp_websocket_client_destroy(had);
-  connected = false;
 }
 
 void relayBegin() {

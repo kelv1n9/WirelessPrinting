@@ -15,7 +15,7 @@ static_assert(FF_MAX_SS == 512, "lib/fatfs must be found before the core's own f
 #include "../ESP8266WirelessPrintAsync/BinaryTransfer.h"
 #include "cardbytes.h"
 #include "../ESP8266WirelessPrintAsync/BootGuard.h"
-#include "page.h"
+#include "page_gz.h"
 #include "printercard.h"
 #include "gcodemeta.h"
 #include "webauth.h"
@@ -1337,7 +1337,10 @@ void setup() {
 
   webAuthBegin();
 
-  route("/", HTTP_GET, []() { server.send_P(200, "text/html", PAGE_HTML); });
+  route("/", HTTP_GET, []() {
+    server.sendHeader("Content-Encoding", "gzip");
+    server.send_P(200, "text/html", (const char *)PAGE_GZ, sizeof PAGE_GZ);
+  });
   // Everything the page draws, in the shape it has always expected. What this build
   // cannot know is said as nothing rather than guessed: the page hides those rows.
   route("/api/status", HTTP_GET, []() {

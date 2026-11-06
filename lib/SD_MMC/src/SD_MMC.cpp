@@ -72,7 +72,7 @@ bool SDMMCFS::begin(const char * mountpoint, bool mode1bit, bool format_if_mount
         // Was 5 in the core this is copied from. Each open file costs 4136 bytes in one
         // block taken at mount, whether or not it is ever opened, and four is the most
         // this firmware has open at once: an upload, its two indexes and its thumbnail.
-        .max_files = 4,
+        .max_files = 6,
         .allocation_unit_size = 0
     };
 
