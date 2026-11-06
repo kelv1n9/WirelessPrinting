@@ -728,6 +728,10 @@ String relayAuthHello() {
   const String socket = YandexHome::getDeviceId();
   if (socket.length() && socket.indexOf('"') < 0 && socket.indexOf('\\') < 0)
     hello = hello.substring(0, hello.length() - 1) + ",\"socket\":\"" + socket + "\"}";
+  const String name = machine[0] ? machine : "KP3S";
+  if (name.indexOf('"') < 0 && name.indexOf('\\') < 0)
+    hello = hello.substring(0, hello.length() - 1) + ",\"name\":\"" + name + "\"}";
+  hello = hello.substring(0, hello.length() - 1) + ",\"chats\":\"" + telegramBot.getChats() + "\"}";
   return hello;
 }
 
@@ -1727,12 +1731,14 @@ void setup() {
 
   route("/telegram/allow", HTTP_POST, []() {
     telegramBot.allow(server.arg("chat"));
+    relayAuthChanged();
     server.sendHeader("Location", "/telegram");
     server.send(303, "text/plain", "let in\n");
   });
 
   route("/telegram/deny", HTTP_POST, []() {
     telegramBot.deny(server.arg("chat"));
+    relayAuthChanged();
     server.sendHeader("Location", "/telegram");
     server.send(303, "text/plain", "removed\n");
   });
@@ -2311,13 +2317,13 @@ static void handleTelegram() {
     else if (verb == "/start" || verb == "/help") {
       telegramBot.send(chat,
         String(machine[0] ? machine : "KP3S") + "\n\n"
-        "/status - what the printer is doing\n"
-        "/files - what is on the printer's card\n"
-        "/print <number> - start that file\n"
-        "/stop - cancel the running print\n"
-        "/nozzle <degrees> - set the hotend, 0 to turn it off\n"
-        "/bed <degrees> - set the bed\n"
-        "/on and /off - the socket\n\n"
+        "/status \u00b7 what the printer is doing\n"
+        "/files \u00b7 what is on the printer's card\n"
+        "/print <number> \u00b7 start that file\n"
+        "/stop \u00b7 cancel the running print\n"
+        "/nozzle <degrees> \u00b7 set the hotend, 0 turns it off\n"
+        "/bed <degrees> \u00b7 set the bed\n"
+        "/on and /off \u00b7 the socket, they work while the printer is off too\n\n"
         "Send a .gcode and it goes onto the printer's card. Send a .bin and the module "
         "flashes itself and reboots; a print carries on, the printer reads its own card. "
         "Send Robin_nano*.bin and it goes onto the printer's card to flash the printer at "
@@ -2325,30 +2331,34 @@ static void handleTelegram() {
     }
 
     else if (verb == "/status") {
-      String out = String(machine[0] ? machine : "KP3S") + "\n";
-      out += printing ? "Printing\n" : "Idle\n";
+      String out = String(machine[0] ? machine : "KP3S") + " \u00b7 " + (printing ? "printing" : "idle") + "\n\n";
       if (selected[0]) {
-        out += "File       " + String(selected) + "\n";
+        out += "File: " + String(selected) + "\n";
         if (printing && printOf) {
           GcodeMetaHead meta;
           uint16_t z100 = 0, left = 0;
-          out += "Done       " + String(printAt * 100.0 / printOf, 1) + " %\n";
+          const float done = printAt * 100.0 / printOf;
+          for (int cell = 0; cell < 10; cell++)
+            out += cell < (int)(done / 10 + 0.5) ? "\u2593" : "\u2591";
+          out += " " + String(done, 0) + " %\n";
           if (cardUp && metaHead(selected, meta) && meta.found) {
             const uint32_t at = metaLayerAt(selected, meta.found, printAt, &z100, &left);
-            out += "Layer      " + (at ? String(at) : String("unknown")) + " of " + String(meta.found);
+            out += "Layer: " + (at ? String(at) : String("unknown")) + " of " + String(meta.found);
             if (z100)
-              out += ", " + String(z100 / 100.0, 2) + " mm";
+              out += " \u00b7 " + String(z100 / 100.0, 2) + " mm";
             out += "\n";
-            out += "Left       " + spanWords(left ? (int32_t)left * 60 : -1) + "\n";
           }
-          out += "Elapsed    " + spanWords(printSince ? (int32_t)((millis() - printSince) / 1000) : -1) + "\n";
+          out += "Left: " + spanWords(left ? (int32_t)left * 60 : -1) + " \u00b7 elapsed " +
+                 spanWords(printSince ? (int32_t)((millis() - printSince) / 1000) : -1) + "\n";
         }
+        out += "\n";
       }
-      out += "Nozzle     " + String(toolNow, 1) + " of " + String(toolSet, 0) + "\n";
-      out += "Bed        " + String(bedNow, 1) + " of " + String(bedSet, 0) + "\n";
+      out += "Nozzle: " + String(toolNow, 0) + " / " + String(toolSet, 0) + " \u00b0C\n";
+      out += "Bed: " + String(bedNow, 0) + " / " + String(bedSet, 0) + " \u00b0C\n";
       if (yandexHome.hasToken() && yandexHome.getDeviceId() != "")
-        out += "Socket     " + powerOffState() + "\n";
-      out += "Module     up " + String(millis() / 1000) + " s, heap " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT));
+        out += "Power off after a print: " + powerOffState() + "\n";
+      out += "Module: up " + spanWords(millis() / 1000) + " \u00b7 memory " +
+             String(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024) + " KB";
       telegramBot.send(chat, out);
     }
 
@@ -2361,11 +2371,11 @@ static void handleTelegram() {
       else if (!printerCard.count())
         telegramBot.send(chat, fresh ? "Nothing on the printer's card." : "Cached listing: nothing on the printer's card. Refresh when idle.");
       else {
-        String out = fresh ? "On the printer's card:\n" : "Cached printer listing (refresh when idle):\n";
+        String out = fresh ? "Printer card\n\n" : "Printer card, as last seen\n\n";
         for (uint8_t i = 0; i < printerCard.count(); i++) {
           const PrinterCardEntry &e = printerCard.at(i);
           out += String(base + i + 1) + ". " + String(e.name[0] ? e.name : e.dos) +
-                 "  " + String(e.size / 1024) + " KB\n";
+                 " \u00b7 " + String(e.size / 1024) + " KB\n";
         }
         if (fresh && printerCard.more())
           out += "and " + String(printerCard.total() - printerCard.more()) + " more: /files " +
@@ -2432,8 +2442,9 @@ static void handleTelegram() {
       else if (verb == "/off" && printing)
         telegramBot.send(chat, "The printer is printing. Cancel it first if you really mean this.");
       else {
-        yandexHome.request(verb == "/on" ? YandexHome::PowerOn : YandexHome::PowerOff);
-        telegramBot.send(chat, String("Asked the socket to go ") + (verb == "/on" ? "on." : "off."));
+        if (verb == "/off")
+          yandexHome.request(YandexHome::PowerOff);
+        telegramBot.send(chat, verb == "/on" ? "The printer is on already." : "Switching the printer off.");
       }
     }
 
@@ -2673,13 +2684,13 @@ void loop() {
       String lower = choreFile;
       lower.toLowerCase();
       if (chore == ChoreFailed)
-        telegramBot.send(choreChat, "Could not put " + choreFile + " on the printer's card \u2014 " + choreTrouble);
+        telegramBot.send(choreChat, "Not on the printer's card\n\nFile: " + choreFile + "\nWhy: " + choreTrouble);
       else if (lower.startsWith("robin_nano"))
-        telegramBot.send(choreChat, "Printer firmware is on its card \u2014 " + choreFile +
-                                    "\n\nIt is flashed the next time the printer is switched on: /off, then /on.");
+        telegramBot.send(choreChat, "Printer firmware is on its card\n\nFile: " + choreFile +
+                                    "\nIt is flashed the next time the printer is switched on: /off, then /on.");
       else
-        telegramBot.send(choreChat, "On the printer's card \u2014 " + choreFile +
-                                    "\n\n/files to see it, /print <number> to start it.");
+        telegramBot.send(choreChat, "On the printer's card\n\nFile: " + choreFile +
+                                    "\n/files to see it, /print <number> to start it.");
       choreChat = "";
     }
   }
@@ -2688,11 +2699,10 @@ void loop() {
   if (printing != toldPrinting) {
     toldPrinting = printing;
     if (printing)
-      tellTheBot("Printing " + String(selected[0] ? selected : "a file") + ".");
+      tellTheBot("Print started\n\nFile: " + String(selected[0] ? selected : "unknown"));
     else
-      tellTheBot(printAt && printAt >= printOf
-                 ? "Finished " + String(selected[0] ? selected : "the file") + "."
-                 : "The print stopped.");
+      tellTheBot(String(printAt && printAt >= printOf ? "Print finished" : "Print stopped") +
+                 "\n\nFile: " + String(selected[0] ? selected : "unknown"));
   }
 
   powerOffTick(millis());

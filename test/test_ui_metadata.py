@@ -186,7 +186,7 @@ int main() {
   commands.clear();telegramPrint();assert(commands.back()=="M24" && commands[3]=="M23 BOATWI~1.GCO");
   printing=true;commands.clear();listFiles();assert(server.code==200 && server.body.indexOf("cached:")==0);
   assert(server.body.indexOf(name.c_str())>=0 && commands.empty());
-  telegramFiles();assert(telegramBot.text.indexOf("Cached")>=0 && commands.empty());
+  telegramFiles();assert(telegramBot.text.indexOf("as last seen")>=0 && commands.empty());
   webPrint();assert(server.code==409 && commands.empty());
   assert(openPrinterFile(name.c_str()).indexOf("busy")>=0 && commands.empty());
   printing=false;

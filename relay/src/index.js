@@ -15,6 +15,12 @@
 
 import { deflate } from "pako";
 
+// What the bot says goes out as Telegram HTML: a first line followed by an empty one is a title
+export function tgHtml(text) {
+  const safe = String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return safe.replace(/^([^\n]+)\n\n/, "<b>$1</b>\n\n");
+}
+
 const UPLOAD_LIMIT = 64 * 1024 * 1024;
 const CHUNK = 2040;                       // plus four bytes of number, one module buffer
 const IN_FLIGHT = 3;                      // one fewer than the module has slots for pieces
@@ -311,6 +317,8 @@ export class Relay {
       const update = await request.json().catch(() => null);
       const m = update && update.message;
       const ws = this.device();
+      if (m && !ws)
+        await this.tgAway(m).catch(() => {});
       if (m && ws) {
         if (m.document)
           ws.send(JSON.stringify({ t: "tgdoc", c: String(m.chat.id), id: m.document.file_id,
@@ -528,6 +536,63 @@ export class Relay {
     return turn;
   }
 
+  tgSay(chat, text) {
+    return this.telegram("sendMessage", { chat_id: chat, text: tgHtml(text), parse_mode: "HTML",
+                                          link_preview_options: { is_disabled: true } });
+  }
+
+  async socketState() {
+    const d = await this.yandex("/v1.0/devices/" + this.auth.socket);
+    const onOff = d && (d.capabilities || []).find((c) => c.type === "devices.capabilities.on_off");
+    if (!d || d.state !== "online" || !onOff || !onOff.state) return null;
+    return onOff.state.value ? "on" : "off";
+  }
+
+  async pressSocket(on, who) {
+    if (on) {
+      const last = (await this.state.storage.get("poweredAt")) || 0;
+      if (Date.now() - last < 20000) return "just";
+      await this.state.storage.put("poweredAt", Date.now());
+    }
+    const press = JSON.stringify({ devices: [{ id: this.auth.socket,
+      actions: [{ type: "devices.capabilities.on_off", state: { instance: "on", value: on } }] }] });
+    const said = (await this.yandex("/v1.0/devices/actions", press)) || (await this.yandex("/v1.0/devices/actions", press));
+    this.incident(`power ${on ? "on" : "off"} asked from ${who}: ${said ? said.status : "yandex did not answer"}`);
+    return said && said.status === "ok" ? "ok" : "no";
+  }
+
+  async tgAway(m) {
+    if (!this.auth) this.auth = (await this.state.storage.get("auth")) || null;
+    const chat = String(m.chat.id);
+    if (!this.auth || !String(this.auth.chats || "").split(",").includes(chat)) return;
+    const name = this.auth.name || "Printer";
+    const words = (m.text || "").trim().split(/\s+/);
+    const verb = (words[0] || "").toLowerCase().replace(/@.*$/, "");
+    if (!this.env.YANDEX_TOKEN || !this.auth.socket)
+      return this.tgSay(chat, `${name} \u00b7 not connected\n\nModule: not connected\nSocket: none is set up, so it cannot be switched from here`);
+    const state = await this.socketState();
+    if (verb === "/on" && state !== "on") {
+      const pressed = await this.pressSocket(true, "Telegram");
+      if (pressed === "ok") await this.state.storage.put("tgWake", { chat, at: Date.now() });
+      return this.tgSay(chat, pressed === "ok" ? "Switching the printer on. I will say when it is connected, about 20 s."
+                            : pressed === "just" ? "It was asked to switch on a moment ago. Give it 20 s."
+                            : "Yandex did not answer. Say /on again.");
+    }
+    if (verb === "/off" && state === "off")
+      return this.tgSay(chat, "The printer is already off.");
+    if (verb === "/off" && words[1] === "force")
+      return this.tgSay(chat, (await this.pressSocket(false, "Telegram")) === "ok" ? "Switching the printer off."
+                                                                                 : "Yandex did not answer. Say /off force again.");
+    const asked = m.document ? "The file was not taken."
+                : verb === "/off" ? "The module is not connected, so I cannot tell whether a print is running."
+                : verb && !["/status", "/start", "/help", "/on"].includes(verb) ? `${verb} needs the module connected.` : "";
+    const hint = state === "off" ? "/on switches it on."
+               : state === "on" ? "The module connects about 20 s after power comes. /off force cuts the power."
+               : "";
+    return this.tgSay(chat, `${name} \u00b7 ${state === "off" ? "off" : state === "on" ? "not answering" : "not connected"}\n\n` +
+                            `Socket: ${state || "did not answer"}\nModule: not connected\n\n${[asked, hint].filter(Boolean).join(" ")}`.trimEnd());
+  }
+
   async telegram(method, payload) {
     const r = await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_TOKEN}/${method}`, {
       method: "POST",
@@ -541,7 +606,7 @@ export class Relay {
   // hands files only to whoever holds the bot token, and the module cannot afford the
   // second encrypted connection, so the file is fetched here and carried down.
   async fetchForModule(m) {
-    const say = (text) => this.telegram("sendMessage", { chat_id: m.c, text });
+    const say = (text) => this.tgSay(m.c, text);
     const started = Date.now();
     const info = await this.telegram("getFile", { file_id: m.id });
     const filePath = info && info.result && info.result.file_path;
@@ -654,12 +719,11 @@ export class Relay {
     const verdict = await this.signedIn(request, url);
     if (verdict === "challenge") return this.challenge();
     if (verdict !== "ok") return plain();
-    const d = await this.yandex("/v1.0/devices/" + this.auth.socket);
-    const onOff = d && (d.capabilities || []).find((c) => c.type === "devices.capabilities.on_off");
+    const socket = await this.socketState();
     let page;
-    if (!d || d.state !== "online" || !onOff || !onOff.state)
+    if (!socket)
       page = personPage("Printer module is not connected", "Its socket did not answer either, so it cannot be switched on from here right now. This page checks again every few seconds.", 10);
-    else if (onOff.state.value)
+    else if (socket === "on")
       page = personPage("Printer is on, the module is starting", "The socket is on. The module connects about a quarter of a minute after power comes. This page checks again every few seconds.", 4);
     else
       page = personPage("Printer is switched off", "Its socket is off, so the module has no power.", 20,
@@ -680,13 +744,7 @@ export class Relay {
     const verdict = await this.signedIn(request, url);
     if (verdict === "challenge") return this.challenge();
     if (verdict !== "ok") return new Response("no\n", { status: 403 });
-    const last = (await this.state.storage.get("poweredAt")) || 0;
-    if (Date.now() - last < 20000) return back();
-    await this.state.storage.put("poweredAt", Date.now());
-    const press = JSON.stringify({ devices: [{ id: this.auth.socket,
-      actions: [{ type: "devices.capabilities.on_off", state: { instance: "on", value: true } }] }] });
-    const said = (await this.yandex("/v1.0/devices/actions", press)) || (await this.yandex("/v1.0/devices/actions", press));
-    this.incident(`power on asked from the web page: ${said ? said.status : "yandex did not answer"}`);
+    await this.pressSocket(true, "the web page");
     return back();
   }
 
@@ -847,9 +905,17 @@ export class Relay {
         // The window the module unpacks zlib in, in bits. A firmware that only said yes
         // took raw deflate, which is no longer sent: it gets the form.
         this.auth.inflate = Number.isInteger(m.inflate) && m.inflate >= 9 && m.inflate <= 15 ? m.inflate : 0;
+        // Who may talk to the bot, so it can answer and press the socket while the module has no power
+        this.auth.chats = typeof m.chats === "string" && /^[-\d,]{0,300}$/.test(m.chats) ? m.chats : "";
+        this.auth.name = typeof m.name === "string" ? m.name.slice(0, 32) : "";
         this.state.storage.put("auth", this.auth).catch(() => {});
         this.note(`auth from module, ${m.open ? "open" : "password set"}`);
         if (this.rttWake) { const wake = this.rttWake; this.rttWake = null; wake(); }
+        const woke = await this.state.storage.get("tgWake");
+        if (woke) {
+          await this.state.storage.delete("tgWake");
+          if (Date.now() - woke.at < 300000) await this.tgSay(woke.chat, `${this.auth.name || "The printer"} is on and connected.`);
+        }
         return;
       }
       if (m.t === "st" && typeof m.b === "string") {
@@ -886,11 +952,7 @@ export class Relay {
       }
       if (m.t === "tg") {
         if (this.env.TELEGRAM_TOKEN && m.c && m.x)
-          await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_TOKEN}/sendMessage`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ chat_id: m.c, text: m.x }),
-          }).catch(() => {});
+          await this.tgSay(m.c, m.x);
         return;
       }
       if (m.k) {

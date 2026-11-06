@@ -86,6 +86,7 @@ CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_transfer_completion.py || fail=1
 
 CXX="$CXX" CXXFLAGS="$FLAGS" python3 -B test_ui_metadata.py || fail=1
 node test_page_ui.js || fail=1
+node test_tg_format.mjs 2>/dev/null || fail=1
 
 echo "=== the module's inflater, on the miniz decoder the ROM holds, against the Worker's deflate ==="
 MINIZ=~/.platformio/packages/tool-esptoolpy/flasher_stub
