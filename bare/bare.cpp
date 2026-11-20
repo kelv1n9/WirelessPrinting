@@ -224,11 +224,14 @@ static bool sawTemps(const char *text) {
 
 RTC_NOINIT_ATTR volatile uint32_t crumbRelay, crumbLoop, crumbWs;   // where each was when a panic hit
 static int heardSync = -1;       // the number a printer in packet mode said it expects next
+static uint32_t heardBusy;
 
 static void sawLine(const char *text, const size_t len) {
   if (text[0] == 's' && text[1] == 's' && text[2] >= '0' && text[2] <= '9')
     heardSync = atoi(text + 2);
   const bool hadTemps = sawTemps(text);
+  if (!strncmp(text, "echo:busy:", 10))
+    heardBusy = millis() | 1;
   if (!strcmp(text, "ok") || !strncmp(text, "ok ", 3)) {
     sawOk = true;
     return;
@@ -1094,7 +1097,10 @@ static bool askedBack() {
 // A printer that answers nothing is seldom busy. Either a transfer that died with the
 // module left it reading packets, or it is still at the fast rate from before the
 // module rebooted. Both are tried before giving up, and the rate that answers is kept.
+static bool wireBusy;
+
 static bool settleWire() {
+  wireBusy = false;
   uint32_t rates[2];
   rates[0] = linkRate;
   rates[1] = linkRate == PRINTER_BAUD ? PRINTER_FAST : PRINTER_BAUD;
@@ -1103,10 +1109,16 @@ static bool settleWire() {
       Printer.updateBaudRate(rate);
       delay(50);
       drain();
+      heardBusy = 0;
     }
     if (askedBack()) {
       linkRate = rate;
       return true;
+    }
+    if (heardBusy && millis() - heardBusy < 5000) {
+      linkRate = rate;
+      wireBusy = true;
+      return false;
     }
     // A reboot can land in the middle of a 1 KB packet, and Marlin then waits for its
     // tail, taking anything sent as part of it. It gives up after 500 ms with nothing
@@ -1144,6 +1156,7 @@ static bool settleWire() {
   Printer.updateBaudRate(linkRate);
   delay(50);
   drain();
+  heardBusy = 0;
   return false;
 }
 
@@ -1156,11 +1169,18 @@ static bool moveLink(const uint32_t rate) {
   delay(200);
   Printer.updateBaudRate(rate);
   linkRate = rate;
+  heardBusy = 0;
   delay(200);
   printerLine("");               // ends whatever half line the change left in the printer
   delay(20);
   drain();
   return askedBack();
+}
+
+static String cancelPrint(const char *who) {
+  journal(String("cancel asked for from ") + who);
+  printerLine("");
+  return say("M524");
 }
 
 static String listingTrouble;
@@ -1169,9 +1189,10 @@ static bool askPrinterCard(const char *wanted, const uint16_t from) {
   listingTrouble = printing ? "a print is running" : "a transfer owns the wire";
   if (sender.running() || sendAsked || printing)
     return false;
-  listingTrouble = "the printer answered at neither rate";
-  if (!settleWire())
+  if (!settleWire()) {
+    listingTrouble = wireBusy ? "the printer is busy" : "the printer answered at neither rate";
     return false;
+  }
   listingTrouble = "a print began";
   if (printing)
     return false;
@@ -1587,7 +1608,7 @@ void setup() {
         server.send(409, "text/plain", "a transfer owns the wire\n");
         return;
       }
-      server.send(200, "text/plain", say("M524"));
+      server.send(200, "text/plain", cancelPrint("the page"));
       return;
     }
     if (body.indexOf("start") < 0) {
@@ -2418,7 +2439,7 @@ static void handleTelegram() {
       }
       else if (rest == "yes" || awaitingStop == chat) {
         awaitingStop = "";
-        say("M524");
+        cancelPrint("the bot");
         telegramBot.send(chat, "Cancelled.");
       }
       else {
@@ -2644,8 +2665,12 @@ void loop() {
   static uint32_t busySince;
   if (printing || sender.running() || sendAsked || chore == ChoreSending)
     busySince = millis();
-  else if (linkRate != PRINTER_BAUD && millis() - busySince > 10000)
-    moveLink(PRINTER_BAUD);
+  else if (linkRate != PRINTER_BAUD && millis() - busySince > 10000) {
+    busySince = millis();
+    say("M105", 600);
+    if (sawOk && !moveLink(PRINTER_BAUD))
+      settleWire();
+  }
 
   static uint32_t slowTick;
   if ((int32_t)(millis() - slowTick) >= 0) {
@@ -2667,7 +2692,21 @@ void loop() {
     if (printing) {
       // A printer that rebooted mid print has its autoreport off and nobody to turn it
       // back on. Asked for without waiting, because a wait here would stall the web.
-      printerLine("M155 S2");
+      static uint32_t quietFrom;
+      static uint8_t quietTicks;
+      if (quietFrom != heardTemp) {
+        quietFrom = heardTemp;
+        quietTicks = 0;
+      }
+      linkRate = linkRate == PRINTER_BAUD ? PRINTER_FAST : PRINTER_BAUD;
+      Printer.updateBaudRate(linkRate);
+      heardBusy = 0;
+      journal("the printer has been silent in a print, listening at " + String(linkRate) + " baud");
+      if (++quietTicks > 1) {
+        printerLine("");
+        printerLine("M155 S2");
+        printerLine("M27 S3");
+      }
     }
     else if (settleWire()) {
       const String said = say("M115");
@@ -2677,6 +2716,7 @@ void loop() {
         snprintf(machine, sizeof machine, "%s",
                  said.substring(at + 13, end < 0 ? said.length() : end).c_str());
         say("M155 S2");          // it reports from idle(), so the queue cannot delay it
+        say("M27 S3");
       }
     }
   }
