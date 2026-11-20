@@ -487,6 +487,69 @@ int main() {
   }
 #endif
 
+  scenario = "a port that takes 127 bytes at a time, the next packet packed while it drains";
+  {
+    std::ifstream file("cold_cube_head.gcode", std::ios::binary);
+    const std::string sample((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    struct FifoWire : PipelineWire {
+      using PipelineWire::PipelineWire;
+      size_t fifo = 127;
+      unsigned polls = 0, pieces = 0;
+      std::vector<uint8_t> whole;
+      size_t writable() override {
+        if (!fifo && ++polls % 3 == 0)
+          fifo = 127;
+        return fifo;
+      }
+      size_t write(const uint8_t *data, size_t len) override {
+        if (len <= fifo) {
+          fifo -= len;
+          pieces++;
+        }
+        const bool starts = len >= 2 && data[0] == 0xAD && data[1] == 0xB5 && whole.empty();
+        if (!starts && whole.empty())
+          return PipelineWire::write(data, len);
+        whole.insert(whole.end(), data, data + len);
+        const size_t want = whole.size() >= 6 ? 8 + (whole[4] | whole[5] << 8) + ((whole[4] | whole[5]) ? 2 : 0) : 8;
+        if (whole.size() >= want) {
+          const std::vector<uint8_t> one(whole);
+          whole.clear();
+          PipelineWire::write(one.data(), one.size());
+        }
+        return len;
+      }
+    };
+    struct FifoRig {
+      MarlinSim sim;
+      FifoWire wire;
+      BinaryTransfer move;
+      FifoRig() : wire(sim, 2000000) {
+        sim.binary = true;
+        wire.txRoom = 4096;
+        move.begin(&wire);
+      }
+    } rig;
+    rig.sim.binaryPayload = 1024;
+    rig.sim.rxBufferSize = 1280;
+    std::string body;
+    for (int i = 0; i < 6; i++) body += sample;
+    MemorySource from(body);
+    rig.move.start(&from, "FIFO.GCO", rig.wire.clock, true);
+    for (uint32_t i = 0; i < 600000 && rig.move.phase != BinaryDone && rig.move.phase != BinaryFailed; i++) {
+      rig.sim.tick(rig.wire.clock);
+      rig.move.service(rig.wire.clock);
+      rig.wire.advance();
+    }
+    check(!sample.empty(), "the real gcode sample is present");
+    check(rig.move.phase == BinaryDone, "the transfer finishes");
+#ifdef MARLIN_SIM_HEATSHRINK
+    check(rig.sim.card["FIFO.GCO"] == body, "the printer card matches the original");
+    check(rig.wire.pieces > rig.move.packets, "packets left in pieces the size of the port's buffer");
+    check(rig.wire.polls > rig.move.packets, "the port was asked for room while the next packet was packed");
+#endif
+    check(rig.move.resends == 0, "the printer requested no repeats");
+  }
+
   printf(failures ? "\n%d checks failed\n" : "\nall checks passed\n", failures);
   return failures != 0;
 }

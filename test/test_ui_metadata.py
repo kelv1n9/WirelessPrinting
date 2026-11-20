@@ -68,6 +68,7 @@ static inline void journal(const TestString &) {}
 static uint32_t upSince, upCardUs, upScanUs;
 static uint32_t micros() { return 0; }
 static int heardSync = -1;
+static uint32_t heardBusy = 0; static bool wireBusy = false;
 std::map<std::string,std::shared_ptr<std::vector<uint8_t>>> disk;
 constexpr int FILE_WRITE=1;
 struct File {

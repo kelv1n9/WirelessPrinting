@@ -242,6 +242,7 @@ export class Relay {
       }
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1], ["device"]);
+      this.note(`device socket from colo ${request.cf && request.cf.colo}, tcp rtt ${request.cf && request.cf.clientTcpRtt} ms`);
       pair[1].send(JSON.stringify({ t: "hello", tg: !!this.env.TELEGRAM_TOKEN }));
       this.note("device connected");
       return new Response(null, { status: 101, webSocket: pair[0] });

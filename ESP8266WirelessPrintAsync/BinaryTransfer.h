@@ -105,6 +105,7 @@ public:
     packer.reset();
     packHead = packTail = 0;
     drained = false;
+    sourceBroke = ahead = false;
     total = from->size();
     written = packets = resends = requested = silent = ackMs = worstAckMs = 0;
     prepareMs = writeMs = 0;
@@ -214,6 +215,7 @@ private:
   uint8_t packed[BINARY_PACK_ROOM];
   uint16_t packHead, packTail;         // compressed bytes live in packed[packTail..packHead)
   bool drained;                        // the source is spent and the encoder flushed
+  bool sourceBroke = false, ahead = false;
   uint8_t packet[BINARY_PACKET_ROOM];
   uint16_t held;                       // length of the packet last sent, for a repeat
   bool atEnd;
@@ -323,9 +325,20 @@ private:
     }
 
     held = at;
-    const uint32_t started = io->now();
-    io->write(packet, held);
-    writeMs += io->now() - started;
+    const uint32_t started = io->now(), prepared = prepareMs;
+    size_t gone = 0;
+    while (ahead && gone < held) {
+      size_t room = io->writable();
+      if (room > held - gone)
+        room = held - gone;
+      if (room)
+        gone += io->write(packet + gone, room);
+      if (gone < held && !packAhead())
+        break;
+    }
+    if (gone < held)
+      io->write(packet + gone, held - gone);
+    writeMs += io->now() - started - (prepareMs - prepared);
     packetSentAt = io->now();
     packets++;
   }
@@ -641,33 +654,39 @@ private:
 
   // Keeps at least one packet of compressed bytes ready, or marks the stream spent.
   bool fillPacked() {
+    if (sourceBroke)
+      return false;
     if (drained || (uint16_t)(packHead - packTail) >= BINARY_MAX_PAYLOAD)
       return true;
+    while (packAhead()) {}
+    return !sourceBroke;
+  }
 
+  bool packAhead() {
+    if (drained || sourceBroke)
+      return false;
     if (packTail) {
       memmove(packed, packed + packTail, (size_t)(packHead - packTail));
       packHead -= packTail;
       packTail = 0;
     }
-
+    if (BINARY_PACK_ROOM - packHead < HeatshrinkEncoder::max_output(BINARY_PACK_SLICE))
+      return false;
     const uint32_t started = io->now();
-    while (BINARY_PACK_ROOM - packHead >= HeatshrinkEncoder::max_output(BINARY_PACK_SLICE)) {
-      uint8_t slice[BINARY_PACK_SLICE];
-      const int got = source->next(slice, sizeof slice);
-      if (got < 0) {
-        prepareMs += io->now() - started;
-        return false;
-      }
-      if (got == 0) {
-        drained = true;
-        packHead += packer.finish(packed + packHead, BINARY_PACK_ROOM - packHead);
-        break;
-      }
+    uint8_t slice[BINARY_PACK_SLICE];
+    const int got = source->next(slice, sizeof slice);
+    if (got < 0)
+      sourceBroke = true;
+    else if (got == 0) {
+      drained = true;
+      packHead += packer.finish(packed + packHead, BINARY_PACK_ROOM - packHead);
+    }
+    else {
       written += got;
       packHead += packer.encode(slice, (size_t)got, packed + packHead, BINARY_PACK_ROOM - packHead);
     }
     prepareMs += io->now() - started;
-    return true;
+    return got > 0;
   }
 
   void writeMore() {
@@ -685,8 +704,11 @@ private:
         }
         const uint16_t take = have < room ? have : (uint16_t)room;
         sent += take;
-        put(BinaryFile, BinaryWrite, packed + packTail, take);
+        const uint8_t *from = packed + packTail;
         packTail += take;
+        ahead = true;
+        put(BinaryFile, BinaryWrite, from, take);
+        ahead = false;
       }
       else {
         uint8_t body[BINARY_MAX_PAYLOAD];

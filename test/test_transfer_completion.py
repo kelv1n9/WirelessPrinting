@@ -52,6 +52,7 @@ void chirp(int times) { chirps+=times; }
 uint32_t linkRate=PRINTER_BAUD;
 std::vector<std::vector<uint8_t>> packetsSent;
 int heardSync=-1;
+uint32_t heardBusy=0; bool wireBusy=false;
 bool wedged=false;
 struct {
   void updateBaudRate(uint32_t) {}
